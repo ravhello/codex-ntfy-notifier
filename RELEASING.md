@@ -95,7 +95,7 @@ Run isolated installer smoke tests from [CONTRIBUTING.md](CONTRIBUTING.md). For 
 - doctor output without secrets;
 - concurrent hook enqueue;
 - offline queue, recovery, and retry;
-- subagent suppression and fail-open root delivery;
+- generic `Stop` root/subagent classification, subagent suppression, and strict fail-closed handling of unknown evidence;
 - rollback after an induced installer failure;
 - uninstall without modifying unrelated Codex settings;
 - config, state, staging, and backup permissions.

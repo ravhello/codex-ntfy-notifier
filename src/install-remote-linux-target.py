@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,98 @@ def ensure_notify(config_path: Path, notifier: Path, origin: str, python: Path) 
     atomic_write(config_path, text, 0o600)
 
 
+def handler_is_managed(handler: object) -> bool:
+    if not isinstance(handler, dict):
+        return False
+    pattern = re.compile(r"(?:^|[\\/])notify-ntfy(?:\.ps1|\.py|-wsl\.sh)(?=$|[\s'\"])", re.IGNORECASE)
+    return any(
+        isinstance(handler.get(field), str) and pattern.search(handler[field]) is not None
+        for field in ("command", "commandWindows", "command_windows")
+    )
+
+
+def ensure_stop_hook(hooks_path: Path, notifier: Path, origin: str, python: Path) -> None:
+    if hooks_path.exists():
+        text = hooks_path.read_text(encoding="utf-8-sig")
+        if text.strip():
+            try:
+                document = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(f"invalid JSON in {hooks_path}: {error}") from error
+        else:
+            document = {}
+    else:
+        text = ""
+        document = {}
+
+    if not isinstance(document, dict):
+        raise RuntimeError(f"{hooks_path} must contain a JSON object")
+    hooks = document.get("hooks")
+    if hooks is None:
+        hooks = {}
+        document["hooks"] = hooks
+    elif not isinstance(hooks, dict):
+        raise RuntimeError(f"hooks in {hooks_path} must contain a JSON object")
+
+    # Remove every older notifier handler, including obsolete UserPromptSubmit or
+    # SubagentStop registrations, while retaining unrelated groups and handlers.
+    for event_name, groups in list(hooks.items()):
+        if not isinstance(groups, list):
+            if event_name == "Stop":
+                raise RuntimeError(f"hooks.Stop in {hooks_path} must contain a JSON array")
+            continue
+        filtered_groups: list[object] = []
+        removed_from_event = False
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                filtered_groups.append(group)
+                continue
+            handlers = group["hooks"]
+            filtered_handlers = [handler for handler in handlers if not handler_is_managed(handler)]
+            if len(filtered_handlers) == len(handlers):
+                filtered_groups.append(group)
+                continue
+            removed_from_event = True
+            if filtered_handlers:
+                filtered_group = dict(group)
+                filtered_group["hooks"] = filtered_handlers
+                filtered_groups.append(filtered_group)
+        if filtered_groups or not removed_from_event:
+            hooks[event_name] = filtered_groups
+        else:
+            del hooks[event_name]
+
+    stop_groups = hooks.setdefault("Stop", [])
+    if not isinstance(stop_groups, list):
+        raise RuntimeError(f"hooks.Stop in {hooks_path} must contain a JSON array")
+    command = " ".join(
+        (
+            shlex.quote(str(python)),
+            shlex.quote(str(notifier)),
+            "--hook-event",
+            "--origin",
+            shlex.quote(origin),
+        )
+    )
+    stop_groups.append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "timeout": 30,
+                }
+            ]
+        }
+    )
+
+    rendered = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+    if rendered != text:
+        atomic_write(hooks_path, rendered, 0o600)
+    else:
+        hooks_path.chmod(0o600)
+
+
 def systemd_quote(value: str | Path) -> str:
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -59,11 +152,28 @@ def migrate_private_config(path: Path) -> None:
         "include_message": True,
         "include_thread_title": True,
         "allow_insecure_auth": False,
+        "idle_detection_mode": "strict",
+        "idle_grace_seconds": 1.5,
+        "idle_probe_grace_seconds": 30,
+        "goal_aware": True,
+        "goal_poll_seconds": 1,
+        "subagent_orphan_seconds": 1800,
+        "suppress_technical_turns": True,
+        "watch_rollouts": True,
+        "watch_scan_seconds": 2,
+        "watch_discovery_seconds": 60,
+        "watch_initial_replay_seconds": 15,
+        "watch_roots": [],
         "dead_retention_days": 30,
     }.items():
         if key not in config:
             config[key] = value
             changed = True
+    # Watch roots are host-local topology. Never carry a source machine's WSL
+    # or custom paths onto an SSH target.
+    if config.get("watch_roots") != []:
+        config["watch_roots"] = []
+        changed = True
     if changed or path.read_bytes().startswith(b"\xef\xbb\xbf"):
         atomic_write(path, json.dumps(config, indent=2) + "\n", 0o600)
 
@@ -75,7 +185,7 @@ def backup_current(codex_home: Path, unit: Path, keep: int = 10) -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000_000:09d}"
     backup = root / stamp
     backup.mkdir(mode=0o700)
-    for name in ("config.toml", "ntfy-config.json", "notify-ntfy.py", "install-remote-linux-target.py"):
+    for name in ("config.toml", "hooks.json", "ntfy-config.json", "notify-ntfy.py", "install-remote-linux-target.py"):
         source = codex_home / name
         if source.exists():
             target = backup / name
@@ -97,7 +207,7 @@ def restore_backup(
     unit: Path,
     unit_previously_present: bool,
 ) -> None:
-    for name in ("config.toml", "ntfy-config.json", "notify-ntfy.py", "install-remote-linux-target.py"):
+    for name in ("config.toml", "hooks.json", "ntfy-config.json", "notify-ntfy.py", "install-remote-linux-target.py"):
         destination = codex_home / name
         saved = backup / name
         if saved.exists():
@@ -117,7 +227,7 @@ def restore_backup(
         unit.unlink(missing_ok=True)
 
 
-def install_systemd(home: Path, notifier: Path, python: Path) -> str:
+def install_systemd(home: Path, notifier: Path, python: Path, codex_home: Path, sqlite_home: Path) -> str:
     systemctl = shutil.which("systemctl")
     if not systemctl:
         return "on-demand"
@@ -140,6 +250,8 @@ Description=Durable ntfy worker for Codex completion notifications
 
 [Service]
 Type=simple
+Environment={systemd_quote(f"CODEX_HOME={codex_home}")}
+Environment={systemd_quote(f"CODEX_SQLITE_HOME={sqlite_home}")}
 ExecStart={systemd_quote(python)} {systemd_quote(notifier)} --worker --continuous
 Restart=always
 RestartSec=5
@@ -179,10 +291,12 @@ def main() -> int:
         effective_origin = args.origin
     home = Path.home()
     codex_home = Path(os.environ.get("CODEX_HOME") or home / ".codex").expanduser().resolve()
+    sqlite_home = Path(os.environ.get("CODEX_SQLITE_HOME") or codex_home).expanduser().resolve()
     notifier = codex_home / "notify-ntfy.py"
     python = Path(sys.executable).resolve()
     private_config = codex_home / "ntfy-config.json"
     config = codex_home / "config.toml"
+    hooks = codex_home / "hooks.json"
     unit = home / ".config" / "systemd" / "user" / "codex-ntfy.service"
     systemctl = shutil.which("systemctl")
     if not args.skip_systemd and unit.is_file() and "notify-ntfy.py" not in unit.read_text(
@@ -230,7 +344,7 @@ def main() -> int:
         expected_hashes[name] = digest.lower()
     if expected_hashes and set(expected_hashes) != set(managed_names):
         raise RuntimeError("expected SHA-256 values must cover every staged file")
-    previously_present = {name for name in (*managed_names, "config.toml") if (codex_home / name).exists()}
+    previously_present = {name for name in (*managed_names, "config.toml", "hooks.json") if (codex_home / name).exists()}
     unit_previously_present = unit.is_file()
     backup = backup_current(codex_home, unit)
     stage: Path | None = None
@@ -259,6 +373,7 @@ def main() -> int:
         private_config.chmod(0o600)
         migrate_private_config(private_config)
         ensure_notify(config, notifier, effective_origin, python)
+        ensure_stop_hook(hooks, notifier, effective_origin, python)
         state = codex_home / "ntfy-state"
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
         state.chmod(0o700)
@@ -274,7 +389,7 @@ def main() -> int:
             worker = "on-demand"
         else:
             systemd_attempted = systemd_available
-            worker = install_systemd(home, notifier, python)
+            worker = install_systemd(home, notifier, python, codex_home, sqlite_home)
     except Exception:
         if systemd_attempted and systemctl:
             subprocess.run(
@@ -313,6 +428,10 @@ def main() -> int:
     finally:
         if stage is not None:
             shutil.rmtree(stage, ignore_errors=True)
+    print(
+        "WARNING: the Codex Stop hook must be reviewed and trusted with /hooks before it can run.",
+        file=sys.stderr,
+    )
     print(
         json.dumps(
             {

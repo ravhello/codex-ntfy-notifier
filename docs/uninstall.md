@@ -1,16 +1,16 @@
 # Uninstall and rollback
 
-These procedures apply to version 2.3.0. They are intentionally explicit because `~/.codex` also belongs to Codex; never remove that whole directory.
+These procedures apply to version 2.4.0. They are intentionally explicit because `~/.codex` also belongs to Codex; never remove that whole directory.
 
-An **uninstall** removes the managed hook and worker while preserving unrelated Codex settings. A **rollback** restores the timestamped snapshot taken immediately before a particular installation or upgrade. Decide which outcome is wanted before deleting anything.
+An **uninstall** removes only this project’s managed `notify` command, `notify-ntfy` hook handlers, scripts, and worker while preserving unrelated Codex settings and hooks. A **rollback** restores the timestamped snapshot taken immediately before a particular installation or upgrade. Decide which outcome is wanted before deleting anything.
 
 ## Before changing files
 
-1. Close or reload Codex/VS Code windows after the procedure so they do not retain the old hook configuration.
-2. Run doctor and inspect `queued`. Wait for it to reach zero, or explicitly accept that pending notifications will be discarded.
+1. Close or reload Codex app/CLI processes and VS Code windows after the procedure so they do not retain old hook configuration.
+2. Run doctor and inspect both `pending_idle` and `queued`. Wait for both to reach zero, or explicitly accept that idle candidates and network-ready notifications will be discarded.
 3. Select the correct host and user. Each local, WSL, and Remote SSH environment can have a separate `~/.codex`.
 4. Make a private copy of any config or state that may be needed for rollback. It can contain credentials and message content.
-5. Do not print or upload `ntfy-config.json`, state, or backups.
+5. Do not print or upload `ntfy-config.json`, `hooks.json`, Codex rollout/database state, notifier state, or backups.
 
 Windows:
 
@@ -50,9 +50,14 @@ Get-CimInstance Win32_Process |
 
 Review the process list before using `Stop-Process` in a customized installation.
 
-### 2. Restore or remove the hook
+### 2. Restore or remove the managed hooks
 
-If no Codex settings were changed after installation, restoring `config.toml` from the chosen backup is the most exact option:
+The installation has two independent signal registrations:
+
+- the root-level legacy `notify` command in `config.toml`;
+- one managed command handler containing `notify-ntfy` under `hooks.Stop` in `hooks.json`.
+
+If no Codex settings changed after installation, restoring `config.toml` from the chosen backup is the most exact legacy-notify rollback:
 
 ```powershell
 $CodexHome = [IO.Path]::GetFullPath((Join-Path $HOME '.codex'))
@@ -61,7 +66,7 @@ Copy-Item -LiteralPath (Join-Path $Backup 'config.toml') `
   -Destination (Join-Path $CodexHome 'config.toml') -Force
 ```
 
-Do not run that copy if the selected backup has no `config.toml` or if it would overwrite later Codex settings. In that case, privately back up the current file and remove only the single root-level line containing `notify-ntfy.ps1`. Leave every unrelated line and table unchanged.
+Do not run that copy if the selected backup has no `config.toml` or if it would overwrite later Codex settings. In that case, privately back up the current file and remove only the root-level line whose command contains `notify-ntfy.ps1`. Leave every unrelated line and table unchanged.
 
 Verify afterwards:
 
@@ -70,6 +75,90 @@ Select-String -Path "$HOME\.codex\config.toml" -Pattern '^\s*notify\s*='
 ```
 
 If a previous non-project hook should be restored, copy its exact root-level `notify = [...]` line from a trusted pre-install backup. Do not add a second root-level `notify` key.
+
+Remove the modern handler selectively. This script scans every hook event so it also cleans up a managed handler left by an older preview, but it retains unrelated handlers, groups, events, and top-level metadata:
+
+```powershell
+$HooksPath = Join-Path $HOME '.codex\hooks.json'
+if (Test-Path -LiteralPath $HooksPath -PathType Leaf) {
+  $Document = Get-Content -LiteralPath $HooksPath -Raw | ConvertFrom-Json
+  $HooksProperty = $Document.PSObject.Properties['hooks']
+  $Changed = $false
+
+  if ($null -ne $HooksProperty -and
+      $null -ne $HooksProperty.Value -and
+      $HooksProperty.Value -is [System.Management.Automation.PSCustomObject]) {
+    $Events = $HooksProperty.Value
+    foreach ($EventProperty in @($Events.PSObject.Properties)) {
+      if ($EventProperty.Value -isnot [array]) { continue }
+
+      $KeptGroups = New-Object 'System.Collections.Generic.List[object]'
+      $RemovedFromEvent = $false
+      foreach ($Group in @($EventProperty.Value)) {
+        if ($null -eq $Group -or $Group -isnot [System.Management.Automation.PSCustomObject]) {
+          $KeptGroups.Add($Group)
+          continue
+        }
+        $HandlersProperty = $Group.PSObject.Properties['hooks']
+        if ($null -eq $HandlersProperty -or $HandlersProperty.Value -isnot [array]) {
+          $KeptGroups.Add($Group)
+          continue
+        }
+
+        $OriginalHandlers = @($HandlersProperty.Value)
+        $KeptHandlers = @($OriginalHandlers | Where-Object {
+          $Managed = $false
+          if ($null -ne $_ -and $_ -is [System.Management.Automation.PSCustomObject]) {
+            foreach ($Field in @('command', 'commandWindows', 'command_windows')) {
+              $Property = $_.PSObject.Properties[$Field]
+              if ($null -ne $Property -and
+                  $Property.Value -is [string] -and
+                  $Property.Value -match '(?i)notify-ntfy') {
+                $Managed = $true
+              }
+            }
+          }
+          -not $Managed
+        })
+
+        if ($KeptHandlers.Count -ne $OriginalHandlers.Count) {
+          $RemovedFromEvent = $true
+        }
+        if ($KeptHandlers.Count -gt 0) {
+          $HandlersProperty.Value = @($KeptHandlers)
+          $KeptGroups.Add($Group)
+        } elseif ($OriginalHandlers.Count -eq 0) {
+          $KeptGroups.Add($Group)
+        }
+      }
+
+      if ($RemovedFromEvent) {
+        $Changed = $true
+        if ($KeptGroups.Count -gt 0) {
+          $EventProperty.Value = @($KeptGroups.ToArray())
+        } else {
+          $Events.PSObject.Properties.Remove($EventProperty.Name)
+        }
+      }
+    }
+  }
+
+  if ($Changed) {
+    $PrivateBackup = "$HooksPath.pre-ntfy-uninstall-$(Get-Date -Format yyyyMMdd-HHmmss)"
+    Copy-Item -LiteralPath $HooksPath -Destination $PrivateBackup
+    $Utf8NoBom = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($HooksPath, (($Document | ConvertTo-Json -Depth 32) + [Environment]::NewLine), $Utf8NoBom)
+  }
+}
+```
+
+If `$Changed` was true, inspect the diff against `$PrivateBackup` locally. Then verify that no managed command remains:
+
+```powershell
+Select-String -Path "$HOME\.codex\hooks.json" -Pattern 'notify-ntfy' -ErrorAction SilentlyContinue
+```
+
+Do not delete all of `hooks.json` and do not edit Codex’s hook trust store. A retained approval does not execute anything without a registered hook command; removing trust entries is outside this uninstall.
 
 ### 3. Remove managed files
 
@@ -104,11 +193,11 @@ Remove-Item -LiteralPath (Join-Path $CodexHome 'ntfy-backups') -Recurse -Force -
 
 ### 4. Reload Codex
 
-Reload every local VS Code window. A process that already read the old `config.toml` can continue invoking a deleted script until it restarts.
+Reload the Codex app/CLI and every local VS Code window. A process that already read `config.toml` or `hooks.json` can continue invoking a deleted script until it restarts.
 
 ## Roll back Windows to a selected backup
 
-Local Windows backups can include the managed scripts, private config, `config.toml`, and an exported `CodexNtfyWatcher.xml` when that task existed before the installer run.
+Local Windows backups can include the managed scripts, private config, `config.toml`, `hooks.json`, and an exported `CodexNtfyWatcher.xml` when that task existed before the installer run.
 
 Stop the current worker as above. Assign a timestamp explicitly, validate that it is directly under the backup root, and restore the files it contains:
 
@@ -124,6 +213,7 @@ $Managed = @(
   'notify-ntfy.ps1',
   'watch-codex-ntfy.ps1',
   'watch-codex-ntfy-hidden.vbs',
+  'hooks.json',
   'ntfy-config.json'
 )
 foreach ($Name in $Managed) {
@@ -152,7 +242,9 @@ if (Test-Path -LiteralPath $SavedTask -PathType Leaf) {
 }
 ```
 
-Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.3.0 uses queue schema 1, but compatibility with an arbitrary older private build is not guaranteed.
+This full rollback restores or removes `hooks.json` exactly as captured. Do not use it when later unrelated hooks must survive; use the selective handler cleanup instead.
+
+Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.4.0 uses record schema 1 but adds `pending/` and `watch/` state; compatibility with an arbitrary older build is not guaranteed.
 
 Remote Windows backups use the same scheduled-task XML snapshot. The installer refuses to overwrite a task named `CodexNtfyWatcher` unless its action belongs to this project, and an installation failure restores the prior definition and running state automatically.
 
@@ -182,21 +274,89 @@ wsl.exe -d Ubuntu -- sh
 
 Inside WSL:
 
-1. privately back up `~/.codex/config.toml`;
+1. privately back up `~/.codex/config.toml` and `~/.codex/hooks.json`;
 2. remove only the root-level line containing `notify-ntfy-wsl.sh`;
-3. verify that no other `notify` line was accidentally changed;
-4. stop any native fallback worker;
-5. remove only the WSL-managed files.
+3. remove only command handlers containing `notify-ntfy` from `hooks.json`;
+4. verify that no unrelated `notify` line or hook changed;
+5. stop any native fallback worker;
+6. remove only the WSL-managed files.
+
+Use this Python cleanup for `hooks.json`. It preserves unrelated handlers, groups, event names, and top-level metadata; it does not edit the Codex trust store:
+
+```sh
+python3 - <<'PY'
+import json
+import os
+import shutil
+import time
+from pathlib import Path
+
+path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "hooks.json"
+if not path.is_file():
+    raise SystemExit(0)
+
+document = json.loads(path.read_text(encoding="utf-8"))
+events = document.get("hooks")
+if not isinstance(events, dict):
+    raise SystemExit("hooks.json has no hooks object; inspect it manually")
+
+def managed(handler):
+    if not isinstance(handler, dict):
+        return False
+    return any(
+        isinstance(handler.get(field), str)
+        and "notify-ntfy" in handler[field].lower()
+        for field in ("command", "commandWindows", "command_windows")
+    )
+
+changed = False
+for event_name, groups in list(events.items()):
+    if not isinstance(groups, list):
+        continue
+    kept_groups = []
+    removed_from_event = False
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            kept_groups.append(group)
+            continue
+        original = group["hooks"]
+        remaining = [handler for handler in original if not managed(handler)]
+        if len(remaining) != len(original):
+            changed = removed_from_event = True
+        if remaining:
+            updated = dict(group)
+            updated["hooks"] = remaining
+            kept_groups.append(updated)
+        elif not original:
+            kept_groups.append(group)
+    if removed_from_event:
+        if kept_groups:
+            events[event_name] = kept_groups
+        else:
+            del events[event_name]
+
+if changed:
+    backup = path.with_name(path.name + ".pre-ntfy-uninstall-" + time.strftime("%Y%m%d-%H%M%S"))
+    shutil.copy2(path, backup)
+    temporary = path.with_name(path.name + ".ntfy-uninstall.tmp")
+    temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    temporary.chmod(path.stat().st_mode & 0o777)
+    os.replace(temporary, path)
+PY
+```
 
 ```sh
 grep -nE '^[[:space:]]*notify[[:space:]]*=' "$HOME/.codex/config.toml"
+grep -n 'notify-ntfy' "$HOME/.codex/hooks.json" 2>/dev/null || true
 pkill -f '[n]otify-ntfy.py --worker' 2>/dev/null || true
 rm -f -- "$HOME/.codex/notify-ntfy-wsl.sh" "$HOME/.codex/notify-ntfy.py"
 ```
 
-The Windows installer keeps up to ten WSL snapshots in `~/.codex/ntfy-backups` inside each distribution. A selected snapshot can restore `config.toml`, the bridge scripts, and the private config. If later Codex settings must be retained, remove only the managed root line instead of replacing the whole TOML file.
+The Windows installer keeps up to ten WSL snapshots in `~/.codex/ntfy-backups` inside each distribution. A selected snapshot can restore `config.toml`, `hooks.json`, the bridge scripts, and private config. If later Codex settings/hooks must be retained, use selective removal instead of replacing the whole file.
 
 WSL receives a copy of `ntfy-config.json`. Delete it only after confirming that no other WSL setup uses it. If native fallback was ever used, `~/.codex/ntfy-state` can contain pending events and sensitive data. The normal Windows-bridged queue is instead in the Windows state directory.
+
+The Windows private config can also contain a `watch_roots` entry for this distribution. Remove only the object whose `path` points at the uninstalled `\\wsl.localhost\<distro>\...` root; keep entries for other distributions and custom roots. Restart `CodexNtfyWatcher` afterwards.
 
 ## Remove a native or Remote SSH Linux installation
 
@@ -211,7 +371,7 @@ systemctl --user daemon-reload 2>/dev/null || true
 systemctl --user reset-failed codex-ntfy.service 2>/dev/null || true
 ```
 
-An on-demand worker normally exits when the outbox is empty. To stop one deliberately, first review matching processes, then terminate them:
+An on-demand worker normally exits when both `pending/` and `outbox/` are empty. In strict mode, incomplete evidence can keep it alive. To stop one deliberately, first review matching processes, then terminate them:
 
 ```sh
 pgrep -af 'notify-ntfy.py.*--worker' || true
@@ -220,9 +380,9 @@ pkill -f '[n]otify-ntfy.py.*--worker' 2>/dev/null || true
 
 That pattern can match more than one custom Codex home for the same user; review before running it.
 
-### 2. Restore or remove the hook
+### 2. Restore or remove the managed hooks
 
-If no Codex settings changed after installation, copy `config.toml` from the explicitly selected backup:
+If no Codex settings changed after installation, restore `config.toml` from the explicitly selected backup. A full file-for-file rollback of `hooks.json` is covered in the Linux rollback section below; for ordinary uninstall, prefer selective removal so unrelated later hooks survive.
 
 ```sh
 codex_home=${CODEX_HOME:-"$HOME/.codex"}
@@ -232,11 +392,14 @@ cp -p -- "$backup/config.toml" "$codex_home/config.toml"
 chmod 600 "$codex_home/config.toml"
 ```
 
-Otherwise, privately back up the current file and remove only the single root-level line containing `notify-ntfy.py`. Restore any prior hook from a trusted pre-install backup. Verify with:
+Privately back up the current files, remove only the root-level `notify` line containing `notify-ntfy.py`, and run the selective Python `hooks.json` cleanup from the WSL section above. That cleanup works unchanged on native and Remote SSH Linux. Restore a prior legacy notification only from a trusted pre-install backup. Verify with:
 
 ```sh
 grep -nE '^[[:space:]]*notify[[:space:]]*=' "${CODEX_HOME:-$HOME/.codex}/config.toml"
+grep -n 'notify-ntfy' "${CODEX_HOME:-$HOME/.codex}/hooks.json" 2>/dev/null || true
 ```
+
+Do not remove the entire `hooks.json` file and do not edit the Codex trust store.
 
 ### 3. Remove managed files and optional private data
 
@@ -281,7 +444,7 @@ backup = (root / "YYYYMMDD-HHMMSS-NNNNNNNNN").resolve()  # choose explicitly
 if backup.parent != root or not backup.is_dir():
     raise SystemExit(f"invalid backup path: {backup}")
 
-managed = ("notify-ntfy.py", "install-remote-linux-target.py", "ntfy-config.json")
+managed = ("notify-ntfy.py", "install-remote-linux-target.py", "hooks.json", "ntfy-config.json")
 for name in managed:
     source = backup / name
     target = home / name
@@ -306,7 +469,7 @@ else:
 PY
 ```
 
-Replace the timestamp placeholder before running the script. Run `systemctl --user daemon-reload`, then explicitly enable/start the restored unit only if that matches the selected snapshot's intended state. State is not included in backups; isolate it before running a version whose queue schema is unknown.
+Replace the timestamp placeholder before running the script. This full rollback restores or removes `hooks.json` exactly as captured, so do not use it when later unrelated hook changes must survive; use selective uninstall instead. Run `systemctl --user daemon-reload`, then explicitly enable/start the restored unit only if that matches the selected snapshot's intended state. State is not included in backups; isolate it before running a version whose queue schema is unknown.
 
 ## Remote hosts
 

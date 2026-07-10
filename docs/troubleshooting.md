@@ -1,8 +1,8 @@
 # Troubleshooting
 
-Start with the environment in which Codex is actually running. A local VS Code window, a WSL window, and a Remote SSH window do not necessarily read the same `~/.codex`, run the same hook, or use the same queue.
+Start in the environment where Codex actually runs. The Codex app on Windows, a local VS Code window, a WSL window, and a Remote SSH window can use different `CODEX_HOME` values, hook files, rollout histories, databases, and notifier state.
 
-Do not post private config, queue records, dead letters, Codex session files, or raw logs. See [Security and privacy](security-and-privacy.md) before sharing diagnostics.
+Do not post private config, pending/outbox records, rollout files, Codex databases, dead letters, backups, or raw logs. See [Security and privacy](security-and-privacy.md).
 
 ## Quick health check
 
@@ -24,13 +24,16 @@ tail -n 40 "$HOME/.codex/ntfy-state/notify.log"
 
 The doctor output does not print the topic or credentials. Check:
 
-- `version` is the expected release;
+- `version` is `2.4.0` or a newer compatible release;
 - `topic_configured` is `true`;
-- `auth_mode` matches the intended anonymous, token, or basic-auth setup;
-- `queued` is not growing indefinitely;
-- `dead_letters` is not increasing after each test.
+- `idle_detection_mode` is `strict` when intermediate notifications must never be sent;
+- `goal_aware` and `watch_rollouts` are `true`;
+- `pending_idle` is the number of root candidates waiting for completion evidence;
+- `queued` is the network-ready outbox count;
+- `watched_rollouts` becomes nonzero after the continuous worker observes local sessions;
+- `dead_letters` is not increasing.
 
-The explicit test sends a real notification:
+The explicit test bypasses idle detection and sends a real notification:
 
 ```powershell
 & "$HOME\.codex\notify-ntfy.ps1" -Test
@@ -40,17 +43,43 @@ The explicit test sends a real notification:
 python3 "$HOME/.codex/notify-ntfy.py" --test
 ```
 
-Use `-Test`/`--test` only when publishing to the configured topic is acceptable.
+Use `-Test`/`--test` only when publishing to the configured topic is acceptable. A successful test proves delivery, not hook or idle detection.
 
-## No event is queued
+## Understand pending versus queued
 
-If a Codex turn finishes but the outbox, sent receipt count, and log do not change, the hook probably did not run.
+Version 2.4.0 has two intentionally separate stages:
 
-### Reload the Codex process
+| Doctor field | Directory | Meaning |
+| --- | --- | --- |
+| `pending_idle` | `ntfy-state/pending/` | A root completion candidate exists, but the logical-idle gate has not yet accepted it. |
+| `queued` | `ntfy-state/outbox/` | Idle was confirmed and the event is waiting for ntfy delivery/retry. |
 
-`config.toml` is read by the Codex app-server. Reload every VS Code window that was open during installation. For Remote SSH and WSL, reload the remote window, not only a local window.
+A short-lived `pending_idle > 0` is normal while the quiet window settles, a goal changes status, or a descendant finishes. A persistent value points to idle evidence; a persistent `queued > 0` points to delivery.
 
-Verify that the relevant environment has one root-level managed `notify` entry:
+Do not move a pending record into `outbox/` manually. That bypasses the intended diagnosis and can create the premature alert this release is designed to prevent.
+
+## Modern Stop hook does not run
+
+The installer writes `~/.codex/hooks.json`, but Codex requires explicit review before a new hook can execute. The project does not modify the Codex trust store.
+
+Verify that a `Stop` group is present without printing its command:
+
+```powershell
+$doc = Get-Content "$HOME\.codex\hooks.json" -Raw | ConvertFrom-Json
+@($doc.hooks.Stop).Count
+```
+
+```sh
+python3 -c 'import json, pathlib; p=pathlib.Path.home()/".codex"/"hooks.json"; print(len(json.loads(p.read_text()).get("hooks", {}).get("Stop", [])))'
+```
+
+Then open Codex in that same environment, run `/hooks`, inspect the managed command containing `notify-ntfy`, and approve it. Repeat for each WSL distribution or Remote SSH host on which the notifier was installed.
+
+Reload app/CLI processes and VS Code windows that were already running during installation. If `Stop` remains untrusted, the legacy notification and rollout watcher can still detect completions, but the modern candidate is absent.
+
+## Legacy notification does not run
+
+Confirm the relevant `config.toml` has one root-level `notify` entry:
 
 ```powershell
 Select-String -Path "$HOME\.codex\config.toml" -Pattern '^\s*notify\s*='
@@ -60,21 +89,94 @@ Select-String -Path "$HOME\.codex\config.toml" -Pattern '^\s*notify\s*='
 grep -nE '^[[:space:]]*notify[[:space:]]*=' "$HOME/.codex/config.toml"
 ```
 
-The line must appear before any TOML table header such as `[features]`; a `notify` key inside a table is not the root-level Codex setting.
+The key must appear before TOML table headers such as `[features]`. The legacy source is documented by OpenAI as `agent-turn-complete` in [advanced notification configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications).
 
-### Confirm the real Codex home
+Legacy `notify` is a fallback, not the finality decision. Its event should enter `pending/` and pass the same idle gate as `Stop`.
 
-Check `CODEX_HOME` in the process environment. When set, it can move config and state away from `~/.codex`. Remote SSH uses the remote account's home. WSL uses the selected distribution's Linux home for its hook, even when delivery is bridged to Windows.
+## No candidate appears at all
 
-### Check the upstream hook boundary
+If `pending_idle`, `queued`, receipt counts, `watched_rollouts`, and the log never change:
 
-The external hook currently covers turn completion, not every approval or input request. See [openai/codex#11808](https://github.com/openai/codex/issues/11808).
+1. confirm `CODEX_HOME` and, when used, `CODEX_SQLITE_HOME` in the Codex process environment;
+2. reload the affected Codex app/VS Code/CLI process;
+3. review the `Stop` hook with `/hooks`;
+4. verify the root-level legacy `notify` entry;
+5. confirm the continuous worker is running so rollout recovery can happen independently of a hook process;
+6. confirm Codex writes a local rollout under the expected `sessions/` tree.
 
-On Windows, an exceptionally large notify payload may exceed process-launch limits before this notifier receives it. In that case there is no queue or log entry to recover. See [openai/codex#18309](https://github.com/openai/codex/issues/18309).
+Pure cloud tasks that do not mirror lifecycle state into the local environment cannot be recovered by this notifier. It does not attach to a private app or VS Code status stream.
+
+On Windows, an exceptionally large legacy payload can fail before the notifier process launches. The continuous rollout watcher can recover it only when a local `task_complete` or `turn_aborted` was persisted.
+
+## A candidate remains pending
+
+Inspect the sanitized log first. Common idle reasons are:
+
+| Reason | Meaning | Action |
+| --- | --- | --- |
+| `settling` | The rollout has not been quiet for `idle_grace_seconds`. | Wait briefly. |
+| `turn-active` | A later `task_started` has no matching completion yet. | Let Codex finish or abort that turn. |
+| `goal-active` | The root goal is still `active`. | Let the goal reach a non-running status. |
+| `subagents-active` | At least one descendant rollout still looks active. | Let the descendant finish; check stale-child policy if it crashed. |
+| `probe-incomplete` | Matching local rollout evidence is missing or unreadable. | Verify the real Codex/session paths and upstream state format. |
+
+### Strict mode waits indefinitely
+
+This is intentional for unresolved root classification or missing matching rollout completion. `strict` has no timed fail-open. It prefers no notification over a false final notification.
+
+Check:
+
+- the event thread ID exists in the same environment’s local Codex state;
+- the matching rollout file is readable by the worker account;
+- the worker receives the correct `CODEX_HOME`/`CODEX_SQLITE_HOME`;
+- the installed notifier version matches the current Codex rollout format;
+- history/session cleanup did not remove the rollout before the candidate could be verified.
+
+If that environment cannot retain usable rollout evidence, `idle_detection_mode: "balanced"` permits a fallback after `idle_probe_grace_seconds`. This explicitly increases the risk of an intermediate notification. `off` disables idle gating and should not be used when final-only alerts are required.
+
+### Goal stays active
+
+With `goal_aware: true`, `active` blocks notification. Other observed statuses, including `complete`, `paused`, `blocked`, `usage_limited`, and `budget_limited`, are non-running and do not block.
+
+The notifier reads only the goal status. If a stale upstream goal is permanently `active`, correct/finish the task state. Setting `goal_aware: false` is possible but weakens the final-only guarantee.
+
+### A child appears stuck
+
+Descendants are discovered recursively from local Codex spawn edges and checked through their rollouts. A recent `task_started` child blocks its root. After `subagent_orphan_seconds` (1800 seconds by default), an unchanged child is considered orphaned so one abandoned rollout cannot block forever.
+
+Lowering that timeout can notify while a genuinely long-running child is still active. Increasing it delays recovery from crashed children.
+
+## Intermediate notifications still arrive
+
+Confirm all of the following:
+
+- doctor reports version 2.4.0+ and `idle_detection_mode: "strict"`;
+- the alert comes from this installation/topic rather than an older custom hook or another notifier;
+- old managed notifier handlers are not still registered under `UserPromptSubmit`, `SubagentStop`, or another hook event;
+- only one intended `notify-ntfy` `Stop` group exists per environment;
+- every worker was restarted after upgrade;
+- `suppress_subagents` and `suppress_technical_turns` are `true`;
+- Windows, WSL, and SSH environments are not publishing to the same topic through separate old installations.
+
+Per-thread coalescing writes older candidates to `suppressed/` with reason `superseded`. Known descendants use reason `subagent`; non-user-facing legacy/watcher turns use `technical-turn`. Those receipts are expected and are not sent.
+
+If `balanced` is enabled, a fallback after `idle_probe_grace_seconds` can be premature. Switch back to `strict`.
+
+## The task finished but no notification arrived
+
+Separate detection from delivery:
+
+1. If `pending_idle > 0`, use the pending guidance above.
+2. If `queued > 0`, inspect worker/network/authentication.
+3. If `sent_receipts` increased, ntfy accepted the event; inspect topic, client subscription, client privacy, and server retention.
+4. If only `suppressed` increased, the candidate was classified as subagent, technical, or superseded.
+5. If no state changed, verify hooks, continuous watcher, and local rollout availability.
+
+A terminal goal status makes an otherwise matching candidate eligible; it does not synthesize a missing thread/turn identity on its own. The rollout watcher is the recovery source for a persisted completion whose hook signal was lost.
 
 ## Events queue but do not send
 
-A nonzero `queued` count means persistence worked and the delivery side needs attention. Do not delete `outbox/` during a normal outage.
+A nonzero `queued` count means idle confirmation and persistence succeeded. Do not delete `outbox/` during a normal outage.
 
 ### Worker is stopped
 
@@ -93,15 +195,15 @@ systemctl --user restart codex-ntfy.service
 systemctl --user is-active codex-ntfy.service
 ```
 
-When the scheduled task or systemd installation was intentionally skipped, each hook starts an on-demand worker. It remains alive while the queue is nonempty. Make sure `CODEX_NTFY_NO_SPAWN=1` was not left in the Codex environment; that variable is intended for testing.
+An on-demand worker drains known queues but cannot continuously discover a hook that never ran. For missed-hook recovery, keep the scheduled task or systemd user service active.
 
-Only one worker per state directory acquires `worker.lock`. A second worker exiting immediately is expected, not a failure.
+Only one worker per state directory acquires `worker.lock`. A second worker exiting immediately is expected.
 
 ### Authentication or authorization fails
 
-HTTP 401 and 403 are retryable by design because credentials or server policy can be repaired. With the default `max_attempts: 0`, they remain in the outbox indefinitely. Correct the token/user/password and restart or wait for the worker; do not re-run Codex to create replacement events.
+HTTP 401 and 403 are retryable because credentials or server policy can be repaired. With `max_attempts: 0`, the record stays in the outbox indefinitely. Correct the token/user/password and restart or wait for the worker; do not create replacement Codex events.
 
-Check configuration syntax without printing its contents:
+Check JSON syntax without printing values:
 
 ```powershell
 Get-Content "$HOME\.codex\ntfy-config.json" -Raw | ConvertFrom-Json | Out-Null
@@ -111,115 +213,98 @@ Get-Content "$HOME\.codex\ntfy-config.json" -Raw | ConvertFrom-Json | Out-Null
 python3 -m json.tool "$HOME/.codex/ntfy-config.json" >/dev/null
 ```
 
-If environment overrides are used, inspect them in the worker's environment, not only in the current shell. A systemd service does not automatically inherit variables exported after it started.
+Environment overrides must exist in the worker’s environment. A systemd service does not automatically inherit variables exported later in an interactive shell.
 
 ### Insecure-auth refusal
 
-The log message `refusing to send ntfy credentials over an insecure connection` means token/basic credentials are configured with non-HTTPS, non-loopback HTTP. Configure TLS or a trusted local proxy. Set `allow_insecure_auth: true` only for a separately protected transport whose risk is understood.
+`refusing to send ntfy credentials over an insecure connection` means token/basic credentials target non-HTTPS, non-loopback HTTP. Configure TLS or a trusted local proxy. Enable `allow_insecure_auth` only for a separately protected transport whose risk is understood.
 
 ### Redirect rejected
 
-Redirects are deliberately not followed. Configure `server` as the final publishing endpoint. This avoids forwarding an authorization header to another location. A 3xx response is a permanent failure and moves the event to `dead/`.
+Redirects are never followed. Configure `server` as the final publishing endpoint. A 3xx response is a permanent failure and moves the event to `dead/`.
 
 ### Network, TLS, rate limit, or server failure
 
-DNS failures, connection failures, timeouts, TLS errors, and 5xx responses retry with exponential backoff. HTTP 429 and a numeric `Retry-After` are also retried. Test the same server from the same host and user context; a successful browser request on the local machine does not prove that a remote worker can reach it.
-
-Check system time as well. Large clock corrections can make persisted `next_attempt_unix_ms` appear unexpectedly early or late.
+DNS, connection, timeout, TLS, and 5xx failures retry with exponential backoff. HTTP 429 and numeric `Retry-After` are retried. Test from the same host and worker account; local browser success does not prove remote reachability.
 
 ## Dead letters
 
-`dead/` contains malformed queue files, redirect responses, most non-retryable 4xx failures, and events that reached a positive `max_attempts` limit. The default retention is 30 days.
+`dead/` contains malformed pending/outbox files, redirects, most non-retryable 4xx failures, and events that reached a positive `max_attempts`. The default retention is 30 days.
 
-First fix the underlying cause. Do not blindly move a malformed record back to the outbox; it will be rejected again. A complete valid record may be replayed manually after review, but it can contain sensitive content and may already have reached ntfy after an ambiguous failure. Stop the worker, retain a private backup, move only the reviewed file back to `outbox/`, then restart the worker. Expect at-least-once rather than exactly-once behavior.
+Fix the cause first. Do not blindly move malformed state into `outbox/`. A complete reviewed outbox record may be replayed privately, but it can contain sensitive content and may already have reached ntfy after an ambiguous failure.
 
-If the event is no longer wanted, delete only that dead-letter file. Deleting a dead letter does not remove any server-side notification.
+Deleting a dead letter does not remove any server-side notification.
 
 ## Duplicate notifications
 
-Local deduplication requires both Codex `thread-id` and `turn-id`. Doctor output does not expose individual records; inspect a private outbox/dead record locally and check `weak_identity` only if necessary. Missing IDs produce a random identity and cannot be deterministically deduplicated.
+Local deduplication requires both Codex thread and turn IDs. A weak identity cannot be deterministically deduplicated.
 
-A crash or timeout after ntfy accepts the request but before a local receipt is written causes a retry with the same `sequence_id`. Client/server sequence handling normally reduces duplicate presentation, but exactly-once display is not guaranteed.
+If ntfy accepts a request but the local receipt is not written, the retry reuses the same `sequence_id`. Exactly-once display is still not guaranteed.
 
-Queues are per host. If the same logical action is independently reported by two real hosts or two separately configured `CODEX_NTFY_STATE_DIR` values, their receipt stores do not coordinate.
-
-## Unexpected subagent notifications
-
-Keep `suppress_subagents: true` and confirm that the notifier can read the matching Codex session under the event's real `CODEX_HOME`. Classification waits up to `subagent_classification_grace_seconds` (8 seconds by default) for rollout metadata.
-
-After the grace period, an unknown session is intentionally delivered to avoid dropping a root notification. An upstream metadata change can therefore cause extra notifications. A known subagent completion increments the `suppressed` receipt count instead.
-
-For a private diagnostic, pass one captured hook payload through classification without queueing or networking:
-
-```sh
-python3 "$HOME/.codex/notify-ntfy.py" --classify --read-stdin < private-payload.json
-```
-
-The payload is sensitive and must not be attached to a public issue.
+Queues and receipts are per state directory. Two hosts or two separate `CODEX_NTFY_STATE_DIR` values do not coordinate. Coalescing prevents several candidates for one root thread from becoming several final notifications on the same state store; it does not merge independent hosts.
 
 ## WSL-specific checks
 
-The WSL hook normally follows this path:
+Normal routing:
 
 ```text
-WSL classifier -> powershell.exe bridge -> Windows outbox/worker
+WSL hooks/rollout -> WSL classifier -> powershell.exe bridge -> Windows pending/outbox worker
 ```
 
-It falls back to the WSL Python outbox when Windows interop is unavailable or the bridge fails.
+When interop fails, the WSL Python notifier owns native pending/outbox state.
 
-Every later bridge invocation checks that native outbox and starts its on-demand worker when pending records exist. This lets an event queued during an interop outage resume even after the original WSL process exited.
-
-Inside the affected distribution, check:
+Inside the affected distribution:
 
 ```sh
 test -x "$HOME/.codex/notify-ntfy-wsl.sh"
 test -x "$HOME/.codex/notify-ntfy.py"
+test -f "$HOME/.codex/hooks.json"
 command -v python3
 command -v powershell.exe || true
 printf '%s\n' "$WSL_DISTRO_NAME"
 ```
 
-Then run the Windows and WSL doctor commands separately. If the Windows doctor shows new receipts, the bridge is working. If only the WSL state changes, delivery is using the native fallback.
+Run Windows and WSL doctor commands separately. Install into the exact distribution name returned by `wsl.exe -l -q`; configuring one distribution does not configure another. Review `/hooks` inside the affected WSL Codex environment.
 
-Run `install.ps1` with the exact distribution name returned by `wsl.exe -l -q`. Installing into one distribution does not configure another.
+The Windows scheduled watcher scans its Windows `CODEX_HOME` plus WSL roots registered by `install.ps1 -WslDistro`. Check the private config's `watch_roots` entries when both WSL hooks were missed. Each entry must point to the correct distribution Codex root and, when different, `sqlite_path`; reinstall that distribution to refresh them. Unregistered distributions are intentionally not crawled.
 
 ## Remote SSH checks
 
-Open a terminal in the same VS Code Remote SSH context and run the remote platform's doctor. Confirm that:
+Open a terminal in the same VS Code Remote SSH context and run the remote platform’s doctor. Confirm:
 
 - the SSH alias points to the intended machine;
 - Codex and the installer use the same remote account;
-- Python 3.10+ exists on a Linux target;
-- the remote `config.toml`, config, state, and worker are under the remote user's home;
+- Python 3.10+ exists on Linux;
+- remote hooks, config, rollout state, and worker are under the intended remote home;
+- `/hooks` was reviewed remotely;
 - the remote host can reach the ntfy server directly.
 
-A Linux user service may stop when the user logs out unless that host keeps the user manager alive. If persistent background delivery is required, ask the host administrator whether user lingering is appropriate:
+A Linux user service may stop after logout unless the host keeps the user manager alive:
 
 ```sh
 loginctl show-user "$USER" -p Linger
 ```
 
-Even without a persistent service, the hook-spawned on-demand worker can drain the queue when Codex creates an event.
+Without a persistent service, hook-driven on-demand delivery still works, but autonomous rollout scanning between hooks is not guaranteed.
 
 ## Notification content looks wrong
 
-- Keep `include_message: false` for the generic completion text.
+- Keep `include_message: false` for generic final text.
 - Set `include_message: true` only if the final assistant response should be stored and sent.
-- Adjust `max_message_chars` to change the sent truncation limit.
-- Keep `include_full_path: false` to send only the project directory name.
-- The title uses the project name by default. Set `include_thread_title: true` to prefer the locally indexed thread title.
-- Reload Codex after changing the hook, but ordinary notifier JSON changes are read by the worker on each loop.
+- Adjust `max_message_chars` for truncation.
+- Keep `include_full_path: false` to send only the project directory.
+- Keep `include_thread_title: false` unless a prompt-derived local title is acceptable.
 
-Redaction is best-effort. If a sensitive value was published, rotate credentials/topic access and follow the ntfy server/client deletion procedure; changing the config cannot recall it.
+Redaction is best-effort. If sensitive data was published, rotate credentials/topic access and follow the ntfy server/client deletion procedure; configuration changes cannot recall it.
 
 ## Safe issue checklist
 
-Before opening a public issue, provide only:
+For a public issue, provide only:
 
-- notifier version and platform versions;
-- Windows/WSL/native Linux/Remote SSH topology;
+- notifier and platform versions;
+- Codex app/VS Code/CLI plus Windows/WSL/Linux/SSH topology;
 - sanitized doctor fields;
-- whether the hook, queue, worker, and server request stages were reached;
+- whether candidate, idle gate, outbox, worker, and server stages were reached;
 - sanitized log lines with topics, URLs, usernames, hostnames, paths, IDs, and content replaced.
 
-For a potential vulnerability or credential leak, use the private process in [SECURITY.md](../SECURITY.md).
+For a possible vulnerability or credential leak, use the private process in [SECURITY.md](../SECURITY.md).

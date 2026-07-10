@@ -6,6 +6,61 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-07-10
+
+### Added
+
+- Logical root-task idle detection: a completion candidate waits until its matching root turn is complete, no later turn is open, and the rollout has remained quiet for a configurable settling window.
+- A modern Codex `Stop` hook source alongside the legacy root-level `notify` compatibility source.
+- A continuous incremental rollout watcher that can recover locally persisted `task_complete` and `turn_aborted` events missed by hooks, retains per-file byte offsets, and never advances over an incomplete JSONL tail.
+- Bounded slow discovery for recently modified old-date and archived rollouts, while existing cursors remain watched across day boundaries.
+- A private `pending/` stage before the network-ready outbox and a `watch/` directory for rollout cursors.
+- Per-root-thread coalescing that suppresses older candidates as `superseded` instead of publishing automatic-continuation results.
+- Goal awareness that holds a root candidate while its goal status is `active`.
+- Recursive descendant awareness that waits for active subagents and uses `subagent_orphan_seconds` to bound abandoned child state.
+- `strict`, `balanced`, and `off` detection modes, with strict fail-closed behavior as the default.
+- Technical-turn suppression for legacy/watcher candidates that lack user-facing turn evidence.
+- Doctor fields for `pending_idle`, `watched_rollouts`, `idle_detection_mode`, `idle_grace_seconds`, `goal_aware`, and `watch_rollouts`.
+- Configuration for idle grace/probe timing, goal polling, child-orphan timeout, technical-turn filtering, watcher cadence, and initial replay.
+- Installer-managed multi-root rollout recovery for selected WSL distributions, preserving separate Codex and SQLite homes.
+- Regression coverage for modern `Stop`, automatic continuation coalescing, active goals, active descendants, missed-hook rollout recovery, and cross-platform hook installation.
+
+### Changed
+
+- Notifications now represent the newest locally verifiable idle epoch of a root Codex task rather than every intermediate `agent-turn-complete` event.
+- The idle gate takes a second fresh snapshot before atomic promotion. Once promoted, an outbox record is an immutable delivery epoch and cannot be coalesced with later pending work, including during network retries.
+- An event name of `Stop` is no longer treated as proof of a root session: explicitly named `SubagentStop` events are ignored, and descendant `Stop`/legacy/watcher completions are classified from local Codex state and suppressed while still delaying their root.
+- Installers now manage a single `hooks.Stop` command in `hooks.json`, remove obsolete managed notifier handlers from other lifecycle events, and preserve unrelated hook groups, handlers, and metadata.
+- The legacy `notify` command remains installed as a redundant signal instead of being replaced by the modern hook.
+- WSL bridging preserves the originating Codex and SQLite homes, and the Windows worker watches registered WSL roots when both live hook sources are missed.
+- Continuous workers also scan rollout state; on-demand workers remain the delivery fallback when a service/scheduled task is unavailable.
+- Documentation now covers Codex app, VS Code, CLI, WSL, and Remote SSH semantics, plus selective hook uninstall and rollback.
+
+### Security and privacy
+
+- Newly installed modern hooks require explicit review through `/hooks`. Installers do not modify the Codex trust store.
+- Codex SQLite databases are queried read-only/query-only; goal integration selects status and never the goal objective.
+- Rollout watcher state stores cursor metadata rather than prompt bodies. User `input-messages` remain excluded from notifier state.
+- Strict mode withholds uncertain root/rollout candidates instead of failing open into a possibly premature network notification.
+- `hooks.json` and new state directories receive host-native private permissions and are included in protected rollback handling.
+
+### Fixed
+
+- Prevented intermediate notifications when Codex completes one turn and starts an automatic continuation immediately afterwards.
+- Prevented a root notification while an active goal or descendant still has work.
+- Prevented a descendant session reported through the generic modern `Stop` hook from producing its own notification, including when its rollout appears only after the hook fires.
+- Removed global-newest-session assumptions that race across simultaneous Codex app, VS Code, and CLI tasks.
+- Added persisted-state recovery for completion signals that never launch a hook process when a continuous worker watches the same `CODEX_HOME`.
+
+### Known limitations
+
+- Pure cloud tasks are not guaranteed unless their lifecycle state is mirrored into the installed local environment.
+- Rollout recovery requires a continuous worker; Windows watches only WSL roots registered by the installer, not arbitrary distributions.
+- Modern hooks remain inactive until reviewed by the user.
+- Codex rollout JSONL and local SQLite schemas are upstream interfaces that may require future adapters.
+- Strict mode can intentionally retain a true completion when required local evidence is missing; `balanced` trades a higher false-positive risk for timed fallback.
+- Delivery after idle confirmation remains durable at-least-once rather than transactional exactly-once.
+
 ## [2.3.0] - 2026-07-10
 
 Initial public release. Earlier iterations were private and are not supported public versions.
@@ -48,5 +103,6 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.4.0...HEAD
+[2.4.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.0
 [2.3.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.3.0

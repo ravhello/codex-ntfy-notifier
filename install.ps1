@@ -121,6 +121,12 @@ function New-PrivateConfigIfNeeded {
     [string]$LegacyScript
   )
 
+  $workerSqlitePath = if ([string]::IsNullOrWhiteSpace($env:CODEX_SQLITE_HOME)) {
+    Split-Path -Parent $Target
+  } else {
+    [IO.Path]::GetFullPath($env:CODEX_SQLITE_HOME)
+  }
+
   if (Test-Path -LiteralPath $Target) {
     $config = Get-Content -LiteralPath $Target -Raw -Encoding UTF8 | ConvertFrom-Json
     $changed = $false
@@ -132,6 +138,19 @@ function New-PrivateConfigIfNeeded {
     $changed = (Add-ConfigDefault -Config $config -Name 'allow_insecure_auth' -Value $false) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'markdown' -Value $true) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'subagent_classification_grace_seconds' -Value 8) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'idle_detection_mode' -Value 'strict') -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'idle_grace_seconds' -Value 1.5) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'idle_probe_grace_seconds' -Value 30) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'goal_aware' -Value $true) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'goal_poll_seconds' -Value 1) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'subagent_orphan_seconds' -Value 1800) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'suppress_technical_turns' -Value $true) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'watch_rollouts' -Value $true) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'watch_scan_seconds' -Value 2) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'watch_discovery_seconds' -Value 60) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'watch_initial_replay_seconds' -Value 15) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'watch_roots' -Value @()) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'worker_sqlite_path' -Value $workerSqlitePath) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'dead_retention_days' -Value 30) -or $changed
     if ($null -eq $config.PSObject.Properties['max_attempts'] -or [int]$config.max_attempts -eq 40) {
       if ($null -eq $config.PSObject.Properties['max_attempts']) {
@@ -201,6 +220,19 @@ function New-PrivateConfigIfNeeded {
     include_full_path = $false
     suppress_subagents = $true
     subagent_classification_grace_seconds = 8
+    idle_detection_mode = 'strict'
+    idle_grace_seconds = 1.5
+    idle_probe_grace_seconds = 30
+    goal_aware = $true
+    goal_poll_seconds = 1
+    subagent_orphan_seconds = 1800
+    suppress_technical_turns = $true
+    watch_rollouts = $true
+    watch_scan_seconds = 2
+    watch_discovery_seconds = 60
+    watch_initial_replay_seconds = 15
+    watch_roots = @()
+    worker_sqlite_path = $workerSqlitePath
     timeout_seconds = 12
     max_attempts = 0
     retry_max_seconds = 900
@@ -223,7 +255,7 @@ function Backup-CurrentInstallation {
   $backup = Join-Path $backupRoot (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
   New-Item -ItemType Directory -Path $backup -Force | Out-Null
   Protect-PrivatePath $backup
-  foreach ($name in @('notify-ntfy.ps1', 'watch-codex-ntfy.ps1', 'watch-codex-ntfy-hidden.vbs', 'config.toml', 'ntfy-config.json')) {
+  foreach ($name in @('notify-ntfy.ps1', 'watch-codex-ntfy.ps1', 'watch-codex-ntfy-hidden.vbs', 'config.toml', 'hooks.json', 'ntfy-config.json')) {
     $source = Join-Path $HomePath $name
     if (Test-Path -LiteralPath $source) {
       Copy-Item -LiteralPath $source -Destination (Join-Path $backup $name) -Force
@@ -278,6 +310,129 @@ function Ensure-TopLevelNotify {
   Write-TextAtomic -Path $ConfigPath -Content $updated
 }
 
+function Test-ManagedHookHandler {
+  param([object]$Handler)
+
+  if ($null -eq $Handler -or $Handler -isnot [System.Management.Automation.PSCustomObject]) {
+    return $false
+  }
+  foreach ($field in @('command', 'commandWindows', 'command_windows')) {
+    $property = $Handler.PSObject.Properties[$field]
+    if ($null -ne $property -and $property.Value -is [string] -and
+        $property.Value -match '(?i)(?:^|[\\/])notify-ntfy(?:\.ps1|\.py|-wsl\.sh)(?=$|[\s''"])') {
+      return $true
+    }
+  }
+  return $false
+}
+
+function ConvertTo-PosixShellArgument {
+  param([string]$Value)
+
+  $singleQuote = [string][char]39
+  $doubleQuote = [string][char]34
+  $escapedQuote = $singleQuote + $doubleQuote + $singleQuote + $doubleQuote + $singleQuote
+  return $singleQuote + $Value.Replace($singleQuote, $escapedQuote) + $singleQuote
+}
+
+function Ensure-StopHook {
+  param(
+    [string]$HooksPath,
+    [string]$Command
+  )
+
+  $original = if (Test-Path -LiteralPath $HooksPath) {
+    [System.IO.File]::ReadAllText($HooksPath)
+  } else { '' }
+  try {
+    $document = if ([string]::IsNullOrWhiteSpace($original)) {
+      [pscustomobject][ordered]@{}
+    } else {
+      $original | ConvertFrom-Json
+    }
+  } catch {
+    throw "Invalid JSON in ${HooksPath}: $($_.Exception.Message)"
+  }
+  if ($null -eq $document -or $document -isnot [System.Management.Automation.PSCustomObject]) {
+    throw "$HooksPath must contain a JSON object."
+  }
+
+  $hooksProperty = $document.PSObject.Properties['hooks']
+  if ($null -eq $hooksProperty) {
+    Add-Member -InputObject $document -MemberType NoteProperty -Name 'hooks' -Value ([pscustomobject][ordered]@{})
+    $hooksProperty = $document.PSObject.Properties['hooks']
+  } elseif ($null -eq $hooksProperty.Value -or $hooksProperty.Value -isnot [System.Management.Automation.PSCustomObject]) {
+    throw "hooks in $HooksPath must contain a JSON object."
+  }
+  $hookEvents = $hooksProperty.Value
+
+  foreach ($eventProperty in @($hookEvents.PSObject.Properties)) {
+    if ($eventProperty.Value -isnot [array]) {
+      if ($eventProperty.Name -eq 'Stop') {
+        throw "hooks.Stop in $HooksPath must contain a JSON array."
+      }
+      continue
+    }
+    $filteredGroups = New-Object 'System.Collections.Generic.List[object]'
+    $removedFromEvent = $false
+    foreach ($group in @($eventProperty.Value)) {
+      if ($null -eq $group -or $group -isnot [System.Management.Automation.PSCustomObject]) {
+        $filteredGroups.Add($group)
+        continue
+      }
+      $handlersProperty = $group.PSObject.Properties['hooks']
+      if ($null -eq $handlersProperty -or $handlersProperty.Value -isnot [array]) {
+        $filteredGroups.Add($group)
+        continue
+      }
+      $filteredHandlers = New-Object 'System.Collections.Generic.List[object]'
+      $removedFromGroup = $false
+      foreach ($handler in @($handlersProperty.Value)) {
+        if (Test-ManagedHookHandler -Handler $handler) {
+          $removedFromGroup = $true
+          $removedFromEvent = $true
+        } else {
+          $filteredHandlers.Add($handler)
+        }
+      }
+      if ($filteredHandlers.Count -gt 0) {
+        $handlersProperty.Value = @($filteredHandlers.ToArray())
+        $filteredGroups.Add($group)
+      } elseif (-not $removedFromGroup) {
+        $filteredGroups.Add($group)
+      }
+    }
+    if ($filteredGroups.Count -gt 0 -or -not $removedFromEvent) {
+      $eventProperty.Value = @($filteredGroups.ToArray())
+    } else {
+      $hookEvents.PSObject.Properties.Remove($eventProperty.Name)
+    }
+  }
+
+  $stopProperty = $hookEvents.PSObject.Properties['Stop']
+  if ($null -eq $stopProperty) {
+    Add-Member -InputObject $hookEvents -MemberType NoteProperty -Name 'Stop' -Value @()
+    $stopProperty = $hookEvents.PSObject.Properties['Stop']
+  } elseif ($stopProperty.Value -isnot [array]) {
+    throw "hooks.Stop in $HooksPath must contain a JSON array."
+  }
+  $managedGroup = [pscustomobject][ordered]@{
+    hooks = @(
+      [pscustomobject][ordered]@{
+        type = 'command'
+        command = $Command
+        timeout = 30
+      }
+    )
+  }
+  $stopProperty.Value = @(@($stopProperty.Value) + $managedGroup)
+
+  $rendered = ($document | ConvertTo-Json -Depth 32) + [Environment]::NewLine
+  if ($rendered -ne $original) {
+    Write-TextAtomic -Path $HooksPath -Content $rendered
+  }
+}
+
 function Restore-WindowsInstallation {
   param(
     [string]$HomePath,
@@ -290,7 +445,7 @@ function Restore-WindowsInstallation {
   if (-not $SkipScheduledTask) {
     Stop-LegacyTask
   }
-  foreach ($name in @('notify-ntfy.ps1', 'watch-codex-ntfy.ps1', 'watch-codex-ntfy-hidden.vbs', 'config.toml', 'ntfy-config.json')) {
+  foreach ($name in @('notify-ntfy.ps1', 'watch-codex-ntfy.ps1', 'watch-codex-ntfy-hidden.vbs', 'config.toml', 'hooks.json', 'ntfy-config.json')) {
     $saved = Join-Path $BackupPath $name
     $target = Join-Path $HomePath $name
     if (Test-Path -LiteralPath $saved) {
@@ -301,7 +456,7 @@ function Restore-WindowsInstallation {
       Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
     }
   }
-  foreach ($privateName in @('config.toml', 'ntfy-config.json')) {
+  foreach ($privateName in @('config.toml', 'hooks.json', 'ntfy-config.json')) {
     Protect-PrivatePath (Join-Path $HomePath $privateName)
   }
 
@@ -354,12 +509,18 @@ function Install-WindowsFiles {
   New-Item -ItemType Directory -Path $state -Force | Out-Null
   Protect-PrivatePath $state
 
-  $escapedScript = (Join-Path $HomePath 'notify-ntfy.ps1').Replace('\', '\\').Replace('"', '\"')
-  $windowsPowerShell = (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe').Replace('\', '\\').Replace('"', '\"')
+  $scriptPath = Join-Path $HomePath 'notify-ntfy.ps1'
+  $windowsPowerShellPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $escapedScript = $scriptPath.Replace('\', '\\').Replace('"', '\"')
+  $windowsPowerShell = $windowsPowerShellPath.Replace('\', '\\').Replace('"', '\"')
   $notifyLine = 'notify = ["' + $windowsPowerShell + '", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "' + $escapedScript + '"]'
   $configPath = Join-Path $HomePath 'config.toml'
   Ensure-TopLevelNotify -ConfigPath $configPath -NotifyLine $notifyLine -ExpectedMarker 'notify-ntfy.ps1'
   Protect-PrivatePath $configPath
+  $hookCommand = '"{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{1}" -HookEvent' -f $windowsPowerShellPath, $scriptPath
+  $hooksPath = Join-Path $HomePath 'hooks.json'
+  Ensure-StopHook -HooksPath $hooksPath -Command $hookCommand
+  Protect-PrivatePath $hooksPath
 }
 
 function Ensure-ScheduledWorker {
@@ -409,6 +570,73 @@ function Convert-WslHomeToUnc {
   return "\\wsl.localhost\$Distro\$relative"
 }
 
+function Register-WslWatchRoot {
+  param(
+    [string]$ConfigPath,
+    [string]$Distro,
+    [string]$Root,
+    [string]$SqliteRoot
+  )
+
+  $config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  $entries = @()
+  $property = $config.PSObject.Properties['watch_roots']
+  if ($null -ne $property) {
+    foreach ($entry in @($property.Value)) {
+      if ($entry -is [string]) {
+        $entries += [pscustomobject][ordered]@{ path = [string]$entry; sqlite_path = [string]$entry; origin = '' }
+      } elseif ($null -ne $entry) {
+        $path = [string]$entry.path
+        if (-not [string]::IsNullOrWhiteSpace($path)) {
+          $sqlitePath = [string]$entry.sqlite_path
+          if ([string]::IsNullOrWhiteSpace($sqlitePath)) { $sqlitePath = $path }
+          $entries += [pscustomobject][ordered]@{ path = $path; sqlite_path = $sqlitePath; origin = [string]$entry.origin }
+        }
+      }
+    }
+  }
+  $managedOrigin = "WSL:$Distro"
+  $entries = @($entries | Where-Object {
+      -not [string]::Equals($_.path, $Root, [StringComparison]::OrdinalIgnoreCase) -and
+      -not [string]::Equals($_.origin, $managedOrigin, [StringComparison]::OrdinalIgnoreCase)
+    })
+  $entries += [pscustomobject][ordered]@{ path = $Root; sqlite_path = $SqliteRoot; origin = $managedOrigin }
+  if ($null -eq $property) {
+    Add-Member -InputObject $config -MemberType NoteProperty -Name 'watch_roots' -Value @($entries)
+  } else {
+    $property.Value = @($entries)
+  }
+  Write-TextAtomic -Path $ConfigPath -Content ($config | ConvertTo-Json -Depth 8)
+  Protect-PrivatePath $ConfigPath
+}
+
+function Restore-WslInstallation {
+  param([object]$State)
+
+  if ($null -eq $State) { return }
+  foreach ($name in @($State.Managed)) {
+    $saved = Join-Path $State.Backup $name
+    $target = Join-Path $State.UncCodex $name
+    if (Test-Path -LiteralPath $saved) {
+      Copy-Item -LiteralPath $saved -Destination $target -Force
+    } elseif ($name -notin @($State.PreviouslyPresent)) {
+      Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+    }
+  }
+  foreach ($name in @('notify-ntfy.py', 'notify-ntfy-wsl.sh')) {
+    if (Test-Path -LiteralPath (Join-Path $State.UncCodex $name)) {
+      & wsl.exe -d $State.Distro -- chmod 700 "$($State.LinuxCodex)/$name"
+      if ($LASTEXITCODE -ne 0) { throw "Could not restore WSL executable permissions in $($State.Distro)." }
+    }
+  }
+  foreach ($name in @('ntfy-config.json', 'config.toml', 'hooks.json')) {
+    if (Test-Path -LiteralPath (Join-Path $State.UncCodex $name)) {
+      & wsl.exe -d $State.Distro -- chmod 600 "$($State.LinuxCodex)/$name"
+      if ($LASTEXITCODE -ne 0) { throw "Could not restore WSL private permissions in $($State.Distro)." }
+    }
+  }
+}
+
 function Install-WslNotifier {
   param(
     [string]$Distro,
@@ -425,7 +653,13 @@ function Install-WslNotifier {
   if ([string]::IsNullOrWhiteSpace($linuxCodex) -or -not $linuxCodex.StartsWith('/')) {
     throw "Could not resolve CODEX_HOME in WSL distro $Distro."
   }
+  $linuxSqlite = (& wsl.exe -d $Distro -- sh -lc 'printf %s "${CODEX_SQLITE_HOME:-${CODEX_HOME:-$HOME/.codex}}"').Trim()
+  if ([string]::IsNullOrWhiteSpace($linuxSqlite) -or -not $linuxSqlite.StartsWith('/')) {
+    throw "Could not resolve CODEX_SQLITE_HOME in WSL distro $Distro."
+  }
   $uncCodex = Convert-WslHomeToUnc -Distro $Distro -LinuxHome $linuxCodex
+  $uncSqlite = Convert-WslHomeToUnc -Distro $Distro -LinuxHome $linuxSqlite
+  Register-WslWatchRoot -ConfigPath $PrivateConfig -Distro $Distro -Root $uncCodex -SqliteRoot $uncSqlite
   New-Item -ItemType Directory -Path $uncCodex -Force | Out-Null
   & wsl.exe -d $Distro -- chmod 700 $linuxCodex
   if ($LASTEXITCODE -ne 0) { throw "Could not protect the WSL Codex directory in $Distro." }
@@ -436,7 +670,7 @@ function Install-WslNotifier {
   $linuxBackup = "$linuxBackupRoot/$(Split-Path -Leaf $backup)"
   & wsl.exe -d $Distro -- chmod 700 $linuxBackupRoot $linuxBackup
   if ($LASTEXITCODE -ne 0) { throw "Could not protect the WSL backup in $Distro." }
-  $managed = @('notify-ntfy.py', 'notify-ntfy-wsl.sh', 'ntfy-config.json', 'config.toml')
+  $managed = @('notify-ntfy.py', 'notify-ntfy-wsl.sh', 'ntfy-config.json', 'config.toml', 'hooks.json')
   $previouslyPresent = @()
   foreach ($name in $managed) {
     $source = Join-Path $uncCodex $name
@@ -451,6 +685,14 @@ function Install-WslNotifier {
     Sort-Object Name -Descending |
     Select-Object -Skip 10 |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+  $rollbackState = [pscustomobject][ordered]@{
+    Distro = $Distro
+    UncCodex = $uncCodex
+    LinuxCodex = $linuxCodex
+    Backup = $backup
+    PreviouslyPresent = @($previouslyPresent)
+    Managed = @($managed)
+  }
 
   try {
     foreach ($copy in @(
@@ -468,36 +710,22 @@ function Install-WslNotifier {
     $escapedWindowsScript = $WindowsScriptPath.Replace('\', '\\').Replace('"', '\"')
     $notifyLine = 'notify = ["' + $escapedLinuxScript + '", "--windows-script", "' + $escapedWindowsScript + '"]'
     Ensure-TopLevelNotify -ConfigPath (Join-Path $uncCodex 'config.toml') -NotifyLine $notifyLine -ExpectedMarker 'notify-ntfy-wsl.sh'
+    $hookCommand = (ConvertTo-PosixShellArgument ($linuxCodex + '/notify-ntfy-wsl.sh')) +
+      ' --hook-event --windows-script ' + (ConvertTo-PosixShellArgument $WindowsScriptPath)
+    Ensure-StopHook -HooksPath (Join-Path $uncCodex 'hooks.json') -Command $hookCommand
 
     & wsl.exe -d $Distro -- chmod 700 "$linuxCodex/notify-ntfy.py" "$linuxCodex/notify-ntfy-wsl.sh"
     if ($LASTEXITCODE -ne 0) { throw "Could not protect WSL executables in $Distro." }
-    & wsl.exe -d $Distro -- chmod 600 "$linuxCodex/ntfy-config.json" "$linuxCodex/config.toml"
+    & wsl.exe -d $Distro -- chmod 600 "$linuxCodex/ntfy-config.json" "$linuxCodex/config.toml" "$linuxCodex/hooks.json"
     if ($LASTEXITCODE -ne 0) { throw "Could not protect WSL private configuration in $Distro." }
     & wsl.exe -d $Distro -- python3 "$linuxCodex/notify-ntfy.py" --doctor | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "WSL doctor failed for $Distro." }
     Write-Status "Installed WSL bridge and native fallback in $Distro."
+    return $rollbackState
   } catch {
     $installationError = $_
     try {
-      foreach ($name in $managed) {
-        $saved = Join-Path $backup $name
-        $target = Join-Path $uncCodex $name
-        if (Test-Path -LiteralPath $saved) {
-          Copy-Item -LiteralPath $saved -Destination $target -Force
-        } elseif ($name -notin $previouslyPresent) {
-          Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
-        }
-      }
-      foreach ($name in @('notify-ntfy.py', 'notify-ntfy-wsl.sh')) {
-        if (Test-Path -LiteralPath (Join-Path $uncCodex $name)) {
-          & wsl.exe -d $Distro -- chmod 700 "$linuxCodex/$name"
-        }
-      }
-      foreach ($name in @('ntfy-config.json', 'config.toml')) {
-        if (Test-Path -LiteralPath (Join-Path $uncCodex $name)) {
-          & wsl.exe -d $Distro -- chmod 600 "$linuxCodex/$name"
-        }
-      }
+      Restore-WslInstallation -State $rollbackState
     } catch {
       Write-Warning "Automatic WSL rollback failed; use the private backup at $linuxBackup."
     }
@@ -514,7 +742,7 @@ foreach ($required in @('notify-ntfy.ps1', 'notify-ntfy.py', 'notify-ntfy-wsl.sh
 New-Item -ItemType Directory -Path $CodexHome -Force | Out-Null
 $legacyScript = Join-Path $CodexHome 'notify-ntfy.ps1'
 $privateConfig = Join-Path $CodexHome 'ntfy-config.json'
-$managedNames = @('notify-ntfy.ps1', 'watch-codex-ntfy.ps1', 'watch-codex-ntfy-hidden.vbs', 'config.toml', 'ntfy-config.json')
+$managedNames = @('notify-ntfy.ps1', 'watch-codex-ntfy.ps1', 'watch-codex-ntfy-hidden.vbs', 'config.toml', 'hooks.json', 'ntfy-config.json')
 $previouslyPresent = @($managedNames | Where-Object { Test-Path -LiteralPath (Join-Path $CodexHome $_) })
 $previousTask = if ($SkipScheduledTask) { $null } else { Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }
 $taskPreviouslyPresent = $null -ne $previousTask
@@ -523,6 +751,7 @@ if ($taskPreviouslyPresent -and -not (Test-OwnedScheduledTask -Task $previousTas
   throw "Scheduled task '$TaskName' already exists but is unrelated; refusing to overwrite it."
 }
 $backup = Backup-CurrentInstallation -HomePath $CodexHome
+$wslInstallations = @()
 
 try {
   New-PrivateConfigIfNeeded -Target $privateConfig -LegacyScript $legacyScript
@@ -533,7 +762,8 @@ try {
   Ensure-ScheduledWorker -HomePath $CodexHome
   if (-not $NoWsl) {
     foreach ($distro in $WslDistro) {
-      Install-WslNotifier -Distro $distro -PrivateConfig $privateConfig -WindowsScriptPath (Join-Path $CodexHome 'notify-ntfy.ps1')
+      $installedWsl = Install-WslNotifier -Distro $distro -PrivateConfig $privateConfig -WindowsScriptPath (Join-Path $CodexHome 'notify-ntfy.ps1')
+      if ($null -ne $installedWsl) { $wslInstallations += $installedWsl }
     }
   }
   & (Join-Path $CodexHome 'notify-ntfy.ps1') -Doctor | Out-Null
@@ -541,9 +771,18 @@ try {
     throw 'Windows notifier doctor failed.'
   }
   Write-Status 'Installation completed without exposing the ntfy destination.'
+  Write-Warning 'Codex will skip the new Stop hook until you review and trust it with /hooks in every installed Codex environment.'
   Write-Status 'Reload existing VS Code windows so their Codex app-server reads the new WSL notify command.'
 } catch {
   $installationError = $_
+  for ($index = $wslInstallations.Count - 1; $index -ge 0; $index--) {
+    try {
+      Restore-WslInstallation -State $wslInstallations[$index]
+      Write-Warning "WSL installation $($wslInstallations[$index].Distro) was restored automatically."
+    } catch {
+      Write-Warning "Automatic WSL rollback failed for $($wslInstallations[$index].Distro): $($_.Exception.Message)"
+    }
+  }
   try {
     Restore-WindowsInstallation `
       -HomePath $CodexHome `
