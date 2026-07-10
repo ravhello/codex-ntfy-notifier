@@ -1,0 +1,22 @@
+{
+  "server": "https://ntfy.sh",
+  "topic": "replace-with-a-long-random-topic",
+  "token": "",
+  "username": "",
+  "password": "",
+  "allow_insecure_auth": false,
+  "priority": 3,
+  "tags": ["computer", "white_check_mark"],
+  "max_message_chars": 900,
+  "include_message": false,
+  "include_thread_title": false,
+  "markdown": true,
+  "include_full_path": false,
+  "suppress_subagents": true,
+  "subagent_classification_grace_seconds": 8,
+  "timeout_seconds": 12,
+  "max_attempts": 0,
+  "retry_max_seconds": 900,
+  "sent_retention_days": 14,
+  "dead_retention_days": 30
+}

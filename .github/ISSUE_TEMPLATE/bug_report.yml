@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a reproducible problem with installation or notification delivery.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the notifier.
+
+        **Privacy warning:** do not attach unredacted configuration files, logs, Codex sessions, outbox/dead-letter records, or state files. Remove topic names, tokens, hostnames, usernames, project paths, prompts, and assistant messages first.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Run the notifier with `--doctor` or `-Doctor`, or provide the release tag.
+      placeholder: 2.3.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Windows
+        - WSL
+        - Native Linux
+        - VS Code Remote SSH to Windows
+        - VS Code Remote SSH to Linux
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest safe sequence of steps that reproduces the problem.
+      placeholder: |
+        1. Install with ...
+        2. Open ...
+        3. Run ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Paste only the relevant, fully redacted `--doctor` or `-Doctor` output. Do not upload raw runtime files.
+      render: text
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials, topic names, personal paths, host details, prompts, and assistant content from everything in this report.
+          required: true

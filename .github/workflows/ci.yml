@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu:
+    name: Ubuntu / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.14"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Verify release version
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          expected = Path("VERSION").read_text(encoding="utf-8").strip()
+          python_source = Path("src/notify-ntfy.py").read_text(encoding="utf-8")
+          powershell_source = Path("src/notify-ntfy.ps1").read_text(encoding="utf-8")
+          python_version = re.search(r'^VERSION = "([^"]+)"$', python_source, re.MULTILINE)
+          powershell_version = re.search(r"^\$ScriptVersion = '([^']+)'$", powershell_source, re.MULTILINE)
+          assert python_version, "Python VERSION constant was not found"
+          assert powershell_version, "PowerShell ScriptVersion constant was not found"
+          assert python_version.group(1) == expected, (python_version.group(1), expected)
+          assert powershell_version.group(1) == expected, (powershell_version.group(1), expected)
+
+      - name: Compile Python sources
+        run: python -m compileall -q src tests
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check POSIX shell syntax
+        run: sh -n install-linux.sh install-remote-linux.sh src/notify-ntfy-wsl.sh
+
+      - name: Run ShellCheck
+        run: shellcheck install-linux.sh install-remote-linux.sh src/notify-ntfy-wsl.sh
+
+  windows:
+    name: Windows / Python 3.14 / Windows PowerShell 5.1
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+
+      - name: Verify release version
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          expected = Path("VERSION").read_text(encoding="utf-8").strip()
+          python_source = Path("src/notify-ntfy.py").read_text(encoding="utf-8")
+          powershell_source = Path("src/notify-ntfy.ps1").read_text(encoding="utf-8")
+          python_version = re.search(r'^VERSION = "([^"]+)"$', python_source, re.MULTILINE)
+          powershell_version = re.search(r"^\$ScriptVersion = '([^']+)'$", powershell_source, re.MULTILINE)
+          assert python_version, "Python VERSION constant was not found"
+          assert powershell_version, "PowerShell ScriptVersion constant was not found"
+          assert python_version.group(1) == expected, (python_version.group(1), expected)
+          assert powershell_version.group(1) == expected, (powershell_version.group(1), expected)
+
+      - name: Compile Python sources
+        run: python -m compileall -q src tests
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Parse PowerShell with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $parseFailed = $false
+          Get-ChildItem -Path . -Filter '*.ps1' -File -Recurse | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $parseFailed = $true
+              Write-Error ("{0}: {1}" -f $_.FullName, ($errors -join [Environment]::NewLine)) -ErrorAction Continue
+            }
+          }
+          if ($parseFailed) {
+            throw 'PowerShell parsing failed.'
+          }
