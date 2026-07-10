@@ -32,7 +32,8 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
+MAX_NTFY_MESSAGE_BYTES = 3500
 
 
 def utc_now() -> dt.datetime:
@@ -81,6 +82,30 @@ def obj_value(value: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+def truncate_text(value: str, max_length: int) -> str:
+    """Truncate at a readable Unicode boundary without splitting a word when possible."""
+    if len(value) <= max_length:
+        return value
+    if max_length <= 1:
+        return "…"[:max_length]
+    prefix = value[: max_length - 1].rstrip()
+    boundary = max(prefix.rfind(" "), prefix.rfind("\n"))
+    if boundary >= int((max_length - 1) * 0.7):
+        prefix = prefix[:boundary].rstrip()
+    return prefix + "…"
+
+
+def truncate_utf8(value: str, max_bytes: int) -> str:
+    """Fit text into a byte budget while keeping valid UTF-8."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    suffix = "…"
+    budget = max(0, max_bytes - len(suffix.encode("utf-8")))
+    prefix = encoded[:budget].decode("utf-8", errors="ignore").rstrip()
+    return prefix + suffix if max_bytes >= len(suffix.encode("utf-8")) else ""
+
+
 def sanitize(text: Any, max_length: int = 900, *, preserve_lines: bool = False) -> str:
     value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     if preserve_lines:
@@ -101,9 +126,7 @@ def sanitize(text: Any, max_length: int = 900, *, preserve_lines: bool = False) 
     )
     value = re.sub(r"(?i)\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,})\b", "[REDACTED]", value)
     value = re.sub(r"(?i)https://ntfy\.sh/[A-Za-z0-9._~-]+", "https://ntfy.sh/[REDACTED]", value)
-    if len(value) > max_length:
-        return value[: max(0, max_length - 3)] + "..."
-    return value
+    return truncate_text(value, max_length)
 
 
 class Runtime:
@@ -196,9 +219,26 @@ def load_config(runtime: Runtime) -> dict[str, Any]:
     def setting(env_name: str, key: str, default: Any = "") -> Any:
         return os.environ.get(env_name) or file_config.get(key, default)
 
-    tags = file_config.get("tags", ["computer", "white_check_mark"])
+    tags = file_config.get("tags", ["white_check_mark"])
+    if tags is None:
+        tags = ["white_check_mark"]
     if isinstance(tags, str):
         tags = [part.strip() for part in tags.split(",") if part.strip()]
+    elif isinstance(tags, list):
+        tags = [str(part).strip() if isinstance(part, str) else "" for part in tags]
+    else:
+        raise ValueError("tags must be an array of strings or a comma-separated string")
+    if any(not tag or len(tag) > 32 or any(character.isspace() for character in tag) for tag in tags):
+        raise ValueError("tags must contain non-empty strings of at most 32 characters without whitespace")
+    tags = list(dict.fromkeys(tags))
+    if len(tags) > 3:
+        raise ValueError("tags must contain at most 3 values")
+    priority = int(file_config.get("priority", 3))
+    if not 1 <= priority <= 5:
+        raise ValueError("priority must be between 1 and 5")
+    max_message_chars = int(file_config.get("max_message_chars", 180))
+    if not 32 <= max_message_chars <= 3000:
+        raise ValueError("max_message_chars must be between 32 and 3000")
     idle_detection_mode = str(file_config.get("idle_detection_mode", "strict")).strip().lower()
     if idle_detection_mode not in ("strict", "balanced", "off"):
         raise ValueError("idle_detection_mode must be strict, balanced, or off")
@@ -209,12 +249,12 @@ def load_config(runtime: Runtime) -> dict[str, Any]:
         "username": str(setting("CODEX_NTFY_USER", "username", "")),
         "password": str(setting("CODEX_NTFY_PASSWORD", "password", "")),
         "allow_insecure_auth": bool(file_config.get("allow_insecure_auth", False)),
-        "priority": int(file_config.get("priority", 3)),
+        "priority": priority,
         "tags": list(tags),
-        "max_message_chars": int(file_config.get("max_message_chars", 900)),
+        "max_message_chars": max_message_chars,
         "include_message": bool(file_config.get("include_message", False)),
         "include_thread_title": bool(file_config.get("include_thread_title", False)),
-        "markdown": bool(file_config.get("markdown", True)),
+        "markdown": bool(file_config.get("markdown", False)),
         "include_full_path": bool(file_config.get("include_full_path", False)),
         "suppress_subagents": bool(file_config.get("suppress_subagents", True)),
         "subagent_classification_grace_seconds": float(file_config.get("subagent_classification_grace_seconds", 8)),
@@ -720,7 +760,7 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
                     raw_terminal_message = (
                         str(payload.get("last_agent_message", ""))
                         if event_type == "task_complete"
-                        else "Turn aborted."
+                        else ""
                     )
                     latest_terminal_message = (
                         sanitize(raw_terminal_message, 4000, preserve_lines=True)
@@ -733,6 +773,7 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
                     candidate_completed = True
                     candidate_final_message = bool(str(payload.get("last_agent_message", "")).strip()) or event_type == "turn_aborted"
                     candidate_completion_end_offset = line_offset
+                    record["completion_event_type"] = event_type
                 if event_type in ("task_complete", "turn_aborted") and current_turn == event_turn:
                     current_turn = ""
             elif event_type == "user_message":
@@ -890,6 +931,9 @@ def new_record(
         "session_classification": classification,
         "include_message": include_message,
         "source_event": str(obj_value(event, "hook-event-name", "hook_event_name", default="legacy-notify")),
+        "completion_event_type": str(
+            obj_value(event, "completion-event-type", "completion_event_type", default="")
+        ),
         "created_at": now.isoformat(),
         "created_unix_ms": now_ms,
         "next_probe_unix_ms": now_ms,
@@ -1025,6 +1069,7 @@ def enqueue_latest_probe_candidate(
         "cwd": str(stale_event.get("cwd", "")),
         "last-assistant-message": str(probe.get("latest_terminal_message", "")),
         "hook-event-name": "rollout-probe",
+        "completion-event-type": event_type,
     }
     recovered = new_record(
         event,
@@ -1457,8 +1502,9 @@ def scan_rollout_file(
                 "cwd": cwd,
                 "last-assistant-message": str(payload.get("last_agent_message", ""))
                 if event_type == "task_complete"
-                else "Turn aborted.",
+                else "",
                 "hook-event-name": "rollout-watch",
+                "completion-event-type": event_type,
                 "source": source,
             }
             classification = event_classification(
@@ -1522,31 +1568,79 @@ def scan_rollouts(runtime: Runtime, config: dict[str, Any], now_ms: int) -> int:
     return queued
 
 
+def completion_label(record: dict[str, Any]) -> str:
+    goal = str(record.get("goal_status", "")).strip().lower()
+    labels = {
+        "blocked": "blocked",
+        "paused": "paused",
+        "usage_limited": "usage limit",
+        "budget_limited": "budget limit",
+    }
+    if goal in labels:
+        return labels[goal]
+    if str(record.get("completion_event_type", "")).strip().lower() == "turn_aborted":
+        return "stopped"
+    return "done"
+
+
 def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     event = record["event"]
     cwd = str(obj_value(event, "cwd", "working-directory", "working_directory", default=""))
-    project = sanitize(project_name(cwd), 50)
-    title = project
+    project = sanitize(project_name(cwd), 42)
+    display_name = project
+    has_distinct_thread_title = False
     if config["include_thread_title"]:
-        title = sanitize(thread_title(runtime, record.get("thread_id", ""), record.get("session_codex_home", "")), 58) or project
-    last_message = sanitize(
-        obj_value(event, "last-assistant-message", "last_assistant_message", default=""),
-        config["max_message_chars"],
-        preserve_lines=True,
-    ) or "Turn completed."
-    location = f"Folder: {sanitize(cwd, 180)}" if config["include_full_path"] and cwd else f"Project: {project}"
-    metadata = [location, f"Source: {record['origin']}"]
-    if record.get("thread_id"):
-        metadata.append(f"Thread: {record['thread_id'][:8]}")
-    return {
+        local_title = sanitize(
+            thread_title(runtime, record.get("thread_id", ""), record.get("session_codex_home", "")),
+            42,
+        )
+        if local_title:
+            display_name = local_title
+            has_distinct_thread_title = local_title.casefold() != project.casefold()
+
+    metadata: list[str] = []
+    if config["include_full_path"] and cwd:
+        metadata.append(sanitize(cwd, 120))
+    elif has_distinct_thread_title:
+        metadata.append(project)
+    origin = sanitize(record.get("origin", ""), 40)
+    if origin:
+        metadata.append(origin)
+    thread_id = sanitize(str(record.get("thread_id", ""))[:8], 8)
+    if thread_id:
+        metadata.append(f"#{thread_id}")
+    context = " · ".join(metadata)
+
+    summary = ""
+    if config["include_message"]:
+        summary = sanitize(
+            obj_value(event, "last-assistant-message", "last_assistant_message", default=""),
+            config["max_message_chars"],
+            preserve_lines=config["markdown"],
+        )
+    separator = "\n\n" if config["markdown"] and summary else " · "
+    suffix = separator + context if summary and context else context
+    if summary:
+        summary_budget = MAX_NTFY_MESSAGE_BYTES - len(suffix.encode("utf-8"))
+        summary = truncate_utf8(summary, max(0, summary_budget))
+        body = summary + suffix
+    else:
+        body = context or completion_label(record).capitalize()
+    body = truncate_utf8(body, MAX_NTFY_MESSAGE_BYTES)
+
+    payload: dict[str, Any] = {
         "topic": config["topic"],
-        "title": f"Codex finished - {title}",
-        "message": last_message + "\n\n" + " | ".join(metadata),
-        "tags": config["tags"],
-        "priority": config["priority"],
-        "markdown": config["markdown"],
+        "title": sanitize(f"Codex {completion_label(record)} · {display_name}", 64),
+        "message": body,
         "sequence_id": record["sequence_id"],
     }
+    if config["tags"]:
+        payload["tags"] = config["tags"]
+    if config["priority"] != 3:
+        payload["priority"] = config["priority"]
+    if config["markdown"] and bool(summary):
+        payload["markdown"] = True
+    return payload
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):

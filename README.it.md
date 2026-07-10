@@ -11,7 +11,7 @@ Notifiche push ntfy affidabili quando una task root di OpenAI Codex è davvero i
 
 Una singola task Codex può produrre più segnali di fine turno mentre ha ancora lavoro: può partire subito una continuazione automatica, il goal può essere ancora `active` oppure un subagent può stare lavorando. Inviare ogni segnale crea notifiche “completato” premature.
 
-La versione 2.4.0 considera completata una task solo dopo un vero **periodo di idle logico**:
+La versione 2.4 ha introdotto il **periodo di idle logico** mantenuto dalla 2.4.1:
 
 - l’hook moderno Codex `Stop` crea un candidato, ma non pubblica direttamente;
 - la notifica legacy `agent-turn-complete` rimane come segnale di compatibilità;
@@ -30,6 +30,21 @@ Dopo la conferma di idle, il motore di consegna:
 - non memorizza i prompt e, per impostazione predefinita, esclude anche il messaggio finale.
 
 La garanzia di consegna è **at-least-once durevole**, non exactly-once transazionale.
+
+## Formato compatto della notifica
+
+La versione 2.4.1 mantiene la regola idle-only della 2.4 e rende la presentazione ntfy compatta e consapevole dello stato:
+
+```text
+Titolo: Codex <done|blocked|paused|usage limit|budget limit|stopped> · <task-o-progetto>
+Corpo:  [messaggio finale ·] [progetto ·] origine · #thread8
+```
+
+Una completion normale usa `Codex done`; gli stati terminali del goal selezionano `blocked`, `paused`, `usage limit` o `budget limit`, mentre un turno interrotto usa `stopped`. Per impostazione predefinita il titolo usa la directory progetto. Se `include_thread_title: true` abilita un titolo locale disponibile e distinto dal progetto, quel titolo diventa il valore mostrato e il progetto passa nel corpo per non essere duplicato né perso.
+
+Con il default `markdown: false`, il corpo occupa una sola riga e il contesto non usa etichette come `Project:`, `Source:` o `Thread:`. Con il default privacy `include_message: false` contiene soltanto il progetto necessario (quando non è già nel titolo), l'origine e `#` seguito dai primi otto caratteri dell'ID della chat. Con `include_message: true` viene anteposto un estratto redatto del messaggio finale; `max_message_chars` vale 180 per default. L'intero campo ntfy `message` ha comunque un limite rigido di 3.500 byte UTF-8. Un opt-in esplicito a Markdown può conservare le righe dell'estratto opzionale.
+
+Le nuove installazioni usano un solo tag ntfy, `white_check_mark`. I template non aggiungono emoji decorative nel titolo o nel corpo, Markdown è disattivato e la priorità predefinita 3 viene rappresentata omettendo `priority` dal JSON in uscita. Una priorità personalizzata diversa da 3 viene invece inviata esplicitamente.
 
 ## Ambienti supportati
 
@@ -135,14 +150,20 @@ Usare `strict` quando evitare falsi “finito” è la priorità. `balanced` pri
 ### Privacy e consegna
 
 - `include_message: false`: non conserva né invia il messaggio finale;
+- `max_message_chars: 180`: limita l'estratto finale opzionale; il corpo completo resta comunque limitato a 3.500 byte UTF-8;
 - `include_thread_title: false`: non usa il titolo della task, che può riassumere il prompt;
-- `include_full_path: false`: invia soltanto il nome della directory progetto;
+- `include_full_path: false`: non aggiunge al corpo il percorso di lavoro completo sanitizzato;
+- `tags: ["white_check_mark"]`: usa un solo tag ntfy senza duplicare un'emoji nel testo;
+- `priority: 3`: usa la priorità ntfy predefinita e omette il campo dal JSON in uscita;
+- `markdown: false`: invia il corpo compatto come testo semplice;
 - `suppress_subagents: true`: non invia completion dei discendenti;
 - `max_attempts: 0`: retry illimitati per errori transitori;
 - `sent_retention_days: 14` e `dead_retention_days: 30`: retention di receipt e dead-letter;
 - `allow_insecure_auth: false`: vieta credenziali su HTTP non locale.
 
 Con `include_message: true`, il messaggio finale viene redatto e troncato, ma la redazione regex è solo best-effort. I prompt utente non vengono salvati.
+
+`include_message` viene verificato di nuovo al momento dell'invio. Disattivarlo impedisce che il contenuto finale presente in record già accodati lasci l'host, ma non cancella il record locale, i backup, le dead letter, una richiesta già in corso o una notifica già accettata da ntfy. `include_full_path: true` resta un opt-in separato che può esporre il percorso di lavoro sanitizzato.
 
 L’idle gate legge metadati locali e campi SQLite in sola lettura. Interroga lo **stato** del goal, non il suo obiettivo. Il watcher conserva path, offset, timestamp e ID della chat, non il contenuto dei prompt.
 

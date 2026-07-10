@@ -14,7 +14,7 @@ body:
     attributes:
       label: Version
       description: Run the notifier with `--doctor` or `-Doctor`, or provide the release tag.
-      placeholder: 2.4.0
+      placeholder: 2.4.1
     validations:
       required: true
 

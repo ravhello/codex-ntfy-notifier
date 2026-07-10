@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-07-10
+
+### Added
+
+- Status-aware compact titles for normal completion, aborted turns, and terminal goal states (`blocked`, `paused`, usage-limited, and budget-limited).
+- A 3,500-byte UTF-8 body ceiling with Unicode-safe truncation in both notifier implementations.
+- Exact cross-platform payload tests covering Unicode task titles, very large emoji summaries, stopped turns, and already-queued privacy opt-outs.
+
+### Changed
+
+- Notification bodies now use label-free compact context (`origin · #thread8`) and include the project only when a distinct task title occupies the title; full paths remain explicit opt-in data.
+- Fresh installations use one `white_check_mark` tag, `max_message_chars: 180`, and plain-text `markdown: false`. Installers migrate only the exact former two-tag default and preserve custom tag sets and existing message-length choices.
+- Default priority 3, empty tags, and inactive Markdown fields are omitted from the ntfy JSON request.
+- The adjacent-project review now records the compact 120–200-character and single-tag patterns used by comparable notifiers.
+
+### Security and privacy
+
+- `include_message: false` is enforced again at send time, so content in an older pending or outbox record cannot leave the host after the operator opts out.
+- Tag, priority, and message-length configuration now has matching validation on Python and PowerShell.
+
+### Fixed
+
+- PowerShell 5.1 now reads UTF-8 task-title indexes with shared-file access and requires an exact thread ID, preventing mojibake and accidental title selection from a different record.
+- Python and PowerShell now normalize string/array tags consistently and produce the same compact payload.
+- Aborted turns use a `stopped` title without a redundant synthesized body message.
+- Removed repeated `Project:`, `Source:`, `Thread:`, and generic `Turn completed.` text from normal pushes.
+
 ## [2.4.0] - 2026-07-10
 
 ### Added
@@ -103,6 +130,7 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.4.1...HEAD
+[2.4.1]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.1
 [2.4.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.0
 [2.3.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.3.0

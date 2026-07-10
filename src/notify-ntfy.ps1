@@ -23,7 +23,10 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.4.0'
+$ScriptVersion = '2.4.1'
+$MaxNtfyMessageBytes = 3500
+$MiddleDot = [char]0x00B7
+$Ellipsis = [char]0x2026
 $CodexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
   $PSScriptRoot
 } else {
@@ -166,6 +169,42 @@ function Read-JsonFile {
   return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
+function Get-NotificationTags {
+  param([object]$Config)
+
+  $property = $Config.PSObject.Properties['tags']
+  $raw = if ($null -eq $property -or $null -eq $property.Value) {
+    @('white_check_mark')
+  } else {
+    $property.Value
+  }
+  $items = if ($raw -is [string]) {
+    @($raw -split ',')
+  } elseif ($raw -is [System.Collections.IEnumerable]) {
+    @($raw)
+  } else {
+    throw 'tags must be an array of strings or a comma-separated string'
+  }
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+  $result = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($item in $items) {
+    if ($item -isnot [string]) {
+      throw 'tags must be an array of strings or a comma-separated string'
+    }
+    $tag = $item.Trim()
+    if ([string]::IsNullOrWhiteSpace($tag)) {
+      if ($items.Count -eq 1 -and $raw -is [string]) { continue }
+      throw 'tags must contain non-empty strings of at most 32 characters without whitespace'
+    }
+    if ($tag.Length -gt 32 -or [regex]::IsMatch($tag, '\s')) {
+      throw 'tags must contain non-empty strings of at most 32 characters without whitespace'
+    }
+    if ($seen.Add($tag)) { $result.Add($tag) }
+  }
+  if ($result.Count -gt 3) { throw 'tags must contain at most 3 values' }
+  foreach ($tag in $result) { Write-Output $tag }
+}
+
 function Get-Config {
   $fileConfig = Read-JsonFile -Path $ConfigPath
   if ($null -eq $fileConfig) {
@@ -191,6 +230,15 @@ function Get-Config {
   if ($idleDetectionMode -notin @('strict', 'balanced', 'off')) {
     throw "idle_detection_mode must be strict, balanced, or off"
   }
+  $priority = [int](Get-ObjectValue $fileConfig 'priority' 3)
+  if ($priority -lt 1 -or $priority -gt 5) {
+    throw 'priority must be between 1 and 5'
+  }
+  $maxMessageChars = [int](Get-ObjectValue $fileConfig 'max_message_chars' 180)
+  if ($maxMessageChars -lt 32 -or $maxMessageChars -gt 3000) {
+    throw 'max_message_chars must be between 32 and 3000'
+  }
+  $tags = @(Get-NotificationTags -Config $fileConfig)
   $watchRoots = @()
   $seenWatchRoots = @{}
   foreach ($entry in @(Get-ObjectValue $fileConfig 'watch_roots' @())) {
@@ -235,12 +283,12 @@ function Get-Config {
     username = $user
     password = $password
     allowInsecureAuth = [bool](Get-ObjectValue $fileConfig 'allow_insecure_auth' $false)
-    priority = [int](Get-ObjectValue $fileConfig 'priority' 3)
-    tags = @(Get-ObjectValue $fileConfig 'tags' @('computer', 'white_check_mark'))
-    maxMessageChars = [int](Get-ObjectValue $fileConfig 'max_message_chars' 900)
+    priority = $priority
+    tags = @($tags)
+    maxMessageChars = $maxMessageChars
     includeMessage = [bool](Get-ObjectValue $fileConfig 'include_message' $false)
     includeThreadTitle = [bool](Get-ObjectValue $fileConfig 'include_thread_title' $false)
-    markdown = [bool](Get-ObjectValue $fileConfig 'markdown' $true)
+    markdown = [bool](Get-ObjectValue $fileConfig 'markdown' $false)
     includeFullPath = [bool](Get-ObjectValue $fileConfig 'include_full_path' $false)
     suppressSubagents = [bool](Get-ObjectValue $fileConfig 'suppress_subagents' $true)
     subagentClassificationGraceSeconds = [double](Get-ObjectValue $fileConfig 'subagent_classification_grace_seconds' 8)
@@ -266,6 +314,54 @@ function Get-Config {
   }
 }
 
+function Limit-NotificationCharacters {
+  param(
+    [AllowEmptyString()][string]$Value,
+    [int]$MaxLength
+  )
+
+  if ([string]::IsNullOrEmpty($Value)) { return '' }
+  $indexes = [Globalization.StringInfo]::ParseCombiningCharacters($Value)
+  if ($indexes.Count -le $MaxLength) { return $Value }
+  if ($MaxLength -le 0) { return '' }
+  if ($MaxLength -eq 1) { return [string]$Ellipsis }
+  $keep = $MaxLength - 1
+  $prefix = $Value.Substring(0, $indexes[$keep]).TrimEnd()
+  $boundary = [Math]::Max($prefix.LastIndexOf(' '), $prefix.LastIndexOf("`n"))
+  if ($boundary -ge [int][Math]::Floor($keep * 0.7)) {
+    $prefix = $prefix.Substring(0, $boundary).TrimEnd()
+  }
+  return $prefix + $Ellipsis
+}
+
+function Limit-Utf8Text {
+  param(
+    [AllowEmptyString()][string]$Value,
+    [int]$MaxBytes
+  )
+
+  if ([string]::IsNullOrEmpty($Value) -or $MaxBytes -le 0) { return '' }
+  if ($Utf8NoBom.GetByteCount($Value) -le $MaxBytes) { return $Value }
+  $suffix = [string]$Ellipsis
+  $suffixBytes = $Utf8NoBom.GetByteCount($suffix)
+  if ($MaxBytes -lt $suffixBytes) { return '' }
+  $budget = $MaxBytes - $suffixBytes
+  $indexes = [Globalization.StringInfo]::ParseCombiningCharacters($Value)
+  $low = 0
+  $high = $indexes.Count
+  while ($low -lt $high) {
+    $middle = [int][Math]::Ceiling(($low + $high) / 2.0)
+    $end = if ($middle -ge $indexes.Count) { $Value.Length } else { $indexes[$middle] }
+    if ($Utf8NoBom.GetByteCount($Value.Substring(0, $end)) -le $budget) {
+      $low = $middle
+    } else {
+      $high = $middle - 1
+    }
+  }
+  $prefixEnd = if ($low -ge $indexes.Count) { $Value.Length } else { $indexes[$low] }
+  return $Value.Substring(0, $prefixEnd).TrimEnd() + $suffix
+}
+
 function Sanitize-NotificationText {
   param(
     [string]$Text,
@@ -289,10 +385,7 @@ function Sanitize-NotificationText {
   $value = [regex]::Replace($value, '(?i)\b(password|passwd|token|api[_-]?key|secret)\s*[:=]\s*[^\s,;]+', '$1=[REDACTED]')
   $value = [regex]::Replace($value, '(?i)\b(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,})\b', '[REDACTED]')
   $value = [regex]::Replace($value, '(?i)https://ntfy\.sh/[A-Za-z0-9._~-]+', 'https://ntfy.sh/[REDACTED]')
-  if ($value.Length -gt $MaxLength) {
-    return $value.Substring(0, [Math]::Max(0, $MaxLength - 3)) + '...'
-  }
-  return $value
+  return Limit-NotificationCharacters -Value $value -MaxLength $MaxLength
 }
 
 function Get-ProjectName {
@@ -328,15 +421,32 @@ function Get-ThreadTitle {
   if (-not (Test-Path -LiteralPath $indexPath)) {
     return $null
   }
+  $stream = $null
+  $reader = $null
   try {
-    $match = Select-String -LiteralPath $indexPath -SimpleMatch -Pattern $ThreadId | Select-Object -Last 1
-    if ($null -eq $match) {
-      return $null
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = New-Object IO.FileStream($indexPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    $reader = New-Object IO.StreamReader($stream, $Utf8NoBom, $true)
+    $title = $null
+    while (-not $reader.EndOfStream) {
+      $line = $reader.ReadLine()
+      if ([string]::IsNullOrWhiteSpace($line) -or -not $line.Contains($ThreadId)) { continue }
+      try {
+        $item = $line | ConvertFrom-Json
+        if ([string](Get-ObjectValue $item 'id' '') -eq $ThreadId) {
+          $candidate = [string](Get-ObjectValue $item 'thread_name' '')
+          if (-not [string]::IsNullOrWhiteSpace($candidate)) { $title = $candidate }
+        }
+      } catch {
+        continue
+      }
     }
-    $item = $match.Line | ConvertFrom-Json
-    return [string](Get-ObjectValue $item 'thread_name' $null)
+    return $title
   } catch {
     return $null
+  } finally {
+    if ($null -ne $reader) { $reader.Dispose() }
+    elseif ($null -ne $stream) { $stream.Dispose() }
   }
 }
 
@@ -740,6 +850,22 @@ function Get-DefaultOrigin {
   return 'Windows'
 }
 
+function Get-CompletionLabel {
+  param([object]$Record)
+
+  $goal = ([string](Get-ObjectValue $Record 'goal_status' '')).Trim().ToLowerInvariant()
+  switch ($goal) {
+    'blocked' { return 'blocked' }
+    'paused' { return 'paused' }
+    'usage_limited' { return 'usage limit' }
+    'budget_limited' { return 'budget limit' }
+  }
+  if (([string](Get-ObjectValue $Record 'completion_event_type' '')).Trim().ToLowerInvariant() -eq 'turn_aborted') {
+    return 'stopped'
+  }
+  return 'done'
+}
+
 function New-NtfyPayload {
   param(
     [object]$Record,
@@ -748,43 +874,79 @@ function New-NtfyPayload {
 
   $event = $Record.event
   $cwd = [string](Get-FirstObjectValue $event @('cwd', 'working-directory', 'working_directory'))
-  $project = Sanitize-NotificationText -Text (Get-ProjectName $cwd) -MaxLength 50
+  $project = Sanitize-NotificationText -Text (Get-ProjectName $cwd) -MaxLength 42
   $sessionHome = [string](Get-ObjectValue $Record 'session_codex_home' $CodexHome)
   if ([string]::IsNullOrWhiteSpace($sessionHome)) {
     $sessionHome = $CodexHome
   }
   $displayName = $project
+  $hasDistinctThreadTitle = $false
   if ($Config.includeThreadTitle) {
-    $threadTitle = Sanitize-NotificationText -Text (Get-ThreadTitle -ThreadId $Record.thread_id -SessionHome $sessionHome) -MaxLength 58
-    if (-not [string]::IsNullOrWhiteSpace($threadTitle)) { $displayName = $threadTitle }
-  }
-  $lastMessage = [string](Get-FirstObjectValue $event @('last-assistant-message', 'last_assistant_message'))
-  $lastMessage = Sanitize-NotificationText -Text $lastMessage -MaxLength $Config.maxMessageChars -PreserveLines
-  if ([string]::IsNullOrWhiteSpace($lastMessage)) {
-    $lastMessage = 'Turn completed.'
+    $threadTitle = Sanitize-NotificationText -Text (Get-ThreadTitle -ThreadId $Record.thread_id -SessionHome $sessionHome) -MaxLength 42
+    if (-not [string]::IsNullOrWhiteSpace($threadTitle)) {
+      $displayName = $threadTitle
+      $hasDistinctThreadTitle = -not [string]::Equals($threadTitle, $project, [StringComparison]::OrdinalIgnoreCase)
+    }
   }
 
   $metadata = @()
   if ($Config.includeFullPath -and -not [string]::IsNullOrWhiteSpace($cwd)) {
-    $metadata += 'Folder: ' + (Sanitize-NotificationText -Text $cwd -MaxLength 180)
-  } else {
-    $metadata += "Project: $project"
+    $metadata += Sanitize-NotificationText -Text $cwd -MaxLength 120
+  } elseif ($hasDistinctThreadTitle) {
+    $metadata += $project
   }
-  $metadata += "Source: $($Record.origin)"
+  $sanitizedOrigin = Sanitize-NotificationText -Text ([string](Get-ObjectValue $Record 'origin' '')) -MaxLength 40
+  if (-not [string]::IsNullOrWhiteSpace($sanitizedOrigin)) {
+    $metadata += $sanitizedOrigin
+  }
   if (-not [string]::IsNullOrWhiteSpace($Record.thread_id)) {
-    $metadata += 'Thread: ' + $Record.thread_id.Substring(0, [Math]::Min(8, $Record.thread_id.Length))
+    $rawThread = [string]$Record.thread_id
+    $shortThread = Sanitize-NotificationText -Text $rawThread.Substring(0, [Math]::Min(8, $rawThread.Length)) -MaxLength 8
+    if (-not [string]::IsNullOrWhiteSpace($shortThread)) { $metadata += '#' + $shortThread }
   }
-  $body = $lastMessage + "`n`n" + ($metadata -join ' | ')
+  $context = $metadata -join (" $MiddleDot ")
 
-  return [ordered]@{
+  $summary = ''
+  if ($Config.includeMessage) {
+    $rawMessage = [string](Get-FirstObjectValue $event @('last-assistant-message', 'last_assistant_message'))
+    if ($Config.markdown) {
+      $summary = Sanitize-NotificationText -Text $rawMessage -MaxLength $Config.maxMessageChars -PreserveLines
+    } else {
+      $summary = Sanitize-NotificationText -Text $rawMessage -MaxLength $Config.maxMessageChars
+    }
+  }
+  $separator = if ($Config.markdown -and -not [string]::IsNullOrWhiteSpace($summary)) { "`n`n" } else { " $MiddleDot " }
+  $suffix = if (-not [string]::IsNullOrWhiteSpace($summary) -and -not [string]::IsNullOrWhiteSpace($context)) {
+    $separator + $context
+  } elseif (-not [string]::IsNullOrWhiteSpace($context)) {
+    $context
+  } else {
+    ''
+  }
+  if (-not [string]::IsNullOrWhiteSpace($summary)) {
+    $summaryBudget = $MaxNtfyMessageBytes - $Utf8NoBom.GetByteCount($suffix)
+    $summary = Limit-Utf8Text -Value $summary -MaxBytes ([Math]::Max(0, $summaryBudget))
+    $body = $summary + $suffix
+  } else {
+    if (-not [string]::IsNullOrWhiteSpace($context)) {
+      $body = $context
+    } else {
+      $fallbackLabel = Get-CompletionLabel -Record $Record
+      $body = $fallbackLabel.Substring(0, 1).ToUpperInvariant() + $fallbackLabel.Substring(1)
+    }
+  }
+  $body = Limit-Utf8Text -Value $body -MaxBytes $MaxNtfyMessageBytes
+
+  $payload = [ordered]@{
     topic = $Config.topic
-    title = "Codex finished - $displayName"
+    title = Sanitize-NotificationText -Text ('Codex ' + (Get-CompletionLabel -Record $Record) + " $MiddleDot " + $displayName) -MaxLength 64
     message = $body
-    tags = @($Config.tags)
-    priority = $Config.priority
-    markdown = $Config.markdown
     sequence_id = $Record.sequence_id
   }
+  if (@($Config.tags).Count -gt 0) { $payload['tags'] = @($Config.tags) }
+  if ([int]$Config.priority -ne 3) { $payload['priority'] = [int]$Config.priority }
+  if ($Config.markdown -and -not [string]::IsNullOrWhiteSpace($summary)) { $payload['markdown'] = $true }
+  return $payload
 }
 
 function Send-NtfyEvent {
@@ -1527,7 +1689,7 @@ function Update-RolloutProbe {
                 $state.abortedTurns[$turn] = [int64]$state.sequence
                 $state.terminalTurns[$turn] = [int64]$state.sequence
                 $state.terminalEventTypes[$turn] = 'turn_aborted'
-                $state.terminalMessages[$turn] = 'Turn aborted.'
+                $state.terminalMessages[$turn] = ''
                 $state.lastLifecycleType = 'turn_aborted'
                 $state.lastLifecycleTurnId = $turn
                 $state.finalMessageTurns[$turn] = $true
@@ -1661,7 +1823,14 @@ function Test-RecordIdleGate {
     return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'candidate-turn-missing'
   }
   $completionEventType = [string](Get-ObjectValue $Record 'completion_event_type' 'task_complete')
-  if ([string]::IsNullOrWhiteSpace($completionEventType)) { $completionEventType = 'task_complete' }
+  if ([string]::IsNullOrWhiteSpace($completionEventType)) {
+    $completionEventType = if ($state.abortedTurns.ContainsKey($turnId) -and -not $state.completedTurns.ContainsKey($turnId)) {
+      'turn_aborted'
+    } else {
+      'task_complete'
+    }
+    Set-RecordValue -Record $Record -Name 'completion_event_type' -Value $completionEventType
+  }
   $terminalTurns = if ($completionEventType -eq 'turn_aborted') { $state.abortedTurns } else { $state.completedTurns }
   if (-not $terminalTurns.ContainsKey($turnId)) {
     return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'candidate-task-complete-not-observed'
@@ -2066,7 +2235,7 @@ function Scan-RolloutFile {
       $lastMessage = if ($eventType -eq 'task_complete') {
         [string](Get-FirstObjectValue $payload @('last_agent_message', 'last-assistant-message', 'last_assistant_message'))
       } else {
-        'Turn aborted.'
+        ''
       }
       $event = [pscustomobject][ordered]@{
         type = 'agent-turn-complete'
@@ -2248,7 +2417,7 @@ function Commit-PendingRecord {
     }
     $writeRecord = if ($canonicalIsStop) { $canonical } else { $incomingRecord }
     if ($canonicalIsStop) {
-      foreach ($name in @('next_attempt_unix_ms', 'gate_reason', 'goal_status', 'active_descendants', 'descendant_unknown_since', 'candidate_rollout_path', 'rollout_sequence')) {
+      foreach ($name in @('next_attempt_unix_ms', 'gate_reason', 'goal_status', 'completion_event_type', 'active_descendants', 'descendant_unknown_since', 'candidate_rollout_path', 'rollout_sequence')) {
         $property = $incomingRecord.PSObject.Properties[$name]
         if ($null -ne $property) { Set-RecordValue -Record $writeRecord -Name $name -Value $property.Value }
       }

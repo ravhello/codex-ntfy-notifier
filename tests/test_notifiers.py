@@ -352,6 +352,86 @@ class NotifierContractTests(unittest.TestCase):
                 self.assertIn("test-host", payload["message"])
                 shutil.rmtree(self.state, ignore_errors=True)
 
+    def test_compact_payload_contract_is_identical(self) -> None:
+        thread_id = "11111111-1111-7111-8111-111111111111"
+        turn_id = "22222222-2222-7222-8222-222222222222"
+        captured: dict[str, dict] = {}
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id, turn_id=turn_id)))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    captured[implementation] = self.server.payloads.pop()
+                shutil.rmtree(self.state, ignore_errors=True)
+
+        expected = {
+            "topic": "test-topic",
+            "title": "Codex done · perfect notifier",
+            "message": "Fatto: test concorrente completato. · test-host · #11111111",
+            "tags": ["white_check_mark"],
+            "sequence_id": captured["python"]["sequence_id"],
+        }
+        self.assertEqual(captured["python"], expected)
+        if "powershell" in captured:
+            self.assertEqual(captured["powershell"], expected)
+
+    def test_compact_payload_unicode_title_and_byte_budget(self) -> None:
+        thread_id = "33333333-3333-7333-8333-333333333333"
+        turn_id = "44444444-4444-7444-8444-444444444444"
+        title = "Attività già pronta 😀"
+        other_id = "55555555-5555-7555-8555-555555555555"
+        (self.codex_home / "session_index.jsonl").write_text(
+            json.dumps({"id": thread_id, "thread_name": title}, ensure_ascii=False)
+            + "\n"
+            + json.dumps({"id": other_id, "thread_name": f"not the target {thread_id}"})
+            + "\n",
+            encoding="utf-8",
+        )
+        self.configure(include_thread_title=True, max_message_chars=3000, markdown=False)
+        captured: dict[str, dict] = {}
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                event = self.event(thread_id=thread_id, turn_id=turn_id)
+                event["last-assistant-message"] = "😀" * 3000
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    payload = self.server.payloads.pop()
+                self.assertEqual(payload["title"], f"Codex done · {title}")
+                self.assertLessEqual(len(payload["message"].encode("utf-8")), 3500)
+                self.assertNotIn("�", payload["message"])
+                self.assertTrue(payload["message"].endswith("perfect notifier · test-host · #33333333"))
+                captured[implementation] = payload
+                shutil.rmtree(self.state, ignore_errors=True)
+        if "powershell" in captured:
+            self.assertEqual(captured["powershell"], captured["python"])
+
+    def test_turn_aborted_uses_stopped_status_without_redundant_body(self) -> None:
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                event = self.event()
+                event["completion-event-type"] = "turn_aborted"
+                event["last-assistant-message"] = ""
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    payload = self.server.payloads.pop()
+                self.assertTrue(payload["title"].startswith("Codex stopped · "))
+                self.assertNotIn("aborted", payload["message"].lower())
+                self.assertNotIn("completed", payload["message"].lower())
+                shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_comma_separated_tags_match_array_semantics(self) -> None:
+        self.configure(tags="white_check_mark,robot")
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                self.run_ok(self.hook_command(implementation, self.event()))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    payload = self.server.payloads.pop()
+                self.assertEqual(payload["tags"], ["white_check_mark", "robot"])
+                shutil.rmtree(self.state, ignore_errors=True)
+
     def test_idle_gate_coalesces_auto_continuations(self) -> None:
         self.configure(
             idle_detection_mode="strict",
@@ -503,7 +583,10 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.worker_command(implementation))
                 payloads = self.wait_for_payloads(2)
                 self.assertEqual(len(payloads), 2)
-                self.assertEqual({payload["message"].splitlines()[0] for payload in payloads}, {"FIRST", "SECOND"})
+                self.assertEqual(
+                    {payload["message"].split(" · ", 1)[0] for payload in payloads},
+                    {"FIRST", "SECOND"},
+                )
                 shutil.rmtree(self.state, ignore_errors=True)
                 with self.server.lock:
                     self.server.payloads.clear()
@@ -542,7 +625,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.worker_command(implementation), timeout=20)
                 payloads = self.wait_for_payloads(2)
                 self.assertEqual(len(payloads), 2)
-                messages = {payload["message"].splitlines()[0] for payload in payloads}
+                messages = {payload["message"].split(" · ", 1)[0] for payload in payloads}
                 self.assertEqual(messages, {"FIRST EPOCH", "SECOND EPOCH"})
                 shutil.rmtree(self.state, ignore_errors=True)
                 with self.server.lock:
@@ -624,6 +707,46 @@ class NotifierContractTests(unittest.TestCase):
                 payloads = self.wait_for_payloads(1)
                 self.assertEqual(len(payloads), 1)
                 self.assertIn("STOP AUTHORITATIVE", payloads[0]["message"])
+                shutil.rmtree(self.state, ignore_errors=True)
+                with self.server.lock:
+                    self.server.payloads.clear()
+
+    def test_modern_stop_infers_an_aborted_rollout(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            suppress_technical_turns=True,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                thread_id = str(uuid.uuid4())
+                turn_id = "00000000-0000-7000-8000-000000000044"
+                rollout = self.write_session_meta(thread_id, subagent=False)
+                self.append_rollout(rollout, "task_started", turn_id=turn_id)
+                self.append_rollout(rollout, "user_message", message="Stop this task")
+                self.append_rollout(rollout, "turn_aborted", turn_id=turn_id)
+                stop = {
+                    "hook_event_name": "Stop",
+                    "session_id": thread_id,
+                    "turn_id": turn_id,
+                    "cwd": "C:\\work\\perfect notifier",
+                    "last_assistant_message": "",
+                    "stop_hook_active": False,
+                }
+                result = subprocess.run(
+                    self.modern_hook_command(implementation),
+                    input=json.dumps(stop),
+                    env=self.env,
+                    text=True,
+                    capture_output=True,
+                    timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.run_ok(self.worker_command(implementation), timeout=20)
+                payloads = self.wait_for_payloads(1)
+                self.assertEqual(len(payloads), 1)
+                self.assertTrue(payloads[0]["title"].startswith("Codex stopped · "))
                 shutil.rmtree(self.state, ignore_errors=True)
                 with self.server.lock:
                     self.server.payloads.clear()
@@ -1476,7 +1599,8 @@ class NotifierContractTests(unittest.TestCase):
             payloads = self.wait_for_payloads(1, timeout=15)
             self.assertEqual(len(payloads), 1)
             self.assertIn("WSL RECOVERED", payloads[0]["message"])
-            self.assertIn("Source: WSL:test", payloads[0]["message"])
+            self.assertIn("WSL:test", payloads[0]["message"])
+            self.assertNotIn("Source:", payloads[0]["message"])
         finally:
             process.terminate()
             stdout, stderr = process.communicate(timeout=10)
@@ -1716,6 +1840,7 @@ class NotifierContractTests(unittest.TestCase):
                 shutil.rmtree(self.state, ignore_errors=True)
 
     def test_outbox_drops_prompt_and_preserves_redacted_markdown(self) -> None:
+        self.configure(markdown=True)
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
                 event = self.event()
@@ -1756,8 +1881,28 @@ class NotifierContractTests(unittest.TestCase):
                     self.assertEqual(len(self.server.payloads), 1)
                     payload = self.server.payloads.pop()
                 self.assertNotIn("private-final-message-marker", payload["message"])
-                self.assertIn("Turn completed.", payload["message"])
+                self.assertIn("test-host", payload["message"])
+                self.assertNotIn("Turn completed.", payload["message"])
                 shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_message_opt_out_applies_to_an_already_queued_record(self) -> None:
+        secret = "queued-message-that-must-not-leave-the-host"
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                event = self.event()
+                event["last-assistant-message"] = secret
+                self.run_ok(self.hook_command(implementation, event))
+                queued = list((self.state / "outbox").glob("*.json"))
+                self.assertEqual(len(queued), 1)
+                self.assertIn(secret, queued[0].read_text(encoding="utf-8-sig"))
+                self.configure(include_message=False)
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    payload = self.server.payloads.pop()
+                self.assertNotIn(secret, payload["message"])
+                self.assertEqual(payload["message"].split(" · ")[0], "test-host")
+                shutil.rmtree(self.state, ignore_errors=True)
+                self.configure(include_message=True)
 
     def test_thread_title_requires_explicit_opt_in(self) -> None:
         thread_id = str(uuid.uuid4())
@@ -1914,6 +2059,9 @@ class NotifierContractTests(unittest.TestCase):
         self.assertEqual(private_config["watch_discovery_seconds"], 60)
         self.assertEqual(private_config["watch_roots"], [])
         self.assertEqual(private_config["max_attempts"], 0)
+        self.assertEqual(private_config["tags"], ["white_check_mark"])
+        self.assertEqual(private_config["max_message_chars"], 180)
+        self.assertFalse(private_config["markdown"])
         self.assertNotIn(secret, (install_home / "notify-ntfy.ps1").read_text(encoding="utf-8-sig"))
         self.assertIn("notify-ntfy.ps1", (install_home / "config.toml").read_text(encoding="utf-8-sig"))
 
@@ -1984,6 +2132,9 @@ class NotifierContractTests(unittest.TestCase):
         self.assertEqual(config["watch_discovery_seconds"], 60)
         self.assertEqual(config["watch_initial_replay_seconds"], 15)
         self.assertEqual(config["watch_roots"], [])
+        self.assertEqual(config["tags"], ["white_check_mark"])
+        self.assertEqual(config["max_message_chars"], 180)
+        self.assertFalse(config["markdown"])
         text = (install_home / "config.toml").read_text(encoding="utf-8-sig")
         self.assertIn("System32\\\\WindowsPowerShell", text)
         self.assertIn(nested, text)
@@ -2011,6 +2162,10 @@ class NotifierContractTests(unittest.TestCase):
         self.assertEqual(len(managed_stop), 1)
         self.assertIn("-HookEvent", managed_stop[0]["command"])
         first_hooks_bytes = hooks_path.read_bytes()
+        config["tags"] = ["computer", "white_check_mark"]
+        config["max_message_chars"] = 900
+        config["markdown"] = True
+        (install_home / "ntfy-config.json").write_text(json.dumps(config), encoding="utf-8")
         reinstall = subprocess.run(
             [
                 str(WINDOWS_POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -2023,6 +2178,10 @@ class NotifierContractTests(unittest.TestCase):
         )
         self.assertEqual(reinstall.returncode, 0, reinstall.stdout + reinstall.stderr)
         self.assertEqual(hooks_path.read_bytes(), first_hooks_bytes)
+        migrated = json.loads((install_home / "ntfy-config.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(migrated["tags"], ["white_check_mark"])
+        self.assertEqual(migrated["max_message_chars"], 900)
+        self.assertTrue(migrated["markdown"])
         vbs = (install_home / "watch-codex-ntfy-hidden.vbs").read_text(encoding="utf-8-sig")
         self.assertIn("WScript.ScriptFullName", vbs)
         self.assertNotIn("C:\\Windows", vbs)

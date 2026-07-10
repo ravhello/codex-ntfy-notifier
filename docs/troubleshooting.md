@@ -24,7 +24,7 @@ tail -n 40 "$HOME/.codex/ntfy-state/notify.log"
 
 The doctor output does not print the topic or credentials. Check:
 
-- `version` is `2.4.0` or a newer compatible release;
+- `version` is `2.4.1` or a newer compatible release;
 - `topic_configured` is `true`;
 - `idle_detection_mode` is `strict` when intermediate notifications must never be sent;
 - `goal_aware` and `watch_rollouts` are `true`;
@@ -47,7 +47,7 @@ Use `-Test`/`--test` only when publishing to the configured topic is acceptable.
 
 ## Understand pending versus queued
 
-Version 2.4.0 has two intentionally separate stages:
+Version 2.4 and later have two intentionally separate stages:
 
 | Doctor field | Directory | Meaning |
 | --- | --- | --- |
@@ -138,6 +138,8 @@ If that environment cannot retain usable rollout evidence, `idle_detection_mode:
 
 With `goal_aware: true`, `active` blocks notification. Other observed statuses, including `complete`, `paused`, `blocked`, `usage_limited`, and `budget_limited`, are non-running and do not block.
 
+In 2.4.1 these terminal states also affect the compact title: `blocked`, `paused`, `usage_limited`, and `budget_limited` become `Codex blocked`, `Codex paused`, `Codex usage limit`, and `Codex budget limit`. A normal completion becomes `Codex done`; a matching `turn_aborted` becomes `Codex stopped`.
+
 The notifier reads only the goal status. If a stale upstream goal is permanently `active`, correct/finish the task state. Setting `goal_aware: false` is possible but weakens the final-only guarantee.
 
 ### A child appears stuck
@@ -150,7 +152,7 @@ Lowering that timeout can notify while a genuinely long-running child is still a
 
 Confirm all of the following:
 
-- doctor reports version 2.4.0+ and `idle_detection_mode: "strict"`;
+- doctor reports version 2.4.1+ and `idle_detection_mode: "strict"`;
 - the alert comes from this installation/topic rather than an older custom hook or another notifier;
 - old managed notifier handlers are not still registered under `UserPromptSubmit`, `SubagentStop`, or another hook event;
 - only one intended `notify-ntfy` `Stop` group exists per environment;
@@ -289,13 +291,21 @@ Without a persistent service, hook-driven on-demand delivery still works, but au
 
 ## Notification content looks wrong
 
-- Keep `include_message: false` for generic final text.
-- Set `include_message: true` only if the final assistant response should be stored and sent.
-- Adjust `max_message_chars` for truncation.
-- Keep `include_full_path: false` to send only the project directory.
-- Keep `include_thread_title: false` unless a prompt-derived local title is acceptable.
+- The 2.4.1 default title is `Codex <status> · <project>`; see the status mapping above.
+- The default body is one plain-text line, `<origin> · #<thread8>`, without `Project:`, `Source:`, or `Thread:` labels. A project is prepended only when a distinct task title occupies the title, or a sanitized path is added when full-path output is enabled.
+- Keep `include_message: false` unless the final assistant response should be captured and sent. With it enabled, the excerpt is prepended to the context and `max_message_chars` defaults to 180.
+- Keep `include_full_path: false` to avoid sending the sanitized working-directory path.
+- Keep `include_thread_title: false` unless a prompt-derived local task title is acceptable.
+- Fresh installs use `tags: ["white_check_mark"]`, `markdown: false`, and `priority: 3`. At priority 3 the outgoing JSON intentionally has no `priority` member. The templates do not duplicate the tag with an emoji in title or body.
+- The full ntfy `message` is always at most 3,500 UTF-8 bytes. `max_message_chars` controls the optional excerpt, not that final byte ceiling.
 
 Redaction is best-effort. If sensitive data was published, rotate credentials/topic access and follow the ntfy server/client deletion procedure; configuration changes cannot recall it.
+
+### Prevent queued message content from being sent
+
+Set `include_message` to `false` in the private config. The worker checks this setting again when it builds every network request, so final-message text captured while the option was previously enabled is omitted from pending and outbox deliveries, including retries.
+
+For an urgent change, stop the continuous worker before editing and avoid launching another hook-driven worker until the config is saved. This closes the avoidable race with a new request, but cannot cancel a request already in flight. Existing queue/dead-letter files and backups may still contain the captured text; the opt-out prevents transmission, not local erasure. It also cannot recall a notification already accepted by ntfy.
 
 ## Safe issue checklist
 

@@ -1,6 +1,6 @@
 # Security and privacy
 
-Durable Codex ntfy notifier 2.4.0 is an unofficial local hook and worker that reads local Codex lifecycle metadata and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, Codex state, notifier state, and backups as private data.
+Durable Codex ntfy notifier 2.4.1 is an unofficial local hook and worker that reads local Codex lifecycle metadata and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, Codex state, notifier state, and backups as private data.
 
 ## Privacy defaults
 
@@ -9,8 +9,12 @@ Fresh installations use:
 ```json
 {
   "include_message": false,
+  "max_message_chars": 180,
   "include_thread_title": false,
   "include_full_path": false,
+  "tags": ["white_check_mark"],
+  "priority": 3,
+  "markdown": false,
   "suppress_subagents": true,
   "suppress_technical_turns": true,
   "idle_detection_mode": "strict",
@@ -45,16 +49,19 @@ The local Codex rollout can itself contain prompts, assistant content, tool data
 
 By default, one ntfy publication can contain:
 
-- the final directory name of the Codex working directory;
-- the source host/origin label;
-- the first eight characters of the thread ID;
-- the project directory name as the notification title;
-- a generic final-completion message;
-- configured tags, priority, Markdown flag, and a deterministic sequence ID.
+- a status label derived from local lifecycle state: `done`, `blocked`, `paused`, `usage limit`, `budget limit`, or `stopped`;
+- the final directory name of the Codex working directory in the title;
+- the source host/origin label in a compact, label-free body;
+- `#` plus the first eight characters of the thread ID;
+- the single ntfy tag `white_check_mark` and a deterministic sequence ID.
 
-`include_full_path: true` sends the sanitized working-directory path instead of only its final name.
+The default wire shape is `Codex <status> · <project>` plus the one-line body `<origin> · #<thread8>`. The templates add no text emoji. Markdown is disabled, and default ntfy priority 3 is represented by omitting the `priority` member from the outgoing JSON. These choices reduce visual and wire noise; they do not make the remaining metadata anonymous.
 
-`include_thread_title: true` replaces the project title with the locally indexed Codex thread title when available. `include_message: true` also sends a sanitized and truncated copy of the final assistant message, limited by `max_message_chars` (900 by default).
+`include_thread_title: true` opts into the locally indexed Codex task title when available. When that title differs from the project, the project moves into the body so the location is retained. A task title can summarize the user's request.
+
+`include_full_path: true` uses the sanitized working-directory path as the body's location context instead of a project-name context item. A full path can reveal usernames, clients, repository names, mounts, or organization structure.
+
+`include_message: true` adds a sanitized and truncated copy of the final assistant message ahead of the context. `max_message_chars` limits that excerpt to 180 characters by default. With the default `markdown: false`, whitespace is normalized and the whole body stays on one line. The complete ntfy `message` is also hard-capped at 3,500 UTF-8 bytes, even if `max_message_chars` is increased. Truncation and the byte cap limit size, not sensitivity.
 
 A thread title or assistant response can summarize sensitive prompt context. “Raw prompts are not copied” is not equivalent to “no sensitive context can leave the host.”
 
@@ -81,7 +88,9 @@ The operational log records short event keys, gate reasons, origin labels, retry
 
 Installers keep up to ten timestamped directories under `~/.codex/ntfy-backups`. A backup can contain credentials, `config.toml`, and hook registration. Rotation is by count, not age. Remote hosts own their own copies and backups.
 
-Changing a content setting affects future records/payloads. It does not rewrite existing pending/outbox/dead state, logs, backups, notifications already accepted by ntfy, or client history.
+`include_message` is enforced both when content is captured and again when the worker builds the network payload. If it is changed from `true` to `false`, final-message text already present in pending or outbox records is excluded at send time and does not leave the host through a later retry. The setting does not scrub that content from existing state, dead letters, logs, or backups.
+
+For an urgent opt-out, stop the worker before editing the private config so it cannot begin another request concurrently. No local setting can recall a request already in flight or content already accepted, retained, or displayed by ntfy. Other content-setting changes likewise do not rewrite existing local state or remote/client history.
 
 ## Hook review and trust
 
