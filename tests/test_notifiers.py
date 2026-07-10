@@ -997,7 +997,10 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.hook_command(implementation, event))
                 process = self.start_worker(implementation)
                 try:
-                    deadline = time.monotonic() + 8
+                    # Hosted Windows runners can be briefly CPU-starved while
+                    # launching PowerShell/Python processes. Wait for an
+                    # observed gate decision, not a fixed startup assumption.
+                    deadline = time.monotonic() + 30
                     observed_reason = ""
                     while time.monotonic() < deadline and "subagent" not in observed_reason:
                         for pending_path in (self.state / "pending").glob("*.json"):
@@ -1009,7 +1012,11 @@ class NotifierContractTests(unittest.TestCase):
                                 pending_record.get("idle_reason") or pending_record.get("gate_reason") or ""
                             )
                         if process.poll() is not None:
-                            break
+                            stdout, stderr = process.communicate()
+                            self.fail(
+                                "worker exited before observing the missing child rollout: "
+                                f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}"
+                            )
                         time.sleep(0.05)
                     self.assertIn("subagent", observed_reason, "missing child rollout did not hold the root")
                     with self.server.lock:
@@ -1019,16 +1026,17 @@ class NotifierContractTests(unittest.TestCase):
                     self.assertEqual(recreated, child_rollout)
                     self.append_rollout(child_rollout, "task_started", turn_id=child_turn)
                     self.append_rollout(child_rollout, "task_complete", turn_id=child_turn, message="Child done")
-                    self.assert_worker_ok(process, timeout=20)
+                    self.assert_worker_ok(process, timeout=30)
+                    self.assertEqual(len(self.wait_for_payloads(1)), 1)
                 finally:
                     if process.poll() is None:
                         process.terminate()
                         process.communicate(timeout=5)
-                self.assertEqual(len(self.wait_for_payloads(1)), 1)
-                shutil.rmtree(self.state, ignore_errors=True)
-                database.unlink(missing_ok=True)
-                with self.server.lock:
-                    self.server.payloads.clear()
+                    shutil.rmtree(self.state, ignore_errors=True)
+                    shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
+                    database.unlink(missing_ok=True)
+                    with self.server.lock:
+                        self.server.payloads.clear()
 
     def test_strict_mode_waits_when_the_spawn_database_disappears(self) -> None:
         self.configure(
