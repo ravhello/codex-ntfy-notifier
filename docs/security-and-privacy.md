@@ -1,6 +1,6 @@
 # Security and privacy
 
-Durable Codex ntfy notifier 2.3.0 is an unofficial local hook that sends metadata to a server chosen by the operator. Treat its topic, authentication values, state, and backups as private data.
+Durable Codex ntfy notifier 2.4.0 is an unofficial local hook and worker that reads local Codex lifecycle metadata and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, Codex state, notifier state, and backups as private data.
 
 ## Privacy defaults
 
@@ -12,12 +12,34 @@ Fresh installations use:
   "include_thread_title": false,
   "include_full_path": false,
   "suppress_subagents": true,
+  "suppress_technical_turns": true,
+  "idle_detection_mode": "strict",
+  "goal_aware": true,
+  "watch_rollouts": true,
   "allow_insecure_auth": false,
   "dead_retention_days": 30
 }
 ```
 
-An upgrade preserves the behavior of an older installation. In particular, an existing configuration that has no `include_message` or `include_thread_title` key is migrated to `true` for compatibility. Review both values after upgrading if message content or prompt-derived thread titles should no longer be sent.
+The installers migrate existing private configuration conservatively and do not print secrets. Review content-related settings after any upgrade from a private or older public build.
+
+`strict` is also the privacy/conservatism default for behavior: when root classification or matching rollout evidence is unresolved, the candidate stays local instead of becoming an uncertain network notification.
+
+## Local data read for idle detection
+
+To distinguish a final root completion from an intermediate result, the notifier can read:
+
+- the matching local Codex rollout JSONL lifecycle;
+- thread source/classification and recursive spawn edges from the local Codex state database;
+- the `status` column for the root thread in the local goal database;
+- local session-index title metadata only when `include_thread_title: true`;
+- filesystem modification time and rollout path.
+
+SQLite access is opened read-only and query-only. Goal awareness selects the goal **status**, not its objective. The notifier does not update Codex databases.
+
+The rollout watcher reads newly appended complete JSONL lines in memory to find `task_complete` and `turn_aborted`. It persists a cursor containing the rollout path, byte offset, timestamp, and thread ID. It does not copy prompt lines into `watch/`.
+
+The local Codex rollout can itself contain prompts, assistant content, tool data, and paths. The notifier needs read access to that pre-existing file, but its own state intentionally stores neither Codex `input-messages` nor prompt bodies. Never attach rollout or database files to a public issue.
 
 ## What leaves the host
 
@@ -27,122 +49,143 @@ By default, one ntfy publication can contain:
 - the source host/origin label;
 - the first eight characters of the thread ID;
 - the project directory name as the notification title;
-- a generic `Turn completed.` message;
+- a generic final-completion message;
 - configured tags, priority, Markdown flag, and a deterministic sequence ID.
 
 `include_full_path: true` sends the sanitized working-directory path instead of only its final name.
 
-`include_thread_title: true` replaces the project title with the locally indexed Codex thread title when available. `include_message: true` also sends a sanitized and truncated copy of the final assistant message. The limit is `max_message_chars` (900 characters by default). The notifier does not add Codex `input-messages` to its queue or ntfy body. A thread title or assistant reply can still summarize sensitive user context, so the absence of raw prompts is not equivalent to zero content disclosure.
+`include_thread_title: true` replaces the project title with the locally indexed Codex thread title when available. `include_message: true` also sends a sanitized and truncated copy of the final assistant message, limited by `max_message_chars` (900 by default).
 
-The server sees normal connection metadata such as source IP, request time, and user agent. Its retention and access logs are outside this project's control. ntfy clients may show content on a lock screen; configure client-side notification privacy as needed.
+A thread title or assistant response can summarize sensitive prompt context. “Raw prompts are not copied” is not equivalent to “no sensitive context can leave the host.”
+
+The ntfy server sees normal connection metadata such as source IP, request time, and user agent. Its retention/access logs are outside this project’s control. ntfy clients may display content on a lock screen; configure client privacy accordingly.
+
+The `server` URL must be absolute HTTP(S) and must not contain URI userinfo. Put authentication only in the dedicated token or username/password fields. Doctor output reduces the server to scheme, host, and non-default port, omitting path, query, fragment, and credentials.
 
 ## What remains on disk
 
-The private configuration is `~/.codex/ntfy-config.json`. It can contain the server URL, topic, token, username, and password.
+The private configuration is `~/.codex/ntfy-config.json`. It can contain server URL, topic, token, username, password, and installer-managed `watch_roots` entries with local/UNC Codex and SQLite paths for selected WSL distributions.
 
-The local `~/.codex/ntfy-state` directory can contain:
+`~/.codex/ntfy-state` can contain:
 
 - full thread and turn IDs;
-- the full local working directory and session Codex home;
-- host/origin and classification metadata;
+- full local working directory, Codex home, SQLite home, and rollout path;
+- host/origin, classification, goal status, descendant count, and idle-gate metadata;
+- watcher paths, byte offsets, timestamps, and thread IDs;
 - retry timing, attempt count, and sanitized error text;
 - the final assistant message only for records created while `include_message` was enabled;
-- compact sent and suppressed receipts;
+- compact sent, subagent, technical-turn, and superseded receipts;
 - dead letters, which may retain a complete failed record.
 
-The operational log records short event keys, origin labels, retry state, and sanitized errors. Redaction is best-effort; do not assume logs are safe to publish.
+The operational log records short event keys, gate reasons, origin labels, retry state, and sanitized errors. Redaction is best-effort; logs are not automatically safe to publish.
 
-Installers keep up to ten timestamped directories under `~/.codex/ntfy-backups`. A backup can contain credentials and a previous `config.toml`. Rotation is by count, not age. Remote hosts have their own copies and backups.
+Installers keep up to ten timestamped directories under `~/.codex/ntfy-backups`. A backup can contain credentials, `config.toml`, and hook registration. Rotation is by count, not age. Remote hosts own their own copies and backups.
 
-Changing `include_message` to `false` affects new events only. Changing `include_thread_title` affects future delivery payloads. Neither change rewrites dead letters, logs, backups, notifications already accepted by ntfy, or a client's notification history.
+Changing a content setting affects future records/payloads. It does not rewrite existing pending/outbox/dead state, logs, backups, notifications already accepted by ntfy, or client history.
+
+## Hook review and trust
+
+The installer writes a managed `Stop` handler to `~/.codex/hooks.json` and preserves unrelated hook groups and metadata. Codex requires the operator to review a new hook through `/hooks`.
+
+The installer deliberately does **not** edit Codex’s trust store or simulate approval. This keeps code execution consent with the user. Review the exact command in every Windows, WSL, Linux, or remote Codex environment before trusting it.
+
+The hook command contains local executable paths but no ntfy topic or credential. Those secrets remain in the private config or worker environment. Treat `hooks.json` as environment metadata even though it should not contain authentication values.
 
 ## Redaction limits
 
-When content storage is enabled, the notifier normalizes whitespace, truncates values, and redacts several common forms, including authorization headers, password/token/key assignments, selected provider token prefixes, and `ntfy.sh` topic URLs.
+When content storage is enabled, the notifier normalizes whitespace, truncates values, and redacts several common patterns, including authorization headers, password/token/key assignments, selected provider token prefixes, and ntfy topic URLs.
 
-Regex redaction cannot reliably detect every secret, custom hostname, source-code credential, private key, personal datum, or value whose context has been removed. It can also produce false positives. The safe choice for sensitive work is to keep `include_message: false`, `include_thread_title: false`, and `include_full_path: false`.
+Regex redaction cannot reliably detect every secret, custom hostname, source-code credential, private key, personal datum, or value whose context has been removed. It can also produce false positives. The safest settings for sensitive work are `include_message: false`, `include_thread_title: false`, and `include_full_path: false`.
 
 ## Topics and credentials
 
-An unguessable topic on a public ntfy service acts like a capability: anyone who learns it may be able to subscribe or publish, depending on server policy. Prefer explicit access control on a trusted ntfy server when notification metadata is sensitive.
+An unguessable topic on a public ntfy service acts like a capability: anyone who learns it may be able to subscribe or publish, depending on server policy. Prefer explicit access control on a trusted server when notification metadata is sensitive.
 
 Recommended practice:
 
-- create a separate publish-only token for each real host when the server supports scoped tokens;
+- create a separate publish-only token for each real host;
 - do not reuse an administrator or subscribe-capable credential for publishing;
 - use different topics or credentials for environments with different trust levels;
-- rotate the affected topic/token if a config, backup, environment dump, command history, or issue attachment leaks;
-- revoke a retired host's token instead of relying only on deletion from that host;
+- rotate the affected topic/token after a config, backup, environment dump, shell history, or issue attachment leaks;
+- revoke a retired host’s token instead of relying only on file deletion;
 - never commit a real `ntfy-config.json` or paste it into an issue.
 
-Environment variables override server and authentication fields. They reduce long-lived config content only if the surrounding process, service manager, shell history, crash reporting, and process inspection are also trusted. Clear temporary variables after installation.
+Environment variables override server/authentication fields. They reduce long-lived config content only if the surrounding process, service manager, shell history, crash reporting, and process inspection are also trusted. Clear temporary variables after installation.
 
 ## Transport protections
 
 The notifier:
 
-- refuses to send token or basic-auth credentials over non-HTTPS connections to non-loopback hosts unless `allow_insecure_auth: true` is explicitly set;
+- refuses token or basic-auth credentials over non-HTTPS connections to non-loopback hosts unless `allow_insecure_auth: true`;
 - permits HTTP authentication to `localhost`, `127.0.0.1`, and `::1` for a local trusted proxy;
-- refuses all HTTP redirects, so an authorization header is not forwarded to a redirect target;
+- refuses all HTTP redirects so an authorization header is not forwarded;
 - applies a configurable request timeout.
 
-Anonymous publication over HTTP is not blocked because no authorization header is present, but the topic and message remain visible and modifiable in transit. HTTPS is still strongly recommended.
+Anonymous HTTP publication is not blocked because no authorization header is present, but topic and message remain visible and modifiable in transit. HTTPS is strongly recommended.
 
-`allow_insecure_auth: true` sends reusable credentials without transport confidentiality. It should be reserved for a separately protected network tunnel whose risk is understood.
+`allow_insecure_auth: true` sends reusable credentials without transport confidentiality. Reserve it for a separately protected network tunnel whose risk is understood.
 
-TLS validation uses the host operating system and runtime trust store. The project does not implement certificate pinning.
+TLS validation uses the host operating system/runtime trust store. The project does not implement certificate pinning.
 
 ## Filesystem protections
 
-Installers attempt to limit access as follows:
+Installers attempt to limit access:
 
 | Platform | Protection |
 | --- | --- |
-| Windows | Private ACLs for the current user, `SYSTEM`, and local administrators on config, state, staging, and backup paths. |
-| Linux/WSL | Mode `0600` for private config/TOML and `0700` for executable or state directories where installed. |
+| Windows | Private ACLs for the current user, `SYSTEM`, and local administrators on config, state, staging, hooks, and backups where managed. |
+| Linux/WSL | Mode `0600` for private config/TOML/JSON and `0700` for executable or state directories where installed. |
 | Linux systemd | `UMask=0077`, `NoNewPrivileges=true`, and `PrivateTmp=true`. |
 
-These controls do not protect against the same user account, an administrator/root account, malware in that security context, a compromised SSH endpoint, or offline access to unencrypted storage. Use full-disk encryption and appropriate host security where necessary.
+These controls do not protect against the same user account, administrator/root, malware in that security context, a compromised SSH endpoint, or offline access to unencrypted storage. Use full-disk encryption and appropriate host security.
 
-To inspect permissions without printing file contents:
+Inspect permissions without printing contents:
 
 ```powershell
 icacls "$HOME\.codex\ntfy-config.json"
+icacls "$HOME\.codex\hooks.json"
 icacls "$HOME\.codex\ntfy-state"
 ```
 
 ```sh
-stat -c '%a %U:%G %n' "$HOME/.codex/ntfy-config.json" "$HOME/.codex/ntfy-state"
+stat -c '%a %U:%G %n' "$HOME/.codex/ntfy-config.json" "$HOME/.codex/hooks.json" "$HOME/.codex/ntfy-state"
 ```
 
 ## Remote installation trust
 
-Remote installers use the existing OpenSSH configuration and host verification. They copy the complete private configuration through a permission-restricted staging directory, then install it for the remote account. This means:
+Remote installers use existing OpenSSH configuration and host verification. They copy the private destination, authentication, and policy through a restricted staging directory, then install it for the remote account. Host-local `watch_roots` are cleared because source-machine WSL/custom paths are not portable. Therefore:
 
-- the local machine, SSH client configuration, selected host key, remote account, and remote administrators are all in the trust boundary;
-- every target receives the source config's credentials unless a host-specific config is supplied;
+- the local machine, SSH client config, selected host key, remote account, and remote administrators are in the trust boundary;
+- every target receives the source config’s credentials unless a host-specific config is supplied;
 - backups on every target can retain old credentials after rotation;
-- an SSH alias must resolve to the intended machine before credentials are copied.
+- an SSH alias must resolve to the intended machine before credentials are copied;
+- hook approval must be performed in the remote Codex environment.
 
-Prefer a host-specific config containing a publish-only token. Verify a new host interactively before using an unattended installer.
+Prefer a host-specific publish-only token. Verify a new host interactively before unattended installation.
 
 ## Retention and erasure
 
-Defaults are 14 days for sent/suppressed receipts and 30 days for dead letters. Cleanup occurs when a worker starts. Pending outbox records have no time-based expiry because dropping an offline notification would violate the delivery goal.
+Defaults are 14 days for sent/suppressed receipts and 30 days for dead letters. Cleanup runs when a worker starts.
+
+Pending idle candidates and network-ready outbox records have no time-based expiry because silently dropping an unfinished/offline notification would violate the delivery goal. Watch cursors persist so scans can resume without replaying old rollout history. In `strict` mode, a candidate with permanently missing evidence can therefore remain on disk until corrected or deliberately removed.
 
 For deliberate local erasure:
 
 1. stop the worker;
-2. decide whether pending outbox events should be delivered or discarded;
+2. decide whether pending and outbox events should be delivered or discarded;
 3. delete the relevant state and backup directories on every host;
-4. delete or replace the private config;
+4. delete or replace private config and managed hook/config entries as appropriate;
 5. revoke or rotate server-side credentials and topic access;
-6. clear ntfy client history and follow the server's deletion/retention procedure if required.
+6. clear ntfy client history and follow the server’s deletion/retention procedure.
 
-Deleting local files does not recall a notification already published to ntfy. See [Uninstall and rollback](uninstall.md) for platform-specific commands.
+Deleting local files does not recall a notification already published to ntfy. See [Uninstall and rollback](uninstall.md).
+
+## Pure cloud boundary
+
+The notifier observes local hook invocations, local Codex rollout files, and local databases. A task executed only in a hosted/cloud environment with no lifecycle state mirrored locally is outside that observation boundary. No local configuration can guarantee a notification for such a task.
 
 ## Safe support and disclosure
 
-The `--doctor`/`-Doctor` output deliberately reports configuration state rather than secret values, and is the preferred first diagnostic. Even so, review hostnames and paths before sharing it.
+`--doctor`/`-Doctor` reports configuration state rather than secret values and is the preferred first diagnostic. Review hostnames and paths before sharing even sanitized output.
 
-Never attach raw files from `ntfy-state`, `ntfy-backups`, Codex sessions, shell environments, or private config to a public issue. Sanitize logs manually and replace hostnames, usernames, paths, IDs, topics, and URLs. Report possible vulnerabilities through the private process in [SECURITY.md](../SECURITY.md).
+Never attach raw files from `ntfy-state`, `ntfy-backups`, Codex sessions, Codex databases, shell environments, `hooks.json`, or private config to a public issue. Replace hostnames, usernames, paths, IDs, topics, and URLs in logs. Report vulnerabilities through [SECURITY.md](../SECURITY.md).

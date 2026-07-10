@@ -8,7 +8,8 @@ This is an unofficial community project. Security problems in OpenAI Codex, ntfy
 
 | Version | Security fixes |
 | --- | --- |
-| 2.3.x | Supported |
+| 2.4.x | Supported |
+| 2.3.x | Not supported; upgrade to 2.4.x |
 | Earlier private/pre-public builds | Not supported; upgrade and rotate any embedded credentials |
 
 Only the latest patch release receives security updates. A report may lead to a new patch release rather than a backport.
@@ -41,6 +42,8 @@ Examples in scope include:
 - installer quoting, staging, rollback, ACL, or file-mode behavior exposing credentials;
 - secret values appearing in logs, doctor output, exceptions, tests, or repository artifacts;
 - queue tampering bypassing validation in a way that crosses a security boundary;
+- idle-gate, goal-state, descendant, or rollout-watcher behavior that sends a root completion despite verified active work;
+- hook registration or upgrade behavior that silently grants trust, replaces unrelated handlers, or executes before user review;
 - unsafe remote-host validation that copies credentials to an unintended target;
 - default behavior sending materially more Codex content than documented;
 - a service/task configuration that grants unintended privilege.
@@ -53,7 +56,8 @@ Usually out of scope:
 - notification content visible because a client is configured to display it on a lock screen;
 - denial of service that requires the attacker already to have arbitrary write access to the user's private state directory;
 - unsupported/private builds that differ from the published source;
-- upstream Codex events that never launch the external hook.
+- upstream Codex events that launch neither a local hook nor a locally persisted lifecycle record;
+- pure cloud tasks that expose no lifecycle state to the installed local environment.
 
 The boundary is not absolute. If uncertain and the impact could expose credentials, content, or code execution, report privately.
 
@@ -86,4 +90,4 @@ Rewriting Git history does not invalidate a credential already copied by someone
 
 ## Hardening guidance
 
-Deployment and privacy guidance is maintained in [docs/security-and-privacy.md](docs/security-and-privacy.md). In particular, keep `include_message: false`, use HTTPS, refuse redirects, scope a publish-only token per host, and protect state and backups with host-native permissions.
+Deployment and privacy guidance is maintained in [docs/security-and-privacy.md](docs/security-and-privacy.md). In particular, keep `include_message: false`, retain the default `idle_detection_mode: "strict"`, review the managed `Stop` hook through `/hooks`, use HTTPS, refuse redirects, scope a publish-only token per host, and protect Codex/notifier state and backups with host-native permissions.
