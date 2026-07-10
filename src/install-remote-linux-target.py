@@ -152,6 +152,10 @@ def migrate_private_config(path: Path) -> None:
         "include_message": True,
         "include_thread_title": True,
         "allow_insecure_auth": False,
+        "priority": 3,
+        "tags": ["white_check_mark"],
+        "max_message_chars": 180,
+        "markdown": False,
         "idle_detection_mode": "strict",
         "idle_grace_seconds": 1.5,
         "idle_probe_grace_seconds": 30,
@@ -169,6 +173,9 @@ def migrate_private_config(path: Path) -> None:
         if key not in config:
             config[key] = value
             changed = True
+    if config.get("tags") == ["computer", "white_check_mark"]:
+        config["tags"] = ["white_check_mark"]
+        changed = True
     # Watch roots are host-local topology. Never carry a source machine's WSL
     # or custom paths onto an SSH target.
     if config.get("watch_roots") != []:

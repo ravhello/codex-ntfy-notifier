@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the completion-detection and delivery model implemented by version 2.4.0. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI or ntfy component.
+This document describes the completion-detection and delivery model implemented by version 2.4.1. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI or ntfy component.
 
 ## Design goal
 
@@ -18,7 +18,8 @@ The design favors:
 - a short hook path with no required network request;
 - one independent queue and worker per real Windows, WSL, Linux, or SSH host;
 - durable at-least-once ntfy delivery after idle is confirmed;
-- privacy-preserving defaults, especially `include_message: false`.
+- privacy-preserving defaults, especially `include_message: false`;
+- a compact status-aware payload that is useful on a lock screen without repeating technical labels.
 
 ## Components
 
@@ -98,7 +99,7 @@ Active descendants are bounded by `subagent_orphan_seconds`. The timeout prevent
 | `balanced` | Applies the same positive busy checks but may accept incomplete rollout evidence after `idle_probe_grace_seconds`. | Prefer eventual notification when local history may be unavailable. |
 | `off` | Skips idle detection and queues each accepted completion signal immediately. | Compatibility, diagnostics, or intentionally per-turn behavior. |
 
-`balanced` can produce a false final notification if evidence is still incomplete when its fallback expires. `off` restores the noisy behavior that version 2.4.0 is designed to avoid.
+`balanced` can produce a false final notification if evidence is still incomplete when its fallback expires. `off` restores the noisy per-turn behavior that version 2.4 and later are designed to avoid.
 
 ## Coalescing and technical-turn suppression
 
@@ -135,6 +136,32 @@ After logical idle is confirmed, the intended guarantee is **durable at-least-on
 If ntfy accepts a request and the worker crashes or times out before the receipt is written, the worker retries with the same sequence ID. Exactly-once display cannot be guaranteed.
 
 Strict idle detection changes the liveness boundary: a true completion can remain indefinitely in `pending/` when Codex no longer exposes enough local evidence. This is deliberate. The project prefers a withheld notification over a false “finished” notification in strict mode.
+
+## Send-time payload assembly
+
+Version 2.4.1 changes the wire presentation, not the logical-idle decision. The worker renders the ntfy JSON from the durable record and the current private configuration immediately before each delivery attempt.
+
+The title is:
+
+```text
+Codex <status> · <task-or-project>
+```
+
+Recognized goal states take precedence and map `blocked`, `paused`, `usage_limited`, and `budget_limited` to `blocked`, `paused`, `usage limit`, and `budget limit`. Otherwise a `turn_aborted` completion maps to `stopped`; normal and other eligible completions map to `done`. The display value is the project directory by default. With `include_thread_title: true`, an available local task title replaces it.
+
+The default plain-text body is a label-free sequence joined by ` · `:
+
+```text
+[final-message ·] [project-or-opted-in-path ·] origin · #thread8
+```
+
+The project appears in the body only when a distinct task title occupies the title. `include_full_path: true` instead adds the sanitized working directory as explicit extra context. The optional final-message excerpt appears only while the current `include_message` setting is true and is limited by `max_message_chars` (180 by default). With the default `markdown: false`, whitespace is normalized and the body is one line. An explicit Markdown opt-in can preserve message lines and is the exception to that one-line default.
+
+The full ntfy `message` is truncated on a valid Unicode boundary to at most 3,500 UTF-8 bytes after context is assembled. This byte ceiling is independent of the configurable character limit for the excerpt.
+
+Fresh configuration uses `tags: ["white_check_mark"]`; the templates add no duplicate emoji to title or body. Priority 3 is ntfy's default and is omitted from the outgoing JSON. The worker serializes `priority` only for a non-default value and serializes `markdown: true` only when Markdown was explicitly enabled and an optional message is present.
+
+The send-time `include_message` check is a privacy gate for durable state. A record captured while the option was true can still contain final-message text locally, but changing it to false prevents that text from entering later network attempts, including retries of an outbox record. This does not erase the record or backups and cannot recall a request already in flight or accepted by ntfy.
 
 ## Concurrency and host topology
 

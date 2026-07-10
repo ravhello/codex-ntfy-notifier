@@ -178,6 +178,10 @@ foreach ($default in @(
     @('include_message', $true),
     @('include_thread_title', $true),
     @('allow_insecure_auth', $false),
+    @('priority', 3),
+    @('tags', @('white_check_mark')),
+    @('max_message_chars', 180),
+    @('markdown', $false),
     @('idle_detection_mode', 'strict'),
     @('idle_grace_seconds', 1.5),
     @('idle_probe_grace_seconds', 30),
@@ -195,6 +199,13 @@ foreach ($default in @(
     Add-Member -InputObject $privateObject -MemberType NoteProperty -Name $default[0] -Value $default[1]
     $privateChanged = $true
   }
+}
+$configuredTags = @($privateObject.tags)
+if ($configuredTags.Count -eq 2 -and
+    [string]$configuredTags[0] -eq 'computer' -and
+    [string]$configuredTags[1] -eq 'white_check_mark') {
+  $privateObject.tags = @('white_check_mark')
+  $privateChanged = $true
 }
 $watchRootsProperty = $privateObject.PSObject.Properties['watch_roots']
 if ($null -eq $watchRootsProperty) {

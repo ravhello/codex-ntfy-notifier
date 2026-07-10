@@ -68,6 +68,10 @@ class LinuxInstallerTests(unittest.TestCase):
         self.assertEqual(details["worker"], "on-demand")
         config = json.loads((codex_home / "ntfy-config.json").read_text(encoding="utf-8"))
         self.assertFalse(config["include_message"])
+        self.assertFalse(config["include_thread_title"])
+        self.assertEqual(config["tags"], ["white_check_mark"])
+        self.assertEqual(config["max_message_chars"], 180)
+        self.assertFalse(config["markdown"])
         self.assertEqual(config["idle_detection_mode"], "strict")
         self.assertEqual(config["idle_grace_seconds"], 1.5)
         self.assertTrue(config["goal_aware"])
@@ -249,6 +253,9 @@ class LinuxInstallerTests(unittest.TestCase):
         legacy = {
             "server": "https://ntfy.sh",
             "topic": "legacy-test-topic",
+            "tags": ["computer", "white_check_mark"],
+            "max_message_chars": 900,
+            "markdown": True,
             "watch_roots": [{"path": r"\\wsl.localhost\Source\home\user\.codex"}],
         }
         (codex_home / "ntfy-config.json").write_text(json.dumps(legacy), encoding="utf-8-sig")
@@ -272,6 +279,9 @@ class LinuxInstallerTests(unittest.TestCase):
         self.assertEqual(migrated["watch_initial_replay_seconds"], 15)
         self.assertEqual(migrated["watch_roots"], [])
         self.assertEqual(migrated["dead_retention_days"], 30)
+        self.assertEqual(migrated["tags"], ["white_check_mark"])
+        self.assertEqual(migrated["max_message_chars"], 900)
+        self.assertTrue(migrated["markdown"])
 
     def test_unrelated_systemd_unit_is_never_overwritten(self) -> None:
         home = self.root / "linux home"

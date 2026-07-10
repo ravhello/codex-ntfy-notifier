@@ -136,7 +136,10 @@ function New-PrivateConfigIfNeeded {
     $changed = (Add-ConfigDefault -Config $config -Name 'include_message' -Value $true) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'include_thread_title' -Value $true) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'allow_insecure_auth' -Value $false) -or $changed
-    $changed = (Add-ConfigDefault -Config $config -Name 'markdown' -Value $true) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'priority' -Value 3) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'tags' -Value @('white_check_mark')) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'max_message_chars' -Value 180) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'markdown' -Value $false) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'subagent_classification_grace_seconds' -Value 8) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'idle_detection_mode' -Value 'strict') -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'idle_grace_seconds' -Value 1.5) -or $changed
@@ -152,6 +155,13 @@ function New-PrivateConfigIfNeeded {
     $changed = (Add-ConfigDefault -Config $config -Name 'watch_roots' -Value @()) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'worker_sqlite_path' -Value $workerSqlitePath) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'dead_retention_days' -Value 30) -or $changed
+    $configuredTags = @($config.tags)
+    if ($configuredTags.Count -eq 2 -and
+        [string]$configuredTags[0] -eq 'computer' -and
+        [string]$configuredTags[1] -eq 'white_check_mark') {
+      $config.tags = @('white_check_mark')
+      $changed = $true
+    }
     if ($null -eq $config.PSObject.Properties['max_attempts'] -or [int]$config.max_attempts -eq 40) {
       if ($null -eq $config.PSObject.Properties['max_attempts']) {
         Add-Member -InputObject $config -MemberType NoteProperty -Name 'max_attempts' -Value 0
@@ -212,11 +222,11 @@ function New-PrivateConfigIfNeeded {
     password = [string]$env:CODEX_NTFY_PASSWORD
     allow_insecure_auth = $false
     priority = 3
-    tags = @('computer', 'white_check_mark')
-    max_message_chars = 900
+    tags = @('white_check_mark')
+    max_message_chars = 180
     include_message = $false
     include_thread_title = $false
-    markdown = $true
+    markdown = $false
     include_full_path = $false
     suppress_subagents = $true
     subagent_classification_grace_seconds = 8
