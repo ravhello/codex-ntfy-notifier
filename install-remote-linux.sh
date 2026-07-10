@@ -14,7 +14,7 @@ case "$host" in
     ;;
 esac
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 private_config=${2:-"${USERPROFILE:-$HOME}/.codex/ntfy-config.json"}
 notifier="$script_dir/src/notify-ntfy.py"
 target_installer="$script_dir/src/install-remote-linux-target.py"

@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 codex_home=${CODEX_HOME:-"$HOME/.codex"}
 private_config="$codex_home/ntfy-config.json"
 origin=${CODEX_NTFY_ORIGIN:-"Linux:$(hostname 2>/dev/null || printf unknown-host)"}

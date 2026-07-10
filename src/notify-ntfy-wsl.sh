@@ -14,7 +14,7 @@ fi
 machine="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
 [ -n "$machine" ] || machine="unknown-host"
 origin="${machine}/WSL:${WSL_DISTRO_NAME:-Linux}"
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 native_notifier="$script_dir/notify-ntfy.py"
 native_python="$(command -v python3 2>/dev/null || true)"
 session_classification="unknown"

@@ -584,7 +584,7 @@ class NotifierContractTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows installer test")
     def test_installer_migrates_legacy_secret_without_printing_it(self) -> None:
         install_home = self.temp / "install-home"
-        install_home.mkdir()
+        install_home.mkdir(parents=True)
         secret = "test-topic-that-must-not-appear-in-output"
         (install_home / "notify-ntfy.ps1").write_text(
             "$DefaultServer = 'https://ntfy.sh'\n" f"$DefaultTopic = '{secret}'\n",
@@ -623,8 +623,9 @@ class NotifierContractTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows installer test")
     def test_fresh_windows_install_is_private_and_updates_managed_hook(self) -> None:
-        install_home = self.temp / "custom codex home"
-        install_home.mkdir()
+        install_home = ROOT / ".test-runtime" / f"custom-codex-home-{uuid.uuid4().hex}"
+        install_home.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, install_home, True)
         old_hook = 'notify = ["powershell.exe", "-File", "C:\\\\old\\\\notify-ntfy.ps1"]\n\n'
         nested = '[tools]\nnotify = ["nested-tool-hook"]\n'
         (install_home / "config.toml").write_text(old_hook + nested, encoding="utf-8")
