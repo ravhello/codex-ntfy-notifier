@@ -32,7 +32,7 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 MAX_NTFY_MESSAGE_BYTES = 3500
 
 
@@ -297,9 +297,16 @@ def safe_server_display(value: str) -> str:
         return "invalid"
 
 
-def thread_title(runtime: Runtime, thread_id: str, session_home: str = "") -> str:
+def thread_title(runtime: Runtime, thread_id: str, session_home: str = "", sqlite_home: str = "") -> str:
     if not thread_id:
         return ""
+    _, database_title = sqlite_scalar(
+        state_database_path(Path(sqlite_home or session_home or runtime.sqlite_home)),
+        "SELECT COALESCE(title, '') FROM threads WHERE id = ? LIMIT 1",
+        thread_id,
+    )
+    if database_title:
+        return database_title
     index = Path(session_home or runtime.codex_home) / "session_index.jsonl"
     if not index.exists():
         return ""
@@ -314,7 +321,7 @@ def thread_title(runtime: Runtime, thread_id: str, session_home: str = "") -> st
                     if item.get("id") == thread_id and item.get("thread_name"):
                         title = str(item["thread_name"])
     except OSError:
-        return ""
+        pass
     return title
 
 
@@ -1586,13 +1593,18 @@ def completion_label(record: dict[str, Any]) -> str:
 def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     event = record["event"]
     cwd = str(obj_value(event, "cwd", "working-directory", "working_directory", default=""))
-    project = sanitize(project_name(cwd), 42)
+    project = sanitize(project_name(cwd), 60)
     display_name = project
     has_distinct_thread_title = False
     if config["include_thread_title"]:
         local_title = sanitize(
-            thread_title(runtime, record.get("thread_id", ""), record.get("session_codex_home", "")),
-            42,
+            thread_title(
+                runtime,
+                record.get("thread_id", ""),
+                record.get("session_codex_home", ""),
+                record.get("session_sqlite_home", ""),
+            ),
+            60,
         )
         if local_title:
             display_name = local_title
@@ -1630,7 +1642,7 @@ def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any
 
     payload: dict[str, Any] = {
         "topic": config["topic"],
-        "title": sanitize(f"Codex {completion_label(record)} · {display_name}", 64),
+        "title": display_name,
         "message": body,
         "sequence_id": record["sequence_id"],
     }

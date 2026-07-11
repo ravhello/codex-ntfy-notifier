@@ -1,6 +1,6 @@
 # Security and privacy
 
-Durable Codex ntfy notifier 2.4.1 is an unofficial local hook and worker that reads local Codex lifecycle metadata and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, Codex state, notifier state, and backups as private data.
+Durable Codex ntfy notifier 2.4.2 is an unofficial local hook and worker that reads local Codex lifecycle metadata and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, Codex state, notifier state, and backups as private data.
 
 ## Privacy defaults
 
@@ -49,13 +49,12 @@ The local Codex rollout can itself contain prompts, assistant content, tool data
 
 By default, one ntfy publication can contain:
 
-- a status label derived from local lifecycle state: `done`, `blocked`, `paused`, `usage limit`, `budget limit`, or `stopped`;
 - the final directory name of the Codex working directory in the title;
 - the source host/origin label in a compact, label-free body;
 - `#` plus the first eight characters of the thread ID;
 - the single ntfy tag `white_check_mark` and a deterministic sequence ID.
 
-The default wire shape is `Codex <status> · <project>` plus the one-line body `<origin> · #<thread8>`. The templates add no text emoji. Markdown is disabled, and default ntfy priority 3 is represented by omitting the `priority` member from the outgoing JSON. These choices reduce visual and wire noise; they do not make the remaining metadata anonymous.
+The default JSON title is only `<project>`, while the single `white_check_mark` tag renders one completion emoji before it in ntfy. The one-line body is `<origin> · #<thread8>`. The templates add no notifier name, completion word, model name, status label, or text emoji. Markdown is disabled, and default ntfy priority 3 is represented by omitting the `priority` member from the outgoing JSON. These choices reduce visual and wire noise; they do not make the remaining metadata anonymous.
 
 `include_thread_title: true` opts into the locally indexed Codex task title when available. When that title differs from the project, the project moves into the body so the location is retained. A task title can summarize the user's request.
 

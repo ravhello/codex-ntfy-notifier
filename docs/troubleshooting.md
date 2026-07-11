@@ -24,7 +24,7 @@ tail -n 40 "$HOME/.codex/ntfy-state/notify.log"
 
 The doctor output does not print the topic or credentials. Check:
 
-- `version` is `2.4.1` or a newer compatible release;
+- `version` is `2.4.2` or a newer compatible release;
 - `topic_configured` is `true`;
 - `idle_detection_mode` is `strict` when intermediate notifications must never be sent;
 - `goal_aware` and `watch_rollouts` are `true`;
@@ -138,7 +138,7 @@ If that environment cannot retain usable rollout evidence, `idle_detection_mode:
 
 With `goal_aware: true`, `active` blocks notification. Other observed statuses, including `complete`, `paused`, `blocked`, `usage_limited`, and `budget_limited`, are non-running and do not block.
 
-In 2.4.1 these terminal states also affect the compact title: `blocked`, `paused`, `usage_limited`, and `budget_limited` become `Codex blocked`, `Codex paused`, `Codex usage limit`, and `Codex budget limit`. A normal completion becomes `Codex done`; a matching `turn_aborted` becomes `Codex stopped`.
+These terminal states still control whether a task is running, but version 2.4.2 deliberately omits lifecycle status from the notification title to save space. The title identifies only the task or project.
 
 The notifier reads only the goal status. If a stale upstream goal is permanently `active`, correct/finish the task state. Setting `goal_aware: false` is possible but weakens the final-only guarantee.
 
@@ -152,7 +152,7 @@ Lowering that timeout can notify while a genuinely long-running child is still a
 
 Confirm all of the following:
 
-- doctor reports version 2.4.1+ and `idle_detection_mode: "strict"`;
+- doctor reports version 2.4.2+ and `idle_detection_mode: "strict"`;
 - the alert comes from this installation/topic rather than an older custom hook or another notifier;
 - old managed notifier handlers are not still registered under `UserPromptSubmit`, `SubagentStop`, or another hook event;
 - only one intended `notify-ntfy` `Stop` group exists per environment;
@@ -291,7 +291,7 @@ Without a persistent service, hook-driven on-demand delivery still works, but au
 
 ## Notification content looks wrong
 
-- The 2.4.1 default title is `Codex <status> · <project>`; see the status mapping above.
+- The 2.4.2 JSON title is only `<task-or-project>`. With the default single `white_check_mark` tag, ntfy displays one completion emoji before it. `Codex`, `done`, model names, and lifecycle status are intentionally absent.
 - The default body is one plain-text line, `<origin> · #<thread8>`, without `Project:`, `Source:`, or `Thread:` labels. A project is prepended only when a distinct task title occupies the title, or a sanitized path is added when full-path output is enabled.
 - Keep `include_message: false` unless the final assistant response should be captured and sent. With it enabled, the excerpt is prepended to the context and `max_message_chars` defaults to 180.
 - Keep `include_full_path: false` to avoid sending the sanitized working-directory path.

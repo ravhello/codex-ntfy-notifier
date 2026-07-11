@@ -83,7 +83,7 @@ class NotifierContractTests(unittest.TestCase):
         connection = sqlite3.connect(self.state_database)
         try:
             connection.execute(
-                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, source TEXT NOT NULL, thread_source TEXT)"
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, source TEXT NOT NULL, thread_source TEXT, title TEXT)"
             )
             connection.execute(
                 "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT PRIMARY KEY, status TEXT)"
@@ -366,19 +366,25 @@ class NotifierContractTests(unittest.TestCase):
 
         expected = {
             "topic": "test-topic",
-            "title": "Codex done · perfect notifier",
+            "title": "perfect notifier",
             "message": "Fatto: test concorrente completato. · test-host · #11111111",
             "tags": ["white_check_mark"],
             "sequence_id": captured["python"]["sequence_id"],
         }
         self.assertEqual(captured["python"], expected)
+        self.assertFalse(
+            any(
+                word in captured["python"]["title"].lower()
+                for word in ("codex", "done", "stopped", "gpt")
+            )
+        )
         if "powershell" in captured:
             self.assertEqual(captured["powershell"], expected)
 
     def test_compact_payload_unicode_title_and_byte_budget(self) -> None:
         thread_id = "33333333-3333-7333-8333-333333333333"
         turn_id = "44444444-4444-7444-8444-444444444444"
-        title = "Attività già pronta 😀"
+        title = "Attività già pronta " + ("x" * 38) + " 😀"
         other_id = "55555555-5555-7555-8555-555555555555"
         (self.codex_home / "session_index.jsonl").write_text(
             json.dumps({"id": thread_id, "thread_name": title}, ensure_ascii=False)
@@ -397,7 +403,9 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.worker_command(implementation))
                 with self.server.lock:
                     payload = self.server.payloads.pop()
-                self.assertEqual(payload["title"], f"Codex done · {title}")
+                self.assertEqual(payload["title"], title)
+                self.assertEqual(len(payload["title"]), 60)
+                self.assertEqual(payload["tags"], ["white_check_mark"])
                 self.assertLessEqual(len(payload["message"].encode("utf-8")), 3500)
                 self.assertNotIn("�", payload["message"])
                 self.assertTrue(payload["message"].endswith("perfect notifier · test-host · #33333333"))
@@ -416,7 +424,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.worker_command(implementation))
                 with self.server.lock:
                     payload = self.server.payloads.pop()
-                self.assertTrue(payload["title"].startswith("Codex stopped · "))
+                self.assertEqual(payload["title"], "perfect notifier")
                 self.assertNotIn("aborted", payload["message"].lower())
                 self.assertNotIn("completed", payload["message"].lower())
                 shutil.rmtree(self.state, ignore_errors=True)
@@ -746,7 +754,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.worker_command(implementation), timeout=20)
                 payloads = self.wait_for_payloads(1)
                 self.assertEqual(len(payloads), 1)
-                self.assertTrue(payloads[0]["title"].startswith("Codex stopped · "))
+                self.assertEqual(payloads[0]["title"], "perfect notifier")
                 shutil.rmtree(self.state, ignore_errors=True)
                 with self.server.lock:
                     self.server.payloads.clear()
@@ -1933,6 +1941,42 @@ class NotifierContractTests(unittest.TestCase):
                     payload = self.server.payloads.pop()
                 self.assertIn(sensitive_title, payload["title"])
                 shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_database_thread_title_is_authoritative_when_session_index_is_missing_or_stale(self) -> None:
+        thread_id = "66666666-6666-7666-8666-666666666666"
+        turn_id = "77777777-7777-7777-8777-777777777777"
+        title = "Titolo conversazione dal database"
+        connection = sqlite3.connect(self.state_database)
+        try:
+            connection.execute(
+                "INSERT INTO threads(id, rollout_path, source, thread_source, title) VALUES (?, ?, 'vscode', 'user', ?)",
+                (thread_id, str(self.codex_home / "missing-rollout.jsonl"), title),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.configure(include_thread_title=True)
+        index_path = self.codex_home / "session_index.jsonl"
+        for index_state in ("missing", "stale"):
+            if index_state == "missing":
+                index_path.unlink(missing_ok=True)
+            else:
+                index_path.write_text(
+                    json.dumps({"id": thread_id, "thread_name": "Titolo obsoleto dall'indice"}) + "\n",
+                    encoding="utf-8",
+                )
+            captured: dict[str, dict] = {}
+            for implementation in self.implementations():
+                with self.subTest(index_state=index_state, implementation=implementation):
+                    self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id, turn_id=turn_id)))
+                    self.run_ok(self.worker_command(implementation))
+                    with self.server.lock:
+                        captured[implementation] = self.server.payloads.pop()
+                    self.assertEqual(captured[implementation]["title"], title)
+                    self.assertEqual(captured[implementation]["tags"], ["white_check_mark"])
+                    shutil.rmtree(self.state, ignore_errors=True)
+            if "powershell" in captured:
+                self.assertEqual(captured["powershell"], captured["python"])
 
     def test_concurrent_hooks_create_one_outbox_item(self) -> None:
         for implementation in self.implementations():
