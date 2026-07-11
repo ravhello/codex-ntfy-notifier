@@ -1,6 +1,8 @@
 name: Bug report
 description: Report a reproducible problem with installation or notification delivery.
 title: "[Bug]: "
+labels:
+  - bug
 body:
   - type: markdown
     attributes:

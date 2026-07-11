@@ -1,11 +1,89 @@
-# Durable Codex ntfy notifier
+# Codex ntfy Notifier — notifiche di completamento idle-aware
 
-[English](README.md) · [Architettura](docs/architecture.md) · [Privacy e sicurezza](docs/security-and-privacy.md) · [Risoluzione problemi](docs/troubleshooting.md)
+[![CI](https://github.com/ravhello/codex-ntfy-notifier/actions/workflows/ci.yml/badge.svg)](https://github.com/ravhello/codex-ntfy-notifier/actions/workflows/ci.yml)
+[![Ultima release](https://img.shields.io/github/v/release/ravhello/codex-ntfy-notifier?display_name=tag&sort=semver)](https://github.com/ravhello/codex-ntfy-notifier/releases/latest)
+[![Licenza: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
+[![Windows PowerShell 5.1](https://img.shields.io/badge/Windows%20PowerShell-5.1-5391FE.svg)](https://learn.microsoft.com/powershell/)
 
-Notifiche push ntfy affidabili quando una task root di OpenAI Codex è davvero inattiva, non a ogni risultato intermedio. Progettato per app Codex, estensione VS Code, CLI, WSL e host Remote SSH.
+[English](README.md) · [Architettura](docs/architecture.md) · [Privacy e sicurezza](docs/security-and-privacy.md) · [Supporto](SUPPORT.md) · [Alternative](docs/alternatives.md)
+
+Una sola notifica push ntfy compatta quando una task root locale di OpenAI Codex è verificabilmente inattiva, non a ogni risultato intermedio. Funziona con app Codex, estensione VS Code, CLI, WSL e host Remote SSH.
+
+![Codex ntfy Notifier aspetta l'idle verificabile localmente prima di inviare una sola notifica di completamento compatta](docs/assets/hero.svg)
 
 > [!IMPORTANT]
 > Questo è un progetto community non ufficiale, non affiliato né approvato da OpenAI o ntfy.
+
+## Cosa lo distingue
+
+- **Idle-aware:** la task root deve risultare inattiva da prove locali; turni intermedi, goal attivi e subagent ancora in esecuzione mantengono la notifica in attesa.
+- **Consegna durevole:** outbox atomica, deduplicazione stabile e retry con backoff forniscono consegna at-least-once dopo la conferma di idle.
+- **Multi-ambiente:** lo stesso classificatore supporta app Codex, VS Code, CLI, Windows, WSL, Linux nativo e installazioni Remote SSH locali all'host.
+- **Privacy predefinita:** prompt e messaggi finali sono esclusi; titolo della task, estratto del messaggio e percorso completo richiedono ciascuno un opt-in esplicito.
+
+## Avvio rapido
+
+Il percorso è **installazione → `/hooks` → doctor → test**. Ogni ambiente reale Windows, WSL, Linux o SSH ha un proprio `CODEX_HOME` e deve essere installato separatamente.
+
+Prima di installare, [sottoscrivere con un client ntfy](https://docs.ntfy.sh/subscribe/phone/) un topic difficile da indovinare oppure protetto dal [controllo accessi ntfy](https://docs.ntfy.sh/config/#access-control). Serve anche Git; Linux nativo richiede Python 3.10 o successivo.
+
+### 1a. Installazione su Windows e WSL
+
+Aprire PowerShell:
+
+```powershell
+git clone https://github.com/ravhello/codex-ntfy-notifier.git
+cd codex-ntfy-notifier
+.\install.ps1 -WslDistro Ubuntu
+```
+
+Per il solo Windows usare `.\install.ps1 -NoWsl`. Dopo l'installazione, ricaricare Codex e le finestre VS Code già aperte.
+
+### 1b. Installazione su Linux nativo
+
+```sh
+git clone https://github.com/ravhello/codex-ntfy-notifier.git
+cd codex-ntfy-notifier
+CODEX_NTFY_TOPIC=$(python3 -c 'import getpass; print(getpass.getpass("Topic ntfy privato: "))')
+export CODEX_NTFY_TOPIC
+./install-linux.sh
+unset CODEX_NTFY_TOPIC
+```
+
+### 2. Revisione dell'hook
+
+In ogni ambiente Codex installato, eseguire `/hooks`, controllare il comando `Stop` gestito e approvarlo. L'installer non modifica mai il trust store di Codex.
+
+### 3. Esecuzione del doctor
+
+Windows:
+
+```powershell
+& "$HOME\.codex\notify-ntfy.ps1" -Doctor
+```
+
+Linux o WSL:
+
+```sh
+python3 ~/.codex/notify-ntfy.py --doctor
+```
+
+### 4. Invio di una notifica di test
+
+Windows:
+
+```powershell
+& "$HOME\.codex\notify-ntfy.ps1" -Test
+```
+
+Linux o WSL:
+
+```sh
+python3 ~/.codex/notify-ntfy.py --test
+```
+
+> Se risolve un problema reale nel tuo flusso di lavoro, puoi [lasciare una stella alla repository](https://github.com/ravhello/codex-ntfy-notifier).
 
 ## Perché esiste
 
@@ -61,15 +139,9 @@ Le task interamente cloud che non replicano lo stato nel `CODEX_HOME` locale non
 
 Fonti ufficiali: [Codex Hooks](https://learn.chatgpt.com/docs/hooks) e [configurazione delle notifiche](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications).
 
-## Installazione Windows e WSL
+## Dettagli dell'installazione Windows e WSL
 
-```powershell
-git clone https://github.com/ravhello/codex-ntfy-notifier.git
-cd codex-ntfy-notifier
-.\install.ps1 -WslDistro Ubuntu
-```
-
-Su una nuova installazione il topic viene chiesto con input nascosto. L’installer:
+L'avvio rapido Windows/WSL riportato sopra chiede il topic con input nascosto su una nuova installazione. L’installer:
 
 1. crea la configurazione privata;
 2. salva un backup di rollback;
@@ -84,24 +156,13 @@ Per Windows senza WSL:
 .\install.ps1 -NoWsl
 ```
 
-Ricaricare app Codex e finestre VS Code già aperte dopo l’installazione.
-
 ### Revisione una tantum dell’hook
 
 Codex non esegue automaticamente un nuovo hook finché l’utente non lo ha revisionato. In ogni ambiente installato, aprire `/hooks` e approvare l’hook `Stop` gestito dopo averne controllato il comando.
 
 L’installer non modifica intenzionalmente il trust store di Codex. Prima dell’approvazione restano attivi il fallback legacy e il watcher dei rollout; l’hook moderno è comunque il candidato di stop più tempestivo, poi classificato dal notifier come root o discendente.
 
-## Installazione Linux
-
-```sh
-git clone https://github.com/ravhello/codex-ntfy-notifier.git
-cd codex-ntfy-notifier
-CODEX_NTFY_TOPIC=$(python3 -c 'import getpass; print(getpass.getpass("Topic ntfy privato: "))')
-export CODEX_NTFY_TOPIC
-./install-linux.sh
-unset CODEX_NTFY_TOPIC
-```
+## Dettagli dell'installazione Linux
 
 Con `CODEX_NTFY_SKIP_SYSTEMD=1` si usa soltanto il worker on-demand. Il worker continuo è consigliato perché esegue il watcher che recupera i segnali mancanti.
 
@@ -172,7 +233,7 @@ L’idle gate legge metadati locali e campi SQLite in sola lettura. Interroga lo
 Windows:
 
 ```powershell
-~/.codex/notify-ntfy.ps1 -Doctor
+& "$HOME\.codex\notify-ntfy.ps1" -Doctor
 Get-ScheduledTask CodexNtfyWatcher | Select-Object TaskName, State
 ```
 

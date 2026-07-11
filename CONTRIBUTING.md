@@ -1,8 +1,17 @@
 # Contributing
 
-Thank you for helping improve Durable Codex ntfy notifier. This is an unofficial community project and is not affiliated with OpenAI or ntfy.
+Thank you for helping improve Codex ntfy Notifier. This is an unofficial community project and is not affiliated with OpenAI or ntfy.
 
 Contributions are welcome for idle detection, delivery reliability, platform compatibility, privacy, security, tests, and documentation. Keep changes focused on notifying when a root Codex task has no more work rather than turning the repository into a general notification framework.
+
+## Contribute in 60 seconds
+
+1. Pick a focused issue, or open a short feature request before a broad change.
+2. Fork the repository and create one branch for that change.
+3. Run `python3 -m unittest discover -s tests -v` plus the platform checks below.
+4. Open a pull request that explains the user impact, affected environments, and validation.
+
+Small compatibility fixtures, documentation corrections, installer UX improvements, and isolated regression tests are especially useful first contributions.
 
 ## Before opening an issue
 
