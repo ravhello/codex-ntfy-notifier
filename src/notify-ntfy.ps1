@@ -23,7 +23,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.4.1'
+$ScriptVersion = '2.4.2'
 $MaxNtfyMessageBytes = 3500
 $MiddleDot = [char]0x00B7
 $Ellipsis = [char]0x2026
@@ -411,11 +411,19 @@ function Get-ProjectName {
 function Get-ThreadTitle {
   param(
     [string]$ThreadId,
-    [string]$SessionHome = $CodexHome
+    [string]$SessionHome = $CodexHome,
+    [string]$SqliteHome = $SessionHome
   )
 
   if ([string]::IsNullOrWhiteSpace($ThreadId)) {
     return $null
+  }
+  if (-not [string]::IsNullOrWhiteSpace($SqliteHome)) {
+    $database = Get-StateDatabasePath -SqliteHome $SqliteHome
+    $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT COALESCE(title,'') FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 1
+    if ($row.ok -and $row.found -and -not [string]::IsNullOrWhiteSpace([string]$row.values[0])) {
+      return [string]$row.values[0]
+    }
   }
   $indexPath = Join-Path $SessionHome 'session_index.jsonl'
   if (-not (Test-Path -LiteralPath $indexPath)) {
@@ -441,13 +449,14 @@ function Get-ThreadTitle {
         continue
       }
     }
-    return $title
   } catch {
-    return $null
+    $title = $null
   } finally {
     if ($null -ne $reader) { $reader.Dispose() }
     elseif ($null -ne $stream) { $stream.Dispose() }
   }
+  if (-not [string]::IsNullOrWhiteSpace($title)) { return $title }
+  return $null
 }
 
 function Read-FirstLineShared {
@@ -874,15 +883,17 @@ function New-NtfyPayload {
 
   $event = $Record.event
   $cwd = [string](Get-FirstObjectValue $event @('cwd', 'working-directory', 'working_directory'))
-  $project = Sanitize-NotificationText -Text (Get-ProjectName $cwd) -MaxLength 42
+  $project = Sanitize-NotificationText -Text (Get-ProjectName $cwd) -MaxLength 60
   $sessionHome = [string](Get-ObjectValue $Record 'session_codex_home' $CodexHome)
   if ([string]::IsNullOrWhiteSpace($sessionHome)) {
     $sessionHome = $CodexHome
   }
+  $sessionSqliteHome = [string](Get-ObjectValue $Record 'session_sqlite_home' $sessionHome)
+  if ([string]::IsNullOrWhiteSpace($sessionSqliteHome)) { $sessionSqliteHome = $sessionHome }
   $displayName = $project
   $hasDistinctThreadTitle = $false
   if ($Config.includeThreadTitle) {
-    $threadTitle = Sanitize-NotificationText -Text (Get-ThreadTitle -ThreadId $Record.thread_id -SessionHome $sessionHome) -MaxLength 42
+    $threadTitle = Sanitize-NotificationText -Text (Get-ThreadTitle -ThreadId $Record.thread_id -SessionHome $sessionHome -SqliteHome $sessionSqliteHome) -MaxLength 60
     if (-not [string]::IsNullOrWhiteSpace($threadTitle)) {
       $displayName = $threadTitle
       $hasDistinctThreadTitle = -not [string]::Equals($threadTitle, $project, [StringComparison]::OrdinalIgnoreCase)
@@ -939,7 +950,7 @@ function New-NtfyPayload {
 
   $payload = [ordered]@{
     topic = $Config.topic
-    title = Sanitize-NotificationText -Text ('Codex ' + (Get-CompletionLabel -Record $Record) + " $MiddleDot " + $displayName) -MaxLength 64
+    title = $displayName
     message = $body
     sequence_id = $Record.sequence_id
   }

@@ -16,7 +16,7 @@ Reliable ntfy push notifications when a root OpenAI Codex task becomes truly idl
 
 Codex may emit several turn-completion signals while one task is still progressing: an automatic continuation can start immediately, a goal can remain active, or a delegated subagent can still be working. Publishing every signal produces noisy “finished” notifications that are not actually final.
 
-Version 2.4 introduced the logical **idle epoch** used by 2.4.1:
+Version 2.4 introduced the logical **idle epoch** used by 2.4.2:
 
 - the modern Codex `Stop` hook contributes a candidate; it never publishes directly;
 - the legacy `agent-turn-complete` notification remains a compatibility signal;
@@ -37,20 +37,20 @@ After the idle gate, the existing durable delivery engine takes over:
 
 The delivery guarantee after idle confirmation is **durable at-least-once**, not transactional exactly-once. See [Architecture](docs/architecture.md) for the complete state machine and failure model.
 
-## Compact notification format
+## Minimal notification title
 
-Version 2.4.1 keeps the 2.4 idle-only delivery rule and makes the ntfy presentation compact and status-aware:
+Version 2.4.2 keeps the 2.4 idle-only delivery rule and removes every redundant title prefix:
 
 ```text
-Title: Codex <done|blocked|paused|usage limit|budget limit|stopped> · <task-or-project>
+Visible title: ✅ <task-or-project>
 Body:  [final message ·] [project ·] origin · #thread8
 ```
 
-A normal completion uses `Codex done`; terminal goal states select `blocked`, `paused`, `usage limit`, or `budget limit`, and an aborted turn uses `stopped`. The title uses the project directory by default. If `include_thread_title: true` opts into an available local task title and that title differs from the project, it becomes the display value and the project moves into the body so the location is not duplicated or lost.
+The JSON `title` contains only the local task title, or the project directory when task-title sharing is disabled or unavailable. The title is resolved by exact thread ID from the read-only Codex state database, then from the local session index as a compatibility fallback. The single default `white_check_mark` tag supplies the one completion emoji displayed by ntfy; the notifier does not add `Codex`, `done`, a model name, a status label, or another decorative emoji. If `include_thread_title: true` opts into an available local task title and that title differs from the project, the project moves into the body so the location is not duplicated or lost.
 
 With the default `markdown: false`, the body is one line and its context has no labels such as `Project:`, `Source:`, or `Thread:`. With the privacy default `include_message: false`, it contains only the necessary project (when not already in the title), origin, and `#` plus the first eight thread-ID characters. With `include_message: true`, a redacted final-message excerpt is prepended; `max_message_chars` defaults to 180. The complete ntfy `message` is hard-capped at 3,500 UTF-8 bytes regardless of that character setting. An explicit Markdown opt-in can preserve lines in the optional excerpt.
 
-Fresh installs use one ntfy tag, `white_check_mark`. The templates add no decorative emoji to title or body, Markdown is off, and default priority 3 is represented by omitting `priority` from the outgoing JSON. Custom non-default priorities are still sent explicitly.
+Fresh installs use one ntfy tag, `white_check_mark`. Apart from the emoji rendered from that tag, the templates add no decorative emoji to title or body. Markdown is off, and default priority 3 is represented by omitting `priority` from the outgoing JSON. Custom non-default priorities are still sent explicitly.
 
 ## When to use it
 
@@ -232,7 +232,7 @@ Do not delete `pending/` or `outbox/` during an outage. Diagnose why a record is
 
 ## Privacy summary
 
-By default, ntfy receives a status-aware title containing the project name and a one-line body containing the source host/origin plus a short thread identifier. Thread titles are excluded because they may summarize prompt context. Setting `include_thread_title: true` opts into that title; setting `include_message: true` also stores and sends a redacted/truncated final assistant message. `include_full_path: true` is a separate opt-in that can expose the sanitized working-directory path.
+By default, the ntfy title contains only the project name; the single configured tag renders one completion emoji. The one-line body contains the source host/origin plus a short thread identifier. Thread titles are excluded because they may summarize prompt context. Setting `include_thread_title: true` replaces the project title with that local task title; setting `include_message: true` also stores and sends a redacted/truncated final assistant message. `include_full_path: true` is a separate opt-in that can expose the sanitized working-directory path.
 
 `include_message` is checked again when an outbox record is sent. Turning it off prevents final-message content in already queued records from leaving the host, but it does not erase the local record, backups, dead letters, a request already in flight, or a notification already accepted by ntfy.
 

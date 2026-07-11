@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the completion-detection and delivery model implemented by version 2.4.1. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI or ntfy component.
+This document describes the completion-detection and delivery model implemented by version 2.4.2. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI or ntfy component.
 
 ## Design goal
 
@@ -19,7 +19,7 @@ The design favors:
 - one independent queue and worker per real Windows, WSL, Linux, or SSH host;
 - durable at-least-once ntfy delivery after idle is confirmed;
 - privacy-preserving defaults, especially `include_message: false`;
-- a compact status-aware payload that is useful on a lock screen without repeating technical labels.
+- a minimal payload that is useful on a lock screen without repeating the notifier name or completion state.
 
 ## Components
 
@@ -139,15 +139,15 @@ Strict idle detection changes the liveness boundary: a true completion can remai
 
 ## Send-time payload assembly
 
-Version 2.4.1 changes the wire presentation, not the logical-idle decision. The worker renders the ntfy JSON from the durable record and the current private configuration immediately before each delivery attempt.
+Version 2.4.2 changes the wire presentation, not the logical-idle decision. The worker renders the ntfy JSON from the durable record and the current private configuration immediately before each delivery attempt.
 
-The title is:
+With the default tag, the visible title is:
 
 ```text
-Codex <status> · <task-or-project>
+✅ <task-or-project>
 ```
 
-Recognized goal states take precedence and map `blocked`, `paused`, `usage_limited`, and `budget_limited` to `blocked`, `paused`, `usage limit`, and `budget limit`. Otherwise a `turn_aborted` completion maps to `stopped`; normal and other eligible completions map to `done`. The display value is the project directory by default. With `include_thread_title: true`, an available local task title replaces it.
+The outgoing JSON `title` is only the display value: the project directory by default, or an available local task title with `include_thread_title: true`. Title lookup queries `threads.title` by exact thread ID from the current state database in read-only/query-only mode, then checks `session_index.jsonl` as a compatibility fallback. The single `white_check_mark` tag supplies the completion emoji rendered by ntfy. No notifier name, completion word, model name, or textual lifecycle status is prepended.
 
 The default plain-text body is a label-free sequence joined by ` · `:
 

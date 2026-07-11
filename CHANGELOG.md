@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.4.2] - 2026-07-11
+
+### Changed
+
+- The ntfy JSON title now contains only the local task title, or the project name when task-title sharing is disabled or unavailable.
+- Task-title lookup now queries the read-only `threads.title` field by exact thread ID before falling back to `session_index.jsonl`, improving freshness and coverage across app and VS Code sessions.
+- Removed `Codex`, completion words such as `done` or `stopped`, lifecycle status, and any model-style prefix from the title. The single default `white_check_mark` tag remains the only notifier-supplied emoji.
+- Expanded the available display-name budget from 42 to 60 characters now that the redundant prefix no longer consumes title space.
+- Idle detection, goal/subagent waiting, continuation coalescing, durable delivery, and the compact body format are unchanged.
+
 ## [2.4.1] - 2026-07-10
 
 ### Added
@@ -130,7 +140,8 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.4.1...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.4.2...HEAD
+[2.4.2]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.2
 [2.4.1]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.1
 [2.4.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.0
 [2.3.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.3.0

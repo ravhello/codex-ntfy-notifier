@@ -11,7 +11,7 @@ Notifiche push ntfy affidabili quando una task root di OpenAI Codex è davvero i
 
 Una singola task Codex può produrre più segnali di fine turno mentre ha ancora lavoro: può partire subito una continuazione automatica, il goal può essere ancora `active` oppure un subagent può stare lavorando. Inviare ogni segnale crea notifiche “completato” premature.
 
-La versione 2.4 ha introdotto il **periodo di idle logico** mantenuto dalla 2.4.1:
+La versione 2.4 ha introdotto il **periodo di idle logico** mantenuto dalla 2.4.2:
 
 - l’hook moderno Codex `Stop` crea un candidato, ma non pubblica direttamente;
 - la notifica legacy `agent-turn-complete` rimane come segnale di compatibilità;
@@ -31,20 +31,20 @@ Dopo la conferma di idle, il motore di consegna:
 
 La garanzia di consegna è **at-least-once durevole**, non exactly-once transazionale.
 
-## Formato compatto della notifica
+## Titolo minimo della notifica
 
-La versione 2.4.1 mantiene la regola idle-only della 2.4 e rende la presentazione ntfy compatta e consapevole dello stato:
+La versione 2.4.2 mantiene la regola idle-only della 2.4 ed elimina ogni prefisso ridondante dal titolo:
 
 ```text
-Titolo: Codex <done|blocked|paused|usage limit|budget limit|stopped> · <task-o-progetto>
+Titolo visibile: ✅ <task-o-progetto>
 Corpo:  [messaggio finale ·] [progetto ·] origine · #thread8
 ```
 
-Una completion normale usa `Codex done`; gli stati terminali del goal selezionano `blocked`, `paused`, `usage limit` o `budget limit`, mentre un turno interrotto usa `stopped`. Per impostazione predefinita il titolo usa la directory progetto. Se `include_thread_title: true` abilita un titolo locale disponibile e distinto dal progetto, quel titolo diventa il valore mostrato e il progetto passa nel corpo per non essere duplicato né perso.
+Il campo JSON `title` contiene soltanto il titolo locale della task, oppure la directory progetto quando la condivisione del titolo è disattivata o non disponibile. Il titolo viene risolto tramite ID esatto dal database di stato Codex aperto in sola lettura e, come fallback di compatibilità, dall'indice locale delle sessioni. L'unico tag predefinito `white_check_mark` fornisce la sola emoji di completamento mostrata da ntfy: il notifier non aggiunge `Codex`, `done`, il nome del modello, uno stato testuale o altre emoji decorative. Se `include_thread_title: true` abilita un titolo locale disponibile e distinto dal progetto, il progetto passa nel corpo per non essere duplicato né perso.
 
 Con il default `markdown: false`, il corpo occupa una sola riga e il contesto non usa etichette come `Project:`, `Source:` o `Thread:`. Con il default privacy `include_message: false` contiene soltanto il progetto necessario (quando non è già nel titolo), l'origine e `#` seguito dai primi otto caratteri dell'ID della chat. Con `include_message: true` viene anteposto un estratto redatto del messaggio finale; `max_message_chars` vale 180 per default. L'intero campo ntfy `message` ha comunque un limite rigido di 3.500 byte UTF-8. Un opt-in esplicito a Markdown può conservare le righe dell'estratto opzionale.
 
-Le nuove installazioni usano un solo tag ntfy, `white_check_mark`. I template non aggiungono emoji decorative nel titolo o nel corpo, Markdown è disattivato e la priorità predefinita 3 viene rappresentata omettendo `priority` dal JSON in uscita. Una priorità personalizzata diversa da 3 viene invece inviata esplicitamente.
+Le nuove installazioni usano un solo tag ntfy, `white_check_mark`. Oltre all'emoji resa da quel tag, i template non aggiungono emoji decorative nel titolo o nel corpo. Markdown è disattivato e la priorità predefinita 3 viene rappresentata omettendo `priority` dal JSON in uscita. Una priorità personalizzata diversa da 3 viene invece inviata esplicitamente.
 
 ## Ambienti supportati
 

@@ -2,7 +2,7 @@
 
 There are useful notification projects for Codex and other coding agents. Durable Codex ntfy notifier is not claimed to be the first or only solution. The best choice depends on whether the priority is true root-task idle detection, durable ntfy delivery, native desktop interaction, broad provider support, tmux integration, or a lightweight explicit workflow.
 
-This comparison was reviewed for version 2.4.1 on 2026-07-10, including the compact notification patterns described below. Projects change; verify their current documentation, code, supported platforms, maintenance status, security model, and license before adoption. The descriptions below are orientation, not security reviews or feature guarantees.
+This comparison was reviewed for version 2.4.2 on 2026-07-11, including the compact notification patterns described below. Projects change; verify their current documentation, code, supported platforms, maintenance status, security model, and license before adoption. The descriptions below are orientation, not security reviews or feature guarantees.
 
 ## Project map
 
@@ -33,7 +33,7 @@ The lifecycle review behind 2.4 reinforced several engineering patterns:
 - deduplicate and delay at a stable task/thread identity, not with one global cooldown;
 - keep an explicit hook signal plus a persisted-state recovery path.
 
-The 2.4.1 presentation review also found a useful compact pattern across several adjacent tools: expose a short result excerpt, commonly in roughly the 120–200 character range, and use one semantic icon/tag instead of repeating decorative markers through the title and body. That review informed this repository's 180-character default excerpt, single `white_check_mark` tag, status-aware title, and label-free one-line context. It did not change 2.4's idle-only detection semantics.
+The presentation review also found a useful compact pattern across several adjacent tools: expose a short result excerpt, commonly in roughly the 120–200 character range, and use one semantic icon/tag instead of repeating decorative markers through the title and body. That review informed this repository's 180-character default excerpt, single `white_check_mark` tag, title containing only the task/project name, and label-free one-line context. It did not change 2.4's idle-only detection semantics.
 
 The implementation in this repository combines those general lessons with its existing durable outbox and was written for this project. Feature ideas are not a claim of source-code reuse, compatibility, endorsement, or equivalent licensing.
 
