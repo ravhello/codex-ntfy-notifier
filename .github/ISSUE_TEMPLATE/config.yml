@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Support and troubleshooting
+    url: https://github.com/ravhello/codex-ntfy-notifier/blob/main/SUPPORT.md
+    about: Start here for setup help, safe diagnostics, and supported versions.
   - name: Security vulnerability
     url: https://github.com/ravhello/codex-ntfy-notifier/security/policy
     about: Report vulnerabilities privately according to the security policy.

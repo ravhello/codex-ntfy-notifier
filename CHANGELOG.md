@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Documentation
+
+- Redesigned the README opening around the final-only value proposition, an anonymized notification preview, and an earlier install-to-test path.
+- Added a GitHub Pages landing page, a reusable 1280×640 social preview, support guidance, and a Contributor Covenant code of conduct.
+- Clarified ntfy topic setup and added concise, verifiable discovery language without changing notifier behavior or delivery guarantees.
+
 ## [2.4.2] - 2026-07-11
 
 ### Changed
