@@ -151,6 +151,8 @@ def migrate_private_config(path: Path) -> None:
     for key, value in {
         "include_message": True,
         "include_thread_title": True,
+        "include_task_link": False,
+        "include_task_link_action": False,
         "allow_insecure_auth": False,
         "priority": 3,
         "tags": ["white_check_mark"],

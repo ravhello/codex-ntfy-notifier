@@ -123,11 +123,13 @@ The JSON `title` contains only the local task title, or the project directory wh
 
 With the default `markdown: false`, the body is one line and its context has no labels such as `Project:`, `Source:`, or `Thread:`. With the privacy default `include_message: false`, it contains only the necessary project (when not already in the title), origin, and `#` plus the first eight thread-ID characters. With `include_message: true`, a redacted final-message excerpt is prepended; `max_message_chars` defaults to 180. The complete ntfy `message` is hard-capped at 3,500 UTF-8 bytes regardless of that character setting. An explicit Markdown opt-in can preserve lines in the optional excerpt.
 
+Notification taps do nothing extra by default. Setting `include_task_link: true` adds the authenticated HTTPS task URL `https://chatgpt.com/codex/tasks/<thread-id>` as [ntfy's `click` target](https://docs.ntfy.sh/publish/#click-action) without changing the visible title or body. On a supported phone, that URL can open the task in the ChatGPT mobile app; otherwise it has a browser fallback. The phone must use the same ChatGPT account and workspace, and local tasks require [Remote](https://learn.chatgpt.com/docs/remote-connections) access to the host. The separate `include_task_link_action` option adds one visible [**Open task** `view` action](https://docs.ntfy.sh/publish/#open-websiteapp) and remains off by default.
+
 Fresh installs use one ntfy tag, `white_check_mark`. Apart from the emoji rendered from that tag, the templates add no decorative emoji to title or body. Markdown is off, and default priority 3 is represented by omitting `priority` from the outgoing JSON. Custom non-default priorities are still sent explicitly.
 
 ## When to use it
 
-Use this project when your priority is one durable phone/desktop push after a local Codex task has no more work, including concurrent tasks and temporary network outages. If you want native sounds, click-to-focus, or one notifier for many different coding agents, another project may be a better fit. See [Alternatives and adjacent projects](docs/alternatives.md).
+Use this project when your priority is one durable phone/desktop push after a local Codex task has no more work, including concurrent tasks and temporary network outages. An opt-in task link can open that exact task from the notification; if you want native sounds, a notification center, or one notifier for many different coding agents, another project may be a better fit. See [Alternatives and adjacent projects](docs/alternatives.md).
 
 ## Supported environments
 
@@ -228,6 +230,8 @@ Leave `strict` enabled when “no intermediate notifications” is more importan
 | `include_message` | `false` | Do not persist or send the final assistant message unless explicitly enabled. |
 | `max_message_chars` | `180` | Maximum character count for the optional final-message excerpt; the complete body also has a 3,500-byte UTF-8 hard cap. |
 | `include_thread_title` | `false` | Use only the project directory in the notification title unless explicitly enabled. |
+| `include_task_link` | `false` | Add an HTTPS `click` target for the exact task. This sends the full thread ID to ntfy. |
+| `include_task_link_action` | `false` | Also show one **Open task** `view` action. It has no effect unless `include_task_link` is enabled. |
 | `include_full_path` | `false` | Do not add the sanitized full working-directory path to the body. |
 | `tags` | `["white_check_mark"]` | Use one default ntfy tag instead of duplicating an emoji in text. |
 | `priority` | `3` | Use ntfy's default priority; the field is omitted from outgoing JSON when it is 3. |
@@ -286,7 +290,7 @@ Do not delete `pending/` or `outbox/` during an outage. Diagnose why a record is
 
 ## Privacy summary
 
-By default, the ntfy title contains only the project name; the single configured tag renders one completion emoji. The one-line body contains the source host/origin plus a short thread identifier. Thread titles are excluded because they may summarize prompt context. Setting `include_thread_title: true` replaces the project title with that local task title; setting `include_message: true` also stores and sends a redacted/truncated final assistant message. `include_full_path: true` is a separate opt-in that can expose the sanitized working-directory path.
+By default, the ntfy title contains only the project name; the single configured tag renders one completion emoji. The one-line body contains the source host/origin plus a short thread identifier. Thread titles are excluded because they may summarize prompt context. Setting `include_thread_title: true` replaces the project title with that local task title; setting `include_message: true` also stores and sends a redacted/truncated final assistant message. `include_full_path: true` is a separate opt-in that can expose the sanitized working-directory path. `include_task_link: true` sends the full thread ID inside a ChatGPT HTTPS URL; it does not bypass ChatGPT authentication. The notifier uses the HTTPS mobile/web fallback instead of the [`codex://` desktop compatibility scheme](https://learn.chatgpt.com/docs/reference/commands#deep-links).
 
 `include_message` is checked again when an outbox record is sent. Turning it off prevents final-message content in already queued records from leaving the host, but it does not erase the local record, backups, dead letters, a request already in flight, or a notification already accepted by ntfy.
 

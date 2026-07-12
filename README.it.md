@@ -122,6 +122,8 @@ Il campo JSON `title` contiene soltanto il titolo locale della task, oppure la d
 
 Con il default `markdown: false`, il corpo occupa una sola riga e il contesto non usa etichette come `Project:`, `Source:` o `Thread:`. Con il default privacy `include_message: false` contiene soltanto il progetto necessario (quando non è già nel titolo), l'origine e `#` seguito dai primi otto caratteri dell'ID della chat. Con `include_message: true` viene anteposto un estratto redatto del messaggio finale; `max_message_chars` vale 180 per default. L'intero campo ntfy `message` ha comunque un limite rigido di 3.500 byte UTF-8. Un opt-in esplicito a Markdown può conservare le righe dell'estratto opzionale.
 
+Per default il tap non esegue azioni aggiuntive. `include_task_link: true` aggiunge l'URL HTTPS autenticato `https://chatgpt.com/codex/tasks/<thread-id>` come [destinazione ntfy `click`](https://docs.ntfy.sh/publish/#click-action), senza cambiare titolo o corpo visibili. Su un telefono supportato può aprire la task nell'app mobile ChatGPT; altrimenti resta il fallback nel browser. Il telefono deve usare lo stesso account e workspace ChatGPT e, per le task locali, avere accesso [Remote](https://learn.chatgpt.com/docs/remote-connections) all'host. L'opzione separata `include_task_link_action` aggiunge una [azione `view` **Open task**](https://docs.ntfy.sh/publish/#open-websiteapp) visibile e resta disattivata per default.
+
 Le nuove installazioni usano un solo tag ntfy, `white_check_mark`. Oltre all'emoji resa da quel tag, i template non aggiungono emoji decorative nel titolo o nel corpo. Markdown è disattivato e la priorità predefinita 3 viene rappresentata omettendo `priority` dal JSON in uscita. Una priorità personalizzata diversa da 3 viene invece inviata esplicitamente.
 
 ## Ambienti supportati
@@ -213,6 +215,8 @@ Usare `strict` quando evitare falsi “finito” è la priorità. `balanced` pri
 - `include_message: false`: non conserva né invia il messaggio finale;
 - `max_message_chars: 180`: limita l'estratto finale opzionale; il corpo completo resta comunque limitato a 3.500 byte UTF-8;
 - `include_thread_title: false`: non usa il titolo della task, che può riassumere il prompt;
+- `include_task_link: false`: non invia a ntfy l'URL della task con l'ID completo;
+- `include_task_link_action: false`: non mostra un pulsante `view` separato; richiede comunque `include_task_link`;
 - `include_full_path: false`: non aggiunge al corpo il percorso di lavoro completo sanitizzato;
 - `tags: ["white_check_mark"]`: usa un solo tag ntfy senza duplicare un'emoji nel testo;
 - `priority: 3`: usa la priorità ntfy predefinita e omette il campo dal JSON in uscita;
@@ -224,7 +228,7 @@ Usare `strict` quando evitare falsi “finito” è la priorità. `balanced` pri
 
 Con `include_message: true`, il messaggio finale viene redatto e troncato, ma la redazione regex è solo best-effort. I prompt utente non vengono salvati.
 
-`include_message` viene verificato di nuovo al momento dell'invio. Disattivarlo impedisce che il contenuto finale presente in record già accodati lasci l'host, ma non cancella il record locale, i backup, le dead letter, una richiesta già in corso o una notifica già accettata da ntfy. `include_full_path: true` resta un opt-in separato che può esporre il percorso di lavoro sanitizzato.
+`include_message` viene verificato di nuovo al momento dell'invio. Disattivarlo impedisce che il contenuto finale presente in record già accodati lasci l'host, ma non cancella il record locale, i backup, le dead letter, una richiesta già in corso o una notifica già accettata da ntfy. `include_full_path: true` resta un opt-in separato che può esporre il percorso di lavoro sanitizzato. `include_task_link: true` invia l'ID completo dentro un URL HTTPS ChatGPT, senza aggirare l'autenticazione. Il notifier usa il fallback HTTPS mobile/web invece dello [schema di compatibilità desktop `codex://`](https://learn.chatgpt.com/docs/reference/commands#deep-links).
 
 L’idle gate legge metadati locali e campi SQLite in sola lettura. Interroga lo **stato** del goal, non il suo obiettivo. Il watcher conserva path, offset, timestamp e ID della chat, non il contenuto dei prompt.
 

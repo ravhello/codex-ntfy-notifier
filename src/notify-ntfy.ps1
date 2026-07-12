@@ -25,6 +25,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $ScriptVersion = '2.4.2'
 $MaxNtfyMessageBytes = 3500
+$ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
 $MiddleDot = [char]0x00B7
 $Ellipsis = [char]0x2026
 $CodexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
@@ -287,6 +288,8 @@ function Get-Config {
     maxMessageChars = $maxMessageChars
     includeMessage = [bool](Get-ObjectValue $fileConfig 'include_message' $false)
     includeThreadTitle = [bool](Get-ObjectValue $fileConfig 'include_thread_title' $false)
+    includeTaskLink = [bool](Get-ObjectValue $fileConfig 'include_task_link' $false)
+    includeTaskLinkAction = [bool](Get-ObjectValue $fileConfig 'include_task_link_action' $false)
     markdown = [bool](Get-ObjectValue $fileConfig 'markdown' $false)
     includeFullPath = [bool](Get-ObjectValue $fileConfig 'include_full_path' $false)
     suppressSubagents = [bool](Get-ObjectValue $fileConfig 'suppress_subagents' $true)
@@ -874,6 +877,16 @@ function Get-CompletionLabel {
   return 'done'
 }
 
+function Get-CodexTaskUrl {
+  param([object]$ThreadId)
+
+  $raw = ([string]$ThreadId).Trim()
+  if ([string]::IsNullOrWhiteSpace($raw)) { return '' }
+  $parsed = [Guid]::Empty
+  if (-not [Guid]::TryParseExact($raw, 'D', [ref]$parsed)) { return '' }
+  return $ChatGptTaskUrlPrefix + $parsed.ToString('D')
+}
+
 function New-NtfyPayload {
   param(
     [object]$Record,
@@ -952,6 +965,20 @@ function New-NtfyPayload {
     title = $displayName
     message = $body
     sequence_id = $Record.sequence_id
+  }
+  if ($Config.includeTaskLink) {
+    $taskUrl = Get-CodexTaskUrl -ThreadId $Record.thread_id
+    if (-not [string]::IsNullOrWhiteSpace($taskUrl)) {
+      $payload['click'] = $taskUrl
+      if ($Config.includeTaskLinkAction) {
+        $payload['actions'] = @([ordered]@{
+          action = 'view'
+          label = 'Open task'
+          url = $taskUrl
+          clear = $true
+        })
+      }
+    }
   }
   if (@($Config.tags).Count -gt 0) { $payload['tags'] = @($Config.tags) }
   if ([int]$Config.priority -ne 3) { $payload['priority'] = [int]$Config.priority }

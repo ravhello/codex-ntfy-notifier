@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added an opt-in authenticated ChatGPT task URL as the ntfy `click` target, with canonical UUID validation and a browser fallback when the mobile app does not claim the link.
+- Added a separate, default-off `include_task_link_action` option for one visible **Open task** button without consuming notification space by default.
+
 ### Fixed
 
 - Preserved existing custom ntfy tag arrays with more than three entries instead of rejecting the entire notifier configuration during an upgrade.

@@ -177,6 +177,8 @@ $privateChanged = $false
 foreach ($default in @(
     @('include_message', $true),
     @('include_thread_title', $true),
+    @('include_task_link', $false),
+    @('include_task_link_action', $false),
     @('allow_insecure_auth', $false),
     @('priority', 3),
     @('tags', @('white_check_mark')),

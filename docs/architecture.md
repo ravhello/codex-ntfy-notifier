@@ -161,6 +161,8 @@ The full ntfy `message` is truncated on a valid Unicode boundary to at most 3,50
 
 Fresh configuration uses `tags: ["white_check_mark"]`; the templates add no duplicate emoji to title or body. Priority 3 is ntfy's default and is omitted from the outgoing JSON. The worker serializes `priority` only for a non-default value and serializes `markdown: true` only when Markdown was explicitly enabled and an optional message is present.
 
+Task navigation is assembled at send time from the durable record's full thread ID. With `include_task_link: true`, a canonical UUID becomes `https://chatgpt.com/codex/tasks/<thread-id>` in the JSON `click` member. An absent or non-canonical ID omits navigation without failing delivery. `include_task_link_action: true` additionally emits one `view` action with the same URL; keeping it false avoids a duplicate visible control. Both Python and PowerShell use the HTTPS route so mobile can hand it to ChatGPT while browsers retain a fallback; the desktop-only `codex://threads/<thread-id>` compatibility scheme is not used. OpenAI's live [iOS app-site association](https://chatgpt.com/.well-known/apple-app-site-association) includes `/codex/tasks/*`, while its [Android Digital Asset Links](https://chatgpt.com/.well-known/assetlinks.json) delegates ChatGPT URLs to the mobile app.
+
 The send-time `include_message` check is a privacy gate for durable state. A record captured while the option was true can still contain final-message text locally, but changing it to false prevents that text from entering later network attempts, including retries of an outbox record. This does not erase the record or backups and cannot recall a request already in flight or accepted by ntfy.
 
 ## Concurrency and host topology
