@@ -201,7 +201,6 @@ function Get-NotificationTags {
     }
     if ($seen.Add($tag)) { $result.Add($tag) }
   }
-  if ($result.Count -gt 3) { throw 'tags must contain at most 3 values' }
   foreach ($tag in $result) { Write-Output $tag }
 }
 

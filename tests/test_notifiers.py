@@ -440,6 +440,18 @@ class NotifierContractTests(unittest.TestCase):
                 self.assertEqual(payload["tags"], ["white_check_mark", "robot"])
                 shutil.rmtree(self.state, ignore_errors=True)
 
+    def test_existing_custom_tag_sets_are_preserved(self) -> None:
+        custom_tags = ["white_check_mark", "robot", "computer", "tada"]
+        self.configure(tags=custom_tags)
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                self.run_ok(self.hook_command(implementation, self.event()))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    payload = self.server.payloads.pop()
+                self.assertEqual(payload["tags"], custom_tags)
+                shutil.rmtree(self.state, ignore_errors=True)
+
     def test_idle_gate_coalesces_auto_continuations(self) -> None:
         self.configure(
             idle_detection_mode="strict",

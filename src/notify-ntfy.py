@@ -231,8 +231,6 @@ def load_config(runtime: Runtime) -> dict[str, Any]:
     if any(not tag or len(tag) > 32 or any(character.isspace() for character in tag) for tag in tags):
         raise ValueError("tags must contain non-empty strings of at most 32 characters without whitespace")
     tags = list(dict.fromkeys(tags))
-    if len(tags) > 3:
-        raise ValueError("tags must contain at most 3 values")
     priority = int(file_config.get("priority", 3))
     if not 1 <= priority <= 5:
         raise ValueError("priority must be between 1 and 5")
