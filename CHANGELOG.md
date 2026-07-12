@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved existing custom ntfy tag arrays with more than three entries instead of rejecting the entire notifier configuration during an upgrade.
+
 ### Documentation
 
 - Redesigned the README opening around the final-only value proposition, an anonymized notification preview, and an earlier install-to-test path.
