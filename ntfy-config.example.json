@@ -10,6 +10,8 @@
   "max_message_chars": 180,
   "include_message": false,
   "include_thread_title": false,
+  "include_task_link": false,
+  "include_task_link_action": false,
   "markdown": false,
   "include_full_path": false,
   "suppress_subagents": true,

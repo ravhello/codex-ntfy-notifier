@@ -11,6 +11,8 @@ Fresh installations use:
   "include_message": false,
   "max_message_chars": 180,
   "include_thread_title": false,
+  "include_task_link": false,
+  "include_task_link_action": false,
   "include_full_path": false,
   "tags": ["white_check_mark"],
   "priority": 3,
@@ -62,6 +64,8 @@ The default JSON title is only `<project>`, while the single `white_check_mark` 
 
 `include_message: true` adds a sanitized and truncated copy of the final assistant message ahead of the context. `max_message_chars` limits that excerpt to 180 characters by default. With the default `markdown: false`, whitespace is normalized and the whole body stays on one line. The complete ntfy `message` is also hard-capped at 3,500 UTF-8 bytes, even if `max_message_chars` is increased. Truncation and the byte cap limit size, not sensitivity.
 
+`include_task_link: true` adds `https://chatgpt.com/codex/tasks/<thread-id>` as the ntfy `click` target after validating a canonical UUID. This sends the full thread ID to the ntfy server and its subscribed clients instead of only the default eight-character prefix. The URL still requires the appropriate ChatGPT account, workspace, and Remote host access; it is not an authentication token and does not bypass authorization. `include_task_link_action: true` duplicates the same destination in one visible `view` action, so it is a separate opt-in and remains off by default.
+
 A thread title or assistant response can summarize sensitive prompt context. “Raw prompts are not copied” is not equivalent to “no sensitive context can leave the host.”
 
 The ntfy server sees normal connection metadata such as source IP, request time, and user agent. Its retention/access logs are outside this project’s control. ntfy clients may display content on a lock screen; configure client privacy accordingly.
@@ -70,7 +74,7 @@ The `server` URL must be absolute HTTP(S) and must not contain URI userinfo. Put
 
 ## What remains on disk
 
-The private configuration is `~/.codex/ntfy-config.json`. It can contain server URL, topic, token, username, password, and installer-managed `watch_roots` entries with local/UNC Codex and SQLite paths for selected WSL distributions.
+The private configuration is `~/.codex/ntfy-config.json`. It can contain server URL, topic, token, username, password, task-link privacy choices, and installer-managed `watch_roots` entries with local/UNC Codex and SQLite paths for selected WSL distributions.
 
 `~/.codex/ntfy-state` can contain:
 
@@ -103,7 +107,7 @@ The hook command contains local executable paths but no ntfy topic or credential
 
 When content storage is enabled, the notifier normalizes whitespace, truncates values, and redacts several common patterns, including authorization headers, password/token/key assignments, selected provider token prefixes, and ntfy topic URLs.
 
-Regex redaction cannot reliably detect every secret, custom hostname, source-code credential, private key, personal datum, or value whose context has been removed. It can also produce false positives. The safest settings for sensitive work are `include_message: false`, `include_thread_title: false`, and `include_full_path: false`.
+Regex redaction cannot reliably detect every secret, custom hostname, source-code credential, private key, personal datum, or value whose context has been removed. It can also produce false positives. The safest settings for sensitive work are `include_message: false`, `include_thread_title: false`, `include_task_link: false`, and `include_full_path: false`.
 
 ## Topics and credentials
 

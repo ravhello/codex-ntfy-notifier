@@ -34,6 +34,7 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
 
 VERSION = "2.4.2"
 MAX_NTFY_MESSAGE_BYTES = 3500
+CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
 
 
 def utc_now() -> dt.datetime:
@@ -252,6 +253,8 @@ def load_config(runtime: Runtime) -> dict[str, Any]:
         "max_message_chars": max_message_chars,
         "include_message": bool(file_config.get("include_message", False)),
         "include_thread_title": bool(file_config.get("include_thread_title", False)),
+        "include_task_link": bool(file_config.get("include_task_link", False)),
+        "include_task_link_action": bool(file_config.get("include_task_link_action", False)),
         "markdown": bool(file_config.get("markdown", False)),
         "include_full_path": bool(file_config.get("include_full_path", False)),
         "suppress_subagents": bool(file_config.get("suppress_subagents", True)),
@@ -1588,6 +1591,18 @@ def completion_label(record: dict[str, Any]) -> str:
     return "done"
 
 
+def codex_task_url(thread_id: Any) -> str:
+    raw = str(thread_id or "").strip()
+    try:
+        parsed = uuid.UUID(raw)
+    except (ValueError, AttributeError):
+        return ""
+    canonical = str(parsed)
+    if raw.lower() != canonical:
+        return ""
+    return CHATGPT_TASK_URL_PREFIX + canonical
+
+
 def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     event = record["event"]
     cwd = str(obj_value(event, "cwd", "working-directory", "working_directory", default=""))
@@ -1644,6 +1659,19 @@ def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any
         "message": body,
         "sequence_id": record["sequence_id"],
     }
+    if config["include_task_link"]:
+        task_url = codex_task_url(record.get("thread_id", ""))
+        if task_url:
+            payload["click"] = task_url
+            if config["include_task_link_action"]:
+                payload["actions"] = [
+                    {
+                        "action": "view",
+                        "label": "Open task",
+                        "url": task_url,
+                        "clear": True,
+                    }
+                ]
     if config["tags"]:
         payload["tags"] = config["tags"]
     if config["priority"] != 3:

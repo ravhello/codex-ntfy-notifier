@@ -46,6 +46,8 @@ config = {
     "max_message_chars": 180,
     "include_message": False,
     "include_thread_title": False,
+    "include_task_link": False,
+    "include_task_link_action": False,
     "markdown": False,
     "include_full_path": False,
     "suppress_subagents": True,

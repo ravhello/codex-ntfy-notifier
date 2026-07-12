@@ -135,6 +135,8 @@ function New-PrivateConfigIfNeeded {
     $changed = (Add-ConfigDefault -Config $config -Name 'password' -Value '') -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'include_message' -Value $true) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'include_thread_title' -Value $true) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'include_task_link' -Value $false) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'include_task_link_action' -Value $false) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'allow_insecure_auth' -Value $false) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'priority' -Value 3) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'tags' -Value @('white_check_mark')) -or $changed
@@ -226,6 +228,8 @@ function New-PrivateConfigIfNeeded {
     max_message_chars = 180
     include_message = $false
     include_thread_title = $false
+    include_task_link = $false
+    include_task_link_action = $false
     markdown = $false
     include_full_path = $false
     suppress_subagents = $true

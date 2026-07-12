@@ -57,7 +57,7 @@ Its deliberate tradeoffs:
 - it is Codex-specific rather than universal;
 - it depends on local Codex rollout/database formats for its strongest idle proof;
 - `strict` can withhold a real notification when local evidence is missing;
-- it has no click-to-focus UI, sounds, notification center, or central dashboard;
+- exact-task navigation is an opt-in HTTPS `click` target; native sounds, a notification center, and a central dashboard remain outside the project;
 - installation manages both hook configuration and a background worker;
 - queues are independent per host;
 - delivery is at-least-once, not exactly-once;

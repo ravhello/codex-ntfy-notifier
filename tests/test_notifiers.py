@@ -372,6 +372,8 @@ class NotifierContractTests(unittest.TestCase):
             "sequence_id": captured["python"]["sequence_id"],
         }
         self.assertEqual(captured["python"], expected)
+        self.assertNotIn("click", captured["python"])
+        self.assertNotIn("actions", captured["python"])
         self.assertFalse(
             any(
                 word in captured["python"]["title"].lower()
@@ -380,6 +382,78 @@ class NotifierContractTests(unittest.TestCase):
         )
         if "powershell" in captured:
             self.assertEqual(captured["powershell"], expected)
+
+    def test_task_link_click_is_opt_in_and_identical(self) -> None:
+        thread_id = "77777777-7777-7777-8777-777777777777"
+        expected_url = f"https://chatgpt.com/codex/tasks/{thread_id}"
+        event = self.event(thread_id=thread_id)
+        captured: dict[str, dict] = {}
+        self.configure(include_task_link=True, include_task_link_action=False, include_message=False)
+
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    payload = self.server.payloads.pop()
+                self.assertEqual(payload["click"], expected_url)
+                self.assertNotIn("actions", payload)
+                self.assertNotIn(thread_id, payload["title"])
+                self.assertNotIn(thread_id, payload["message"])
+                captured[implementation] = payload
+                shutil.rmtree(self.state, ignore_errors=True)
+
+        if "powershell" in captured:
+            python_payload = {key: value for key, value in captured["python"].items() if key != "sequence_id"}
+            powershell_payload = {key: value for key, value in captured["powershell"].items() if key != "sequence_id"}
+            self.assertEqual(powershell_payload, python_payload)
+
+    def test_task_link_action_requires_a_second_opt_in(self) -> None:
+        thread_id = "88888888-8888-7888-8888-888888888888"
+        expected_url = f"https://chatgpt.com/codex/tasks/{thread_id}"
+
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                self.configure(include_task_link=False, include_task_link_action=True)
+                self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id)))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    disabled_payload = self.server.payloads.pop()
+                self.assertNotIn("click", disabled_payload)
+                self.assertNotIn("actions", disabled_payload)
+                shutil.rmtree(self.state, ignore_errors=True)
+
+                self.configure(include_task_link=True, include_task_link_action=True)
+                self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id)))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    payload = self.server.payloads.pop()
+                self.assertEqual(payload["click"], expected_url)
+                self.assertEqual(
+                    payload["actions"],
+                    [
+                        {
+                            "action": "view",
+                            "label": "Open task",
+                            "url": expected_url,
+                            "clear": True,
+                        }
+                    ],
+                )
+                shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_invalid_thread_id_omits_task_link_without_blocking_delivery(self) -> None:
+        self.configure(include_task_link=True, include_task_link_action=True)
+
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                self.run_ok(self.hook_command(implementation, self.event(thread_id="not-a-canonical-uuid")))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    payload = self.server.payloads.pop()
+                self.assertNotIn("click", payload)
+                self.assertNotIn("actions", payload)
+                shutil.rmtree(self.state, ignore_errors=True)
 
     def test_compact_payload_unicode_title_and_byte_budget(self) -> None:
         thread_id = "33333333-3333-7333-8333-333333333333"
@@ -2176,6 +2250,8 @@ class NotifierContractTests(unittest.TestCase):
         config = json.loads((install_home / "ntfy-config.json").read_text(encoding="utf-8-sig"))
         self.assertFalse(config["include_message"])
         self.assertFalse(config["include_thread_title"])
+        self.assertFalse(config["include_task_link"])
+        self.assertFalse(config["include_task_link_action"])
         self.assertEqual(config["idle_detection_mode"], "strict")
         self.assertEqual(config["idle_grace_seconds"], 1.5)
         self.assertEqual(config["idle_probe_grace_seconds"], 30)
