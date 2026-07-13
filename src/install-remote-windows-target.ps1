@@ -187,6 +187,7 @@ foreach ($default in @(
     @('idle_detection_mode', 'strict'),
     @('idle_grace_seconds', 1.5),
     @('idle_probe_grace_seconds', 30),
+    @('unknown_retry_max_seconds', 60),
     @('goal_aware', $true),
     @('goal_poll_seconds', 1),
     @('subagent_orphan_seconds', 1800),
@@ -194,6 +195,8 @@ foreach ($default in @(
     @('watch_rollouts', $true),
     @('watch_scan_seconds', 2),
     @('watch_discovery_seconds', 60),
+    @('watch_cursor_batch_size', 64),
+    @('watch_remote_timeout_seconds', 90),
     @('watch_initial_replay_seconds', 15),
     @('dead_retention_days', 30)
   )) {

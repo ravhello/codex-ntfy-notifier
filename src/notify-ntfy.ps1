@@ -14,6 +14,10 @@ param(
   [switch]$Continuous,
   [switch]$DeliveryOnly,
   [switch]$ScanRollouts,
+  [ValidateSet('All', 'Local', 'Remote')]
+  [string]$ScanScope = 'All',
+  [switch]$Maintenance,
+  [switch]$CleanupTestState,
   [int]$ScanParentPid = 0,
   [string]$ScanParentToken = '',
   [switch]$NoSpawn,
@@ -27,8 +31,9 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.4.2'
+$ScriptVersion = '2.4.3'
 $MaxNtfyMessageBytes = 3500
+$SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
 $MiddleDot = [char]0x00B7
 $Ellipsis = [char]0x2026
@@ -53,17 +58,21 @@ $WatchDir = Join-Path $StateRoot 'watch'
 $SentDir = Join-Path $StateRoot 'sent'
 $SuppressedDir = Join-Path $StateRoot 'suppressed'
 $DeadDir = Join-Path $StateRoot 'dead'
+$MutationLocksDir = Join-Path $StateRoot 'mutation-locks'
 $WorkerLockPath = Join-Path $StateRoot 'worker.lock'
 $DeliveryLockPath = Join-Path $StateRoot 'delivery.lock'
 $WorkerHealthPath = Join-Path $StateRoot 'worker-health.json'
 $DeliveryHealthPath = Join-Path $StateRoot 'delivery-health.json'
 $ScanLockPath = Join-Path $StateRoot 'watch-scan.lock'
 $ScanHealthPath = Join-Path $StateRoot 'watch-health.json'
+$RemoteScanLockPath = Join-Path $StateRoot 'remote-watch-scan.lock'
+$RemoteScanHealthPath = Join-Path $StateRoot 'remote-watch-health.json'
+$MaintenanceLockPath = Join-Path $StateRoot 'maintenance.lock'
 $LogPath = Join-Path $StateRoot 'notify.log'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Ensure-RuntimeDirectories {
-  foreach ($path in @($StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir, $DeadDir)) {
+  foreach ($path in @($StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir, $DeadDir, $MutationLocksDir)) {
     if (-not (Test-Path -LiteralPath $path)) {
       New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
@@ -306,6 +315,7 @@ function Get-Config {
     idleDetectionMode = $idleDetectionMode
     idleGraceSeconds = [double](Get-ObjectValue $fileConfig 'idle_grace_seconds' 1.5)
     idleProbeGraceSeconds = [double](Get-ObjectValue $fileConfig 'idle_probe_grace_seconds' 30)
+    unknownRetryMaxSeconds = [double](Get-ObjectValue $fileConfig 'unknown_retry_max_seconds' 60)
     goalAware = [bool](Get-ObjectValue $fileConfig 'goal_aware' $true)
     goalPollSeconds = [double](Get-ObjectValue $fileConfig 'goal_poll_seconds' 1)
     suppressTechnicalTurns = [bool](Get-ObjectValue $fileConfig 'suppress_technical_turns' $true)
@@ -313,6 +323,8 @@ function Get-Config {
     watchScanSeconds = [double](Get-ObjectValue $fileConfig 'watch_scan_seconds' 2)
     watchInitialReplaySeconds = [double](Get-ObjectValue $fileConfig 'watch_initial_replay_seconds' 15)
     watchDiscoverySeconds = [double](Get-ObjectValue $fileConfig 'watch_discovery_seconds' 60)
+    watchCursorBatchSize = [int][Math]::Min(4096, [Math]::Max(1, [int](Get-ObjectValue $fileConfig 'watch_cursor_batch_size' 64)))
+    remoteWatchTimeoutSeconds = [double](Get-ObjectValue $fileConfig 'watch_remote_timeout_seconds' 90)
     watchRoots = @($watchRoots)
     workerSqlitePath = $workerSqlitePath
     workerSqliteConfigured = $workerSqliteConfigured
@@ -655,7 +667,10 @@ function Invoke-WithRecordMutationLock {
   )
   Ensure-RuntimeDirectories
   if ($Key -notmatch '^[0-9a-f]{64}$') { throw 'invalid mutation lock key' }
-  $lockPath = Join-Path $StateRoot ("mutation-$Key.lock")
+  # A bounded shard set avoids leaving one permanent file per observed turn.
+  # Same-key operations still serialize, while unrelated keys only contend on
+  # the rare two-hex-digit collision.
+  $lockPath = Join-Path $MutationLocksDir ($Key.Substring(0, 2) + '.lock')
   $lockStream = $null
   for ($attempt = 0; $attempt -lt 200 -and $null -eq $lockStream; $attempt++) {
     try {
@@ -712,10 +727,10 @@ function Remove-TechnicalSuppressionForStopCore {
   }
   try {
     $receipt = Read-JsonFile -Path $Path
-    if ([string](Get-ObjectValue $receipt 'reason' '') -ne 'technical-turn') { return $false }
+    if ([string](Get-ObjectValue $receipt 'reason' '') -notin @('technical-turn', 'unverifiable')) { return $false }
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $Path) { return $false }
-    Write-RuntimeLog "revived technical suppression with Stop evidence key=$($Record.key.Substring(0, 12))"
+    Write-RuntimeLog "revived provisional suppression with Stop evidence key=$($Record.key.Substring(0, 12))"
     return $true
   } catch {
     return $false
@@ -1253,11 +1268,66 @@ function Clean-RuntimeState {
   Get-ChildItem -LiteralPath $DeadDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTimeUtc -lt $deadCutoff } |
     Remove-Item -Force -ErrorAction SilentlyContinue
+
+  # Versions before 2.4.3 left one zero-byte lock per completion in the state
+  # root. New code uses 256 lock shards in mutation-locks instead.
+  Get-ChildItem -LiteralPath $StateRoot -Filter 'mutation-*.lock' -File -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-RuntimeMaintenance {
+  Ensure-RuntimeDirectories
+  $lockStream = $null
+  try {
+    $lockStream = [System.IO.File]::Open($MaintenanceLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+  } catch {
+    return 0
+  }
+  try {
+    $config = Get-Config
+    Clean-RuntimeState -ReceiptRetentionDays $config.sentRetentionDays -DeadRetentionDays $config.deadRetentionDays
+    Write-RuntimeLog 'maintenance completed'
+    return 0
+  } catch {
+    Write-RuntimeLog "maintenance error: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 240)"
+    return 1
+  } finally {
+    if ($null -ne $lockStream) { $lockStream.Dispose() }
+  }
+}
+
+function Clear-SyntheticTestState {
+  Ensure-RuntimeDirectories
+  $removed = 0
+  foreach ($directory in @($PendingDir, $OutboxDir, $SentDir, $SuppressedDir, $DeadDir)) {
+    $files = @(Get-ChildItem -LiteralPath $directory -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) { continue }
+    # Most durable histories contain no synthetic records. Search for the exact
+    # fixed test UUID first so reinstall does not JSON-decode thousands of real
+    # receipts; matching files are still parsed and structurally verified below.
+    $candidatePaths = @(Select-String -LiteralPath $files.FullName -Pattern $SyntheticTestThreadId -SimpleMatch -List -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty Path -Unique)
+    foreach ($candidatePath in $candidatePaths) {
+      try {
+        $record = Read-JsonFile -Path $candidatePath
+        if ([string](Get-ObjectValue $record 'thread_id' '') -ne $SyntheticTestThreadId) { continue }
+        Remove-Item -LiteralPath $candidatePath -Force -ErrorAction Stop
+        $removed++
+      } catch {
+        # Never remove malformed or unrelated state by filename or free text.
+      }
+    }
+  }
+  return $removed
 }
 
 $script:RolloutProbeCache = @{}
 $script:ThreadDatabaseCache = @{}
+$script:StateDatabasePathCache = @{}
 $script:RolloutDiscoveryCache = @{}
+$script:DurableCursorCache = @{}
+$script:NextDurableCursorRefreshUnixMs = [int64]0
+$script:ColdDiscoveryRanThisScan = $false
 
 function Initialize-WinSqlite {
   if ($null -ne ([System.Management.Automation.PSTypeName]'CodexNtfyWinSqlite').Type) {
@@ -1265,6 +1335,8 @@ function Initialize-WinSqlite {
   }
   Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -1342,6 +1414,187 @@ public static class CodexNtfyWinSqlite {
             if (database != IntPtr.Zero) sqlite3_close_v2(database);
         }
     }
+
+    public static string[][] QueryRows(string databasePath, string sql, string parameter, int columnCount, int maxRows) {
+        IntPtr database = IntPtr.Zero;
+        IntPtr statement = IntPtr.Zero;
+        try {
+            byte[] databaseBytes = Utf8Z(databasePath);
+            int result = sqlite3_open_v2(databaseBytes, out database, SQLITE_OPEN_READONLY, IntPtr.Zero);
+            if (result != SQLITE_OK) throw new InvalidOperationException(Error(database, "sqlite open", result));
+            sqlite3_busy_timeout(database, 1000);
+            byte[] sqlBytes = Utf8Z(sql);
+            result = sqlite3_prepare_v2(database, sqlBytes, sqlBytes.Length - 1, out statement, IntPtr.Zero);
+            if (result != SQLITE_OK) throw new InvalidOperationException(Error(database, "sqlite prepare", result));
+            byte[] parameterBytes = Utf8Z(parameter);
+            result = sqlite3_bind_text(statement, 1, parameterBytes, parameterBytes.Length - 1, new IntPtr(-1));
+            if (result != SQLITE_OK) throw new InvalidOperationException(Error(database, "sqlite bind", result));
+            List<string[]> rows = new List<string[]>();
+            while (rows.Count < Math.Max(1, maxRows)) {
+                result = sqlite3_step(statement);
+                if (result == SQLITE_DONE) break;
+                if (result != SQLITE_ROW) throw new InvalidOperationException(Error(database, "sqlite step", result));
+                string[] values = new string[columnCount];
+                for (int index = 0; index < columnCount; index++) {
+                    IntPtr pointer = sqlite3_column_text(statement, index);
+                    int length = sqlite3_column_bytes(statement, index);
+                    if (pointer == IntPtr.Zero || length <= 0) {
+                        values[index] = String.Empty;
+                        continue;
+                    }
+                    byte[] bytes = new byte[length];
+                    Marshal.Copy(pointer, bytes, 0, length);
+                    values[index] = Encoding.UTF8.GetString(bytes);
+                }
+                rows.Add(values);
+            }
+            return rows.ToArray();
+        } finally {
+            if (statement != IntPtr.Zero) sqlite3_finalize(statement);
+            if (database != IntPtr.Zero) sqlite3_close_v2(database);
+        }
+    }
+
+    private static string JsonString(string line, string name, int startIndex) {
+        string token = "\"" + name + "\"";
+        int key = line.IndexOf(token, Math.Max(0, startIndex), StringComparison.Ordinal);
+        if (key < 0) return String.Empty;
+        int colon = line.IndexOf(':', key + token.Length);
+        if (colon < 0) return String.Empty;
+        int index = colon + 1;
+        while (index < line.Length && Char.IsWhiteSpace(line[index])) index++;
+        if (index >= line.Length || line[index] != '"') return String.Empty;
+        index++;
+        StringBuilder value = new StringBuilder();
+        bool escaped = false;
+        bool closed = false;
+        for (; index < line.Length; index++) {
+            char current = line[index];
+            if (escaped) {
+                value.Append(current);
+                escaped = false;
+            } else if (current == '\\') {
+                escaped = true;
+            } else if (current == '"') {
+                closed = true;
+                break;
+            } else {
+                value.Append(current);
+            }
+        }
+        return closed ? value.ToString() : String.Empty;
+    }
+
+    public static string[] ScanLifecycleSummary(string path, string candidateTurnId) {
+        FileInfo before = new FileInfo(path);
+        long initialLength = before.Length;
+        long initialTicks = before.LastWriteTimeUtc.Ticks;
+        long sequence = 0;
+        long candidateSequence = 0;
+        string candidateType = String.Empty;
+        string candidateLine = String.Empty;
+        long candidateCompletedSequence = 0;
+        long candidateAbortedSequence = 0;
+        string candidateCompletedLine = String.Empty;
+        string candidateAbortedLine = String.Empty;
+        bool candidateUserMessage = false;
+        bool candidateFinalMessage = false;
+        string currentTurn = String.Empty;
+        string latestTerminalType = String.Empty;
+        string latestTerminalTurn = String.Empty;
+        string latestTerminalLine = String.Empty;
+        long latestTerminalSequence = 0;
+        string goalStatus = String.Empty;
+        Dictionary<string, long> openTurns = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> userMessageTurns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        List<string> lifecycleLines = new List<string>();
+
+        if (initialLength > 0) {
+            using (FileStream tail = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+                tail.Seek(initialLength - 1, SeekOrigin.Begin);
+                if (tail.ReadByte() != 10) return new string[0];
+            }
+        }
+
+        using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true, 65536)) {
+            string line;
+            while ((line = reader.ReadLine()) != null) {
+                if (line.IndexOf("\"event_msg\"", StringComparison.Ordinal) < 0 ||
+                    line.IndexOf("\"payload\"", StringComparison.Ordinal) < 0) continue;
+                if (line.IndexOf("\"task_started\"", StringComparison.Ordinal) < 0 &&
+                    line.IndexOf("\"task_complete\"", StringComparison.Ordinal) < 0 &&
+                    line.IndexOf("\"turn_aborted\"", StringComparison.Ordinal) < 0 &&
+                    line.IndexOf("\"user_message\"", StringComparison.Ordinal) < 0 &&
+                    line.IndexOf("\"thread_goal_updated\"", StringComparison.Ordinal) < 0) continue;
+                lifecycleLines.Add(line);
+                int payloadAt = line.IndexOf("\"payload\"", StringComparison.Ordinal);
+                string eventType = JsonString(line, "type", payloadAt);
+                if (eventType != "task_started" && eventType != "task_complete" &&
+                    eventType != "turn_aborted" && eventType != "user_message" &&
+                    eventType != "thread_goal_updated") continue;
+                sequence++;
+                string turnId = JsonString(line, "turn_id", payloadAt);
+                if (String.IsNullOrEmpty(turnId)) turnId = JsonString(line, "turn-id", payloadAt);
+                if (eventType == "task_started" && !String.IsNullOrEmpty(turnId)) {
+                    openTurns[turnId] = sequence;
+                    currentTurn = turnId;
+                } else if (eventType == "user_message") {
+                    if (!String.IsNullOrEmpty(currentTurn)) {
+                        userMessageTurns.Add(currentTurn);
+                        if (String.Equals(currentTurn, candidateTurnId, StringComparison.OrdinalIgnoreCase))
+                            candidateUserMessage = true;
+                    }
+                } else if ((eventType == "task_complete" || eventType == "turn_aborted") && !String.IsNullOrEmpty(turnId)) {
+                    openTurns.Remove(turnId);
+                    latestTerminalType = eventType;
+                    latestTerminalTurn = turnId;
+                    latestTerminalLine = line;
+                    latestTerminalSequence = sequence;
+                    if (String.Equals(turnId, candidateTurnId, StringComparison.OrdinalIgnoreCase)) {
+                        candidateType = eventType;
+                        candidateLine = line;
+                        candidateSequence = sequence;
+                        candidateFinalMessage = eventType == "turn_aborted";
+                        if (eventType == "task_complete") {
+                            candidateCompletedSequence = sequence;
+                            candidateCompletedLine = line;
+                        } else {
+                            candidateAbortedSequence = sequence;
+                            candidateAbortedLine = line;
+                        }
+                    }
+                    if (String.Equals(currentTurn, turnId, StringComparison.OrdinalIgnoreCase)) currentTurn = String.Empty;
+                } else if (eventType == "thread_goal_updated") {
+                    int goalAt = line.IndexOf("\"goal\"", payloadAt, StringComparison.Ordinal);
+                    string status = JsonString(line, "status", goalAt < 0 ? payloadAt : goalAt);
+                    if (!String.IsNullOrWhiteSpace(status)) goalStatus = status.ToLowerInvariant();
+                }
+            }
+        }
+
+        string openLaterTurn = String.Empty;
+        long openLaterSequence = 0;
+        foreach (KeyValuePair<string, long> entry in openTurns) {
+            if (entry.Value > openLaterSequence) {
+                openLaterTurn = entry.Key;
+                openLaterSequence = entry.Value;
+            }
+        }
+        FileInfo after = new FileInfo(path);
+        List<string> result = new List<string>(new[] {
+            candidateType, candidateLine, candidateUserMessage ? "1" : "0", candidateFinalMessage ? "1" : "0",
+            candidateSequence.ToString(), latestTerminalType, latestTerminalTurn, latestTerminalLine,
+            latestTerminalSequence.ToString(), openLaterTurn, openLaterSequence.ToString(), goalStatus,
+            initialLength.ToString(), initialTicks.ToString(), after.Length.ToString(), after.LastWriteTimeUtc.Ticks.ToString(),
+            new DateTimeOffset(after.LastWriteTimeUtc).ToUnixTimeMilliseconds().ToString(),
+            userMessageTurns.Contains(latestTerminalTurn) ? "1" : "0",
+            candidateCompletedSequence.ToString(), candidateAbortedSequence.ToString(),
+            candidateCompletedLine, candidateAbortedLine
+        });
+        result.AddRange(lifecycleLines);
+        return result.ToArray();
+    }
 }
 '@
 }
@@ -1380,6 +1633,10 @@ function Invoke-SqliteRow {
 
 function Get-StateDatabasePath {
   param([string]$SqliteHome)
+  $cacheKey = ([string]$SqliteHome).ToLowerInvariant()
+  if ($script:StateDatabasePathCache.ContainsKey($cacheKey)) {
+    return $script:StateDatabasePathCache[$cacheKey]
+  }
   $preferred = Join-Path $SqliteHome 'state_5.sqlite'
   try {
     $candidate = $null
@@ -1394,11 +1651,43 @@ function Get-StateDatabasePath {
         $candidate = $file
       }
     }
-    if ($null -ne $candidate) { return $candidate.FullName }
+    if ($null -ne $candidate) {
+      $script:StateDatabasePathCache[$cacheKey] = $candidate.FullName
+      return $candidate.FullName
+    }
   } catch {
     # The preferred path remains the diagnostic target when discovery fails.
   }
+  $script:StateDatabasePathCache[$cacheKey] = $preferred
   return $preferred
+}
+
+function Get-RecentThreadRolloutPaths {
+  param(
+    [string]$SqliteHome,
+    [int64]$CutoffUnixMs,
+    [int]$MaxRows = 64
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SqliteHome)) { return @() }
+  $databasePath = Get-StateDatabasePath -SqliteHome $SqliteHome
+  $queries = @(
+    'SELECT rollout_path FROM threads WHERE COALESCE(NULLIF(updated_at_ms, 0), updated_at * 1000) >= CAST(?1 AS INTEGER) AND COALESCE(source, '''') NOT LIKE ''%subagent%'' ORDER BY COALESCE(NULLIF(updated_at_ms, 0), updated_at * 1000) DESC LIMIT 64',
+    'SELECT rollout_path FROM threads WHERE updated_at * 1000 >= CAST(?1 AS INTEGER) AND COALESCE(source, '''') NOT LIKE ''%subagent%'' ORDER BY updated_at DESC LIMIT 64',
+    'SELECT rollout_path FROM threads WHERE ?1 = ?1 AND COALESCE(source, '''') NOT LIKE ''%subagent%'' ORDER BY rowid DESC LIMIT 64'
+  )
+  foreach ($query in $queries) {
+    $result = Invoke-SqliteRows -DatabasePath $databasePath -Sql $query -Parameter ([string]$CutoffUnixMs) -ColumnCount 1 -MaxRows $MaxRows
+    if (-not $result.ok) { continue }
+    $paths = @()
+    foreach ($row in @($result.rows)) {
+      if ($null -eq $row -or $row.Count -lt 1) { continue }
+      $path = [string]$row[0]
+      if (-not [string]::IsNullOrWhiteSpace($path)) { $paths += $path }
+    }
+    return @($paths)
+  }
+  return @()
 }
 
 function Resolve-RolloutPath {
@@ -1613,6 +1902,18 @@ function Get-ActiveDescendants {
       }
       continue
     }
+    if ($orphanMs -gt 0) {
+      try {
+        $childFile = Get-Item -LiteralPath $rolloutPath -ErrorAction Stop
+        $childModifiedMs = ([DateTimeOffset]$childFile.LastWriteTimeUtc).ToUnixTimeMilliseconds()
+        if ($childModifiedMs -gt 0 -and $NowUnixMs - $childModifiedMs -ge $orphanMs) {
+          [void]$unknownSince.Remove($childId)
+          continue
+        }
+      } catch {
+        # The authoritative probe below retains strict unknown/error semantics.
+      }
+    }
     $probe = Update-RolloutProbe -Path $rolloutPath
     if (-not $probe.ok) {
       return [pscustomobject]@{ ok = $false; busy = $false; count = $active; error = $probe.error }
@@ -1772,6 +2073,114 @@ function Update-RolloutProbe {
   }
 }
 
+function Get-FastRolloutProbe {
+  param(
+    [string]$Path,
+    [string]$CandidateTurnId
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($CandidateTurnId) -or
+      -not (Test-Path -LiteralPath $Path)) {
+    return [pscustomobject]@{ ok = $false; state = $null; error = 'fast lifecycle probe unavailable' }
+  }
+  try {
+    Initialize-WinSqlite
+    $values = [CodexNtfyWinSqlite]::ScanLifecycleSummary($Path, $CandidateTurnId)
+    if ($null -eq $values -or $values.Count -lt 22 -or [string]$values[0] -notin @('task_complete', 'turn_aborted')) {
+      return [pscustomobject]@{ ok = $false; state = $null; error = 'candidate terminal event unavailable' }
+    }
+    for ($lineIndex = 22; $lineIndex -lt $values.Count; $lineIndex++) {
+      try {
+        $validatedEnvelope = [string]$values[$lineIndex] | ConvertFrom-Json -ErrorAction Stop
+        if ([string](Get-ObjectValue $validatedEnvelope 'type' '') -ne 'event_msg') {
+          return [pscustomobject]@{ ok = $false; state = $null; error = 'non-event lifecycle envelope' }
+        }
+        $validatedPayload = Get-ObjectValue $validatedEnvelope 'payload'
+        if ($null -eq $validatedPayload) {
+          return [pscustomobject]@{ ok = $false; state = $null; error = 'lifecycle payload unavailable' }
+        }
+      } catch {
+        return [pscustomobject]@{ ok = $false; state = $null; error = 'invalid lifecycle JSON' }
+      }
+    }
+    $state = New-RolloutProbeState -Path $Path
+    $candidateType = [string]$values[0]
+    $candidateSequence = [int64]$values[4]
+    $latestType = [string]$values[5]
+    $latestTurn = [string]$values[6]
+    $latestSequence = [int64]$values[8]
+    $openLaterTurn = [string]$values[9]
+    $openLaterSequence = [int64]$values[10]
+    $candidateCompletedSequence = [int64]$values[18]
+    $candidateAbortedSequence = [int64]$values[19]
+    $state.offset = [int64]$values[14]
+    $state.sequence = [Math]::Max($candidateSequence, [Math]::Max($latestSequence, $openLaterSequence))
+    $state.modifiedUnixMs = [int64]$values[16]
+    $state.snapshotChanged = [int64]$values[12] -ne [int64]$values[14] -or [int64]$values[13] -ne [int64]$values[15]
+    $state.goalStatus = [string]$values[11]
+    if ([string]$values[2] -eq '1') { $state.userMessageTurns[$CandidateTurnId] = $true }
+
+    $seenTerminals = @{}
+    $terminalCandidates = @(
+        [pscustomobject]@{ turn = $CandidateTurnId; type = 'task_complete'; sequence = $candidateCompletedSequence; line = [string]$values[20] },
+        [pscustomobject]@{ turn = $CandidateTurnId; type = 'turn_aborted'; sequence = $candidateAbortedSequence; line = [string]$values[21] },
+        [pscustomobject]@{ turn = $latestTurn; type = $latestType; sequence = $latestSequence; line = [string]$values[7] }
+      ) | Sort-Object @{ Expression = { [int64]$_.sequence } }, @{ Expression = { [string]$_.type } }
+    foreach ($terminal in $terminalCandidates) {
+      if ([string]::IsNullOrWhiteSpace($terminal.turn) -or $terminal.type -notin @('task_complete', 'turn_aborted') -or
+          [int64]$terminal.sequence -le 0 -or [string]::IsNullOrWhiteSpace($terminal.line)) { continue }
+      $terminalKey = '{0}|{1}|{2}' -f $terminal.turn, $terminal.type, $terminal.sequence
+      if ($seenTerminals.ContainsKey($terminalKey)) { continue }
+      $seenTerminals[$terminalKey] = $true
+      $payload = $null
+      try {
+        $envelope = $terminal.line | ConvertFrom-Json -ErrorAction Stop
+        $payload = Get-ObjectValue $envelope 'payload'
+        $parsedType = [string](Get-ObjectValue $payload 'type' '')
+        $parsedTurn = [string](Get-FirstObjectValue $payload @('turn_id', 'turn-id'))
+        if ($parsedType -ne $terminal.type -or $parsedTurn -ne $terminal.turn) { continue }
+      } catch {
+        continue
+      }
+      if ($terminal.type -eq 'turn_aborted') {
+        $state.abortedTurns[$terminal.turn] = [int64]$terminal.sequence
+      } else {
+        $state.completedTurns[$terminal.turn] = [int64]$terminal.sequence
+      }
+      $state.terminalTurns[$terminal.turn] = [int64]$terminal.sequence
+      $state.terminalEventTypes[$terminal.turn] = [string]$terminal.type
+      if (($terminal.turn -eq $CandidateTurnId -and [string]$values[2] -eq '1') -or
+          ($terminal.turn -eq $latestTurn -and [string]$values[17] -eq '1')) {
+        $state.userMessageTurns[$terminal.turn] = $true
+      }
+      $message = ''
+      $message = [string](Get-FirstObjectValue $payload @('last_agent_message', 'last-assistant-message', 'last_assistant_message'))
+      $state.terminalMessages[$terminal.turn] = Sanitize-NotificationText -Text $message -MaxLength 4000 -PreserveLines
+      if ($terminal.type -eq 'turn_aborted' -or -not [string]::IsNullOrWhiteSpace($message)) {
+        $state.finalMessageTurns[$terminal.turn] = $true
+      }
+    }
+    if (-not $state.completedTurns.ContainsKey($CandidateTurnId) -and -not $state.abortedTurns.ContainsKey($CandidateTurnId)) {
+      return [pscustomobject]@{ ok = $false; state = $null; error = 'candidate terminal JSON invalid' }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($openLaterTurn) -and $openLaterSequence -gt $candidateSequence) {
+      $state.openTurns[$openLaterTurn] = $openLaterSequence
+      $state.currentTurnId = $openLaterTurn
+      $state.lastLifecycleType = 'task_started'
+      $state.lastLifecycleTurnId = $openLaterTurn
+    } else {
+      $state.lastLifecycleType = $latestType
+      $state.lastLifecycleTurnId = $latestTurn
+    }
+    if (-not $state.snapshotChanged) {
+      $script:RolloutProbeCache[$Path.ToLowerInvariant()] = $state
+    }
+    return [pscustomobject]@{ ok = $true; state = $state; snapshotChanged = [bool]$state.snapshotChanged; error = '' }
+  } catch {
+    return [pscustomobject]@{ ok = $false; state = $null; error = Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 240 }
+  }
+}
+
 function New-GateResult {
   param(
     [string]$State,
@@ -1793,11 +2202,46 @@ function Get-UnknownGateResult {
   if ($Config.idleDetectionMode -eq 'balanced' -and $now -ge $fallbackAt) {
     return New-GateResult -State 'ready' -Reason ('balanced-fallback:' + $Reason) -RetryAtUnixMs $now
   }
-  $retryAt = [Math]::Min($now + [int64]([Math]::Max(0.1, $Config.goalPollSeconds) * 1000), $fallbackAt)
-  if ($Config.idleDetectionMode -eq 'strict') {
-    $retryAt = $now + [int64]([Math]::Max(0.1, $Config.goalPollSeconds) * 1000)
+  if ($Config.idleDetectionMode -eq 'strict' -and $now -ge $fallbackAt) {
+    return New-GateResult -State 'unverifiable' -Reason $Reason -RetryAtUnixMs $now
   }
+
+  $previousReason = [string](Get-ObjectValue $Record 'unknown_gate_reason' '')
+  $probeCount = if ($previousReason -eq $Reason) { [int](Get-ObjectValue $Record 'unknown_probe_count' 0) } else { 0 }
+  $baseSeconds = [Math]::Max(0.1, [double]$Config.goalPollSeconds)
+  $maxSeconds = [Math]::Max($baseSeconds, [double]$Config.unknownRetryMaxSeconds)
+  $delaySeconds = [Math]::Min($maxSeconds, $baseSeconds * [Math]::Pow(2, [Math]::Min(10, $probeCount)))
+  Set-RecordValue -Record $Record -Name 'unknown_gate_reason' -Value $Reason
+  Set-RecordValue -Record $Record -Name 'unknown_probe_count' -Value ($probeCount + 1)
+  $retryAt = $now + [int64]($delaySeconds * 1000)
+  if ($fallbackAt -gt $now) { $retryAt = [Math]::Min($retryAt, $fallbackAt) }
   return New-GateResult -State 'unknown' -Reason $Reason -RetryAtUnixMs $retryAt
+}
+
+function Invoke-SqliteRows {
+  param(
+    [string]$DatabasePath,
+    [string]$Sql,
+    [string]$Parameter,
+    [int]$ColumnCount,
+    [int]$MaxRows = 64
+  )
+
+  if (-not (Test-Path -LiteralPath $DatabasePath)) {
+    return [pscustomobject]@{ ok = $false; missing = $true; rows = @(); error = 'database missing' }
+  }
+  try {
+    Initialize-WinSqlite
+    $rows = [CodexNtfyWinSqlite]::QueryRows($DatabasePath, $Sql, $Parameter, $ColumnCount, $MaxRows)
+    return [pscustomobject]@{ ok = $true; missing = $false; rows = @($rows); error = '' }
+  } catch {
+    return [pscustomobject]@{
+      ok = $false
+      missing = $false
+      rows = @()
+      error = Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 240
+    }
+  }
 }
 
 function Test-RecordIdleGate {
@@ -1810,8 +2254,22 @@ function Test-RecordIdleGate {
   if ($Config.idleDetectionMode -eq 'off') {
     return New-GateResult -State 'ready' -Reason 'idle-detection-off' -RetryAtUnixMs $now
   }
+  $previousGateReason = [string](Get-ObjectValue $Record 'gate_reason' '')
+  $createdAt = [int64](Get-ObjectValue $Record 'created_unix_ms' $now)
+  $unverifiableAt = $createdAt + [int64]([Math]::Max(0, $Config.idleProbeGraceSeconds) * 1000)
+  if ($Config.idleDetectionMode -eq 'strict' -and
+      $now -ge $unverifiableAt -and
+      $previousGateReason -in @(
+        'candidate-thread-missing', 'classification-unknown', 'rollout-path-unknown',
+        'rollout-probe-failed', 'candidate-turn-missing',
+        'candidate-task-complete-not-observed', 'newer-completion-recovery-failed',
+        'goal-probe-failed', 'descendant-probe-failed'
+      )) {
+    return New-GateResult -State 'unverifiable' -Reason $previousGateReason -RetryAtUnixMs $now
+  }
   $threadId = [string](Get-ObjectValue $Record 'thread_id' '')
   $turnId = [string](Get-ObjectValue $Record 'turn_id' '')
+  $candidateKind = [string](Get-ObjectValue $Record 'candidate_kind' 'legacy')
   if ([string]::IsNullOrWhiteSpace($threadId)) {
     return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'candidate-thread-missing'
   }
@@ -1850,7 +2308,27 @@ function Test-RecordIdleGate {
   if ([string]::IsNullOrWhiteSpace($rolloutPath)) {
     return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'rollout-path-unknown'
   }
-  $probe = Update-RolloutProbe -Path $rolloutPath
+  $probeCacheKey = $rolloutPath.ToLowerInvariant()
+  $probe = if ($script:RolloutProbeCache.ContainsKey($probeCacheKey)) {
+    Update-RolloutProbe -Path $rolloutPath
+  } else {
+    Get-FastRolloutProbe -Path $rolloutPath -CandidateTurnId $turnId
+  }
+  if ($probe.ok -and -not [string]::IsNullOrWhiteSpace($turnId) -and
+      -not $probe.state.completedTurns.ContainsKey($turnId) -and
+      -not $probe.state.abortedTurns.ContainsKey($turnId)) {
+    # The cache is path-scoped while the native cold summary materializes the
+    # requested candidate plus the absolute latest terminal. A second pending
+    # candidate on the same already-scanned rollout needs one fresh native pass.
+    [void]$script:RolloutProbeCache.Remove($probeCacheKey)
+    $probe = Get-FastRolloutProbe -Path $rolloutPath -CandidateTurnId $turnId
+  }
+  if (-not $probe.ok) {
+    # Stop hooks can race the terminal rollout write, and future/legacy formats
+    # may not expose enough lifecycle data for the native summary. Preserve the
+    # original full parser as a correctness fallback.
+    $probe = Update-RolloutProbe -Path $rolloutPath
+  }
   if (-not $probe.ok) {
     return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'rollout-probe-failed'
   }
@@ -1934,7 +2412,10 @@ function Test-RecordIdleGate {
   }
   foreach ($entry in $state.openTurns.GetEnumerator()) {
     if ([int64]$entry.Value -gt $completionSequence) {
-      return New-GateResult -State 'busy' -Reason 'later-task-open' -RetryAtUnixMs ($now + [int64]([Math]::Max(0.1, $Config.goalPollSeconds) * 1000))
+      # This candidate is an intermediate completion. The open turn will create
+      # its own terminal candidate; retaining the predecessor can only produce
+      # a late, misleading notification.
+      return New-GateResult -State 'superseded' -Reason 'later-task-open' -RetryAtUnixMs $now
     }
   }
   $goal = Get-GoalDatabaseStatus -ThreadId $threadId -SqliteHome $sqliteHome
@@ -2005,16 +2486,35 @@ function Add-RolloutWatchEntry {
 function Get-RecentRolloutFiles {
   param([object]$Config)
 
+  $script:ColdDiscoveryRanThisScan = $false
   $found = @{}
   $localSqliteHome = [string](Get-ObjectValue $Config 'workerSqlitePath' $CodexHome)
   if ([string]::IsNullOrWhiteSpace($localSqliteHome)) { $localSqliteHome = $CodexHome }
-  $roots = @([pscustomobject]@{
+  $localRoot = [pscustomobject]@{
       path = $CodexHome
       session_codex_home = $CodexHome
       session_sqlite_home = $localSqliteHome
       origin = ''
-    })
-  if ($null -ne $Config) { $roots += @(Get-ObjectValue $Config 'watchRoots' @()) }
+    }
+  $configuredRoots = if ($null -ne $Config) { @(Get-ObjectValue $Config 'watchRoots' @()) } else { @() }
+  $roots = switch ($ScanScope) {
+    'Local' {
+      @($localRoot) + @($configuredRoots | Where-Object {
+          -not ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' ''))).StartsWith('\\')
+        })
+      break
+    }
+    'Remote' {
+      @($configuredRoots | Where-Object {
+          ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' ''))).StartsWith('\\')
+        })
+      break
+    }
+    default {
+      @($localRoot) + @($configuredRoots)
+      break
+    }
+  }
   $today = [DateTime]::Now.Date
   $nowUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $discoverySeconds = [Math]::Max(0.1, [double](Get-ObjectValue $Config 'watchDiscoverySeconds' 60))
@@ -2025,41 +2525,111 @@ function Get-RecentRolloutFiles {
   $durableCursorPaths = @{}
 
   # Cursor paths remain authoritative even after a session moves outside the
-  # today/yesterday layout or into archived_sessions.
-  foreach ($cursorFile in @(Get-ChildItem -LiteralPath $WatchDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
-    try {
-      $cursor = Read-JsonFile -Path $cursorFile.FullName
-      $rolloutPath = [string](Get-ObjectValue $cursor 'rollout_path' '')
-      if ([string]::IsNullOrWhiteSpace($rolloutPath)) { continue }
-      $durableCursorPaths[$rolloutPath.ToLowerInvariant()] = $true
-      if (-not (Test-Path -LiteralPath $rolloutPath -PathType Leaf -ErrorAction SilentlyContinue)) { continue }
-      $sessionHome = [string](Get-ObjectValue $cursor 'session_codex_home' '')
-      $sqliteHome = [string](Get-ObjectValue $cursor 'session_sqlite_home' '')
-      $rootOrigin = [string](Get-ObjectValue $cursor 'origin' '')
-      foreach ($root in @($roots | Sort-Object { ([string](Get-ObjectValue $_ 'path' '')).Length } -Descending)) {
-        $rootPath = ([string](Get-ObjectValue $root 'path' '')).TrimEnd('\', '/')
-        if ([string]::IsNullOrWhiteSpace($rootPath)) { continue }
-        $underRoot = $rolloutPath.Equals($rootPath, [StringComparison]::OrdinalIgnoreCase) -or
-          $rolloutPath.StartsWith($rootPath + '\', [StringComparison]::OrdinalIgnoreCase) -or
-          $rolloutPath.StartsWith($rootPath + '/', [StringComparison]::OrdinalIgnoreCase)
-        if (-not $underRoot) { continue }
-        if ([string]::IsNullOrWhiteSpace($sessionHome)) { $sessionHome = [string](Get-ObjectValue $root 'session_codex_home' $rootPath) }
-        if ([string]::IsNullOrWhiteSpace($sqliteHome)) { $sqliteHome = [string](Get-ObjectValue $root 'session_sqlite_home' $sessionHome) }
-        if ([string]::IsNullOrWhiteSpace($rootOrigin)) { $rootOrigin = [string](Get-ObjectValue $root 'origin' '') }
-        break
+  # today/yesterday layout or into archived_sessions. Read their lightweight
+  # metadata on the cold cadence, but probe only one rotating batch of rollout
+  # files per cycle. Hot files are still found immediately below by mtime.
+  # The persistent local scanner must stay hot. Active and recently resumed
+  # local threads are obtained from Codex's SQLite index below; historical
+  # cursor enumeration is reserved for isolated remote/manual scans.
+  $refreshDurableCursors = $ScanScope -ne 'Local' -and $nowUnixMs -ge $script:NextDurableCursorRefreshUnixMs
+  if ($refreshDurableCursors) {
+    $script:ColdDiscoveryRanThisScan = $true
+    $refreshedCursorCache = @{}
+    $cursorFiles = @(Get-ChildItem -LiteralPath $WatchDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    $cursorBatchSize = [int](Get-ObjectValue $Config 'watchCursorBatchSize' 64)
+    $cursorMetadata = @{}
+    $localCursorFiles = @()
+    $remoteCursorFiles = @()
+    foreach ($cursorFile in $cursorFiles) {
+      try {
+        $cursor = Read-JsonFile -Path $cursorFile.FullName
+        $rolloutPath = [string](Get-ObjectValue $cursor 'rollout_path' '')
+        if ([string]::IsNullOrWhiteSpace($rolloutPath)) { continue }
+        $durableCursorPaths[$rolloutPath.ToLowerInvariant()] = $true
+        $sessionHome = [string](Get-ObjectValue $cursor 'session_codex_home' '')
+        $isRemoteCursor = $sessionHome.StartsWith('\\') -or $rolloutPath.StartsWith('\\')
+        $cursorMetadata[$cursorFile.FullName.ToLowerInvariant()] = $cursor
+        if ($isRemoteCursor) {
+          $remoteCursorFiles += $cursorFile
+        } else {
+          $localCursorFiles += $cursorFile
+        }
+      } catch {
+        continue
       }
-      if ([string]::IsNullOrWhiteSpace($sessionHome)) {
-        $normalized = $rolloutPath.Replace('/', '\')
-        $markerIndex = $normalized.IndexOf('\sessions\', [StringComparison]::OrdinalIgnoreCase)
-        if ($markerIndex -lt 0) { $markerIndex = $normalized.IndexOf('\archived_sessions\', [StringComparison]::OrdinalIgnoreCase) }
-        if ($markerIndex -gt 0) { $sessionHome = $normalized.Substring(0, $markerIndex) }
+    }
+
+    # Local histories can contain hundreds of immutable cursors, so rotate a
+    # bounded batch. Remote scans already run in their own timeout-supervised
+    # process and must inspect every remote cursor independently: sharing the
+    # local batch could otherwise postpone a resumed WSL/SSH task for minutes.
+    $selectedLocalCursorFiles = @()
+    if ($localCursorFiles.Count -gt 0) {
+      $cursorBatchCount = [int][Math]::Max(1, [Math]::Ceiling($localCursorFiles.Count / [double]$cursorBatchSize))
+      $cadenceMs = [int64][Math]::Max(1, $discoverySeconds * 1000)
+      $cursorBatchIndex = [int]([Math]::Floor($nowUnixMs / [double]$cadenceMs) % $cursorBatchCount)
+      $cursorBatchStart = $cursorBatchIndex * $cursorBatchSize
+      $cursorBatchEnd = [int][Math]::Min($localCursorFiles.Count, $cursorBatchStart + $cursorBatchSize)
+      for ($cursorIndex = $cursorBatchStart; $cursorIndex -lt $cursorBatchEnd; $cursorIndex++) {
+        $selectedLocalCursorFiles += $localCursorFiles[$cursorIndex]
       }
-      if ([string]::IsNullOrWhiteSpace($sessionHome)) { continue }
-      if ([string]::IsNullOrWhiteSpace($sqliteHome)) { $sqliteHome = $sessionHome }
-      $file = Get-Item -LiteralPath $rolloutPath -ErrorAction Stop
-      Add-RolloutWatchEntry -Found $found -File $file -SessionHome $sessionHome -SqliteHome $sqliteHome -RootOrigin $rootOrigin
-    } catch {
-      continue
+    }
+    $selectedCursorFiles = switch ($ScanScope) {
+      'Local' { @($selectedLocalCursorFiles); break }
+      'Remote' { @($remoteCursorFiles); break }
+      default { @($selectedLocalCursorFiles) + @($remoteCursorFiles); break }
+    }
+    foreach ($cursorFile in @($selectedCursorFiles)) {
+      try {
+        $cursor = $cursorMetadata[$cursorFile.FullName.ToLowerInvariant()]
+        $rolloutPath = [string](Get-ObjectValue $cursor 'rollout_path' '')
+        if ([string]::IsNullOrWhiteSpace($rolloutPath)) { continue }
+        $sessionHome = [string](Get-ObjectValue $cursor 'session_codex_home' '')
+        $sqliteHome = [string](Get-ObjectValue $cursor 'session_sqlite_home' '')
+        $rootOrigin = [string](Get-ObjectValue $cursor 'origin' '')
+        if (-not (Test-Path -LiteralPath $rolloutPath -PathType Leaf -ErrorAction SilentlyContinue)) { continue }
+        foreach ($root in @($roots | Sort-Object { ([string](Get-ObjectValue $_ 'path' '')).Length } -Descending)) {
+          $rootPath = ([string](Get-ObjectValue $root 'path' '')).TrimEnd('\', '/')
+          if ([string]::IsNullOrWhiteSpace($rootPath)) { continue }
+          $underRoot = $rolloutPath.Equals($rootPath, [StringComparison]::OrdinalIgnoreCase) -or
+            $rolloutPath.StartsWith($rootPath + '\', [StringComparison]::OrdinalIgnoreCase) -or
+            $rolloutPath.StartsWith($rootPath + '/', [StringComparison]::OrdinalIgnoreCase)
+          if (-not $underRoot) { continue }
+          if ([string]::IsNullOrWhiteSpace($sessionHome)) { $sessionHome = [string](Get-ObjectValue $root 'session_codex_home' $rootPath) }
+          if ([string]::IsNullOrWhiteSpace($sqliteHome)) { $sqliteHome = [string](Get-ObjectValue $root 'session_sqlite_home' $sessionHome) }
+          if ([string]::IsNullOrWhiteSpace($rootOrigin)) { $rootOrigin = [string](Get-ObjectValue $root 'origin' '') }
+          break
+        }
+        if ([string]::IsNullOrWhiteSpace($sessionHome)) {
+          $normalized = $rolloutPath.Replace('/', '\')
+          $markerIndex = $normalized.IndexOf('\sessions\', [StringComparison]::OrdinalIgnoreCase)
+          if ($markerIndex -lt 0) { $markerIndex = $normalized.IndexOf('\archived_sessions\', [StringComparison]::OrdinalIgnoreCase) }
+          if ($markerIndex -gt 0) { $sessionHome = $normalized.Substring(0, $markerIndex) }
+        }
+        if ([string]::IsNullOrWhiteSpace($sessionHome)) { continue }
+        if ([string]::IsNullOrWhiteSpace($sqliteHome)) { $sqliteHome = $sessionHome }
+        $file = Get-Item -LiteralPath $rolloutPath -ErrorAction Stop
+        $entry = [pscustomobject]@{
+          file = $file
+          rollout_path = $file.FullName
+          session_codex_home = $sessionHome
+          session_sqlite_home = $sqliteHome
+          origin = $rootOrigin
+          force_replay = $false
+        }
+        $refreshedCursorCache[$file.FullName.ToLowerInvariant()] = $entry
+      } catch {
+        continue
+      }
+    }
+    $script:DurableCursorCache = $refreshedCursorCache
+    $script:NextDurableCursorRefreshUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [int64]($discoverySeconds * 1000)
+  }
+  foreach ($cursorPathKey in @($script:DurableCursorCache.Keys)) {
+    $durableCursorPaths[$cursorPathKey] = $true
+    if ($refreshDurableCursors) {
+      $entry = $script:DurableCursorCache[$cursorPathKey]
+      Add-RolloutWatchEntry -Found $found -File (Get-ObjectValue $entry 'file') -SessionHome ([string](Get-ObjectValue $entry 'session_codex_home' '')) -SqliteHome ([string](Get-ObjectValue $entry 'session_sqlite_home' '')) -RootOrigin ([string](Get-ObjectValue $entry 'origin' ''))
     }
   }
 
@@ -2070,27 +2640,53 @@ function Get-RecentRolloutFiles {
       $sqliteHome = [string](Get-ObjectValue $root 'session_sqlite_home' $sessionHome)
       if ([string]::IsNullOrWhiteSpace($sqliteHome)) { $sqliteHome = $sessionHome }
       $rootOrigin = [string](Get-ObjectValue $root 'origin' '')
+      $isRemoteRoot = $sessionHome.StartsWith('\\')
+      $cacheKey = $sessionHome.ToLowerInvariant()
+      $cache = if ($script:RolloutDiscoveryCache.ContainsKey($cacheKey)) { $script:RolloutDiscoveryCache[$cacheKey] } else { $null }
+      $rootRefreshDue = $null -eq $cache -or $nowUnixMs -ge [int64](Get-ObjectValue $cache 'next_unix_ms' 0)
       $sessions = Join-Path $sessionHome 'sessions'
       $quickFiles = @()
-      if (Test-Path -LiteralPath $sessions -PathType Container -ErrorAction SilentlyContinue) {
+      $recentCutoffUnixMs = $nowUnixMs - [int64]($recentWindowSeconds * 1000)
+      foreach ($recentRolloutPath in @(Get-RecentThreadRolloutPaths -SqliteHome $sqliteHome -CutoffUnixMs $recentCutoffUnixMs -MaxRows 16)) {
+        try {
+          $resolvedRecentPath = Resolve-RolloutPath -DatabasePathValue $recentRolloutPath -SessionHome $sessionHome
+          $isRemoteRecentPath = $resolvedRecentPath.StartsWith('\\')
+          if (($ScanScope -eq 'Local' -and $isRemoteRecentPath) -or
+              ($ScanScope -eq 'Remote' -and -not $isRemoteRecentPath -and $isRemoteRoot)) { continue }
+          $quickFiles += Get-Item -LiteralPath $resolvedRecentPath -ErrorAction Stop
+        } catch {
+          continue
+        }
+      }
+      # Direct WSL hooks bridge immediately. The UNC fallback is intentionally
+      # sampled on the cold cadence; touching it every two seconds can block a
+      # healthy local scan for many seconds when WSL is suspended or busy.
+      if ((-not $isRemoteRoot -or $rootRefreshDue) -and
+          (Test-Path -LiteralPath $sessions -PathType Container -ErrorAction SilentlyContinue)) {
         foreach ($daysBack in @(0, 1)) {
           $day = $today.AddDays(-$daysBack)
           $directory = Join-Path (Join-Path (Join-Path $sessions $day.ToString('yyyy')) $day.ToString('MM')) $day.ToString('dd')
           if (Test-Path -LiteralPath $directory -PathType Container -ErrorAction SilentlyContinue) {
-            $quickFiles += @(Get-ChildItem -LiteralPath $directory -Filter '*.jsonl' -File -ErrorAction SilentlyContinue)
+            $quickFiles += @(Get-ChildItem -LiteralPath $directory -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTimeUtc -ge $recentCutoffUtc })
           }
         }
-        $quickFiles += @(Get-ChildItem -LiteralPath $sessions -Filter '*.jsonl' -File -ErrorAction SilentlyContinue)
+        $quickFiles += @(Get-ChildItem -LiteralPath $sessions -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTimeUtc -ge $recentCutoffUtc })
       }
       $quickPathSet = @{}
       foreach ($file in @($quickFiles)) {
+        $quickMetadata = Get-RolloutMetadata -Path $file.FullName
+        $quickSource = Get-ObjectValue $quickMetadata 'source'
+        $quickIsSubagent = ($quickSource -is [string] -and $quickSource.Trim().Equals('subagent', [StringComparison]::OrdinalIgnoreCase)) -or
+          ($null -ne $quickSource -and $quickSource -isnot [string] -and $null -ne (Get-ObjectValue $quickSource 'subagent'))
+        if ($quickIsSubagent) { continue }
         if ($null -ne $file) { $quickPathSet[$file.FullName.ToLowerInvariant()] = $true }
         Add-RolloutWatchEntry -Found $found -File $file -SessionHome $sessionHome -SqliteHome $sqliteHome -RootOrigin $rootOrigin
       }
 
-      $cacheKey = $sessionHome.ToLowerInvariant()
-      $cache = if ($script:RolloutDiscoveryCache.ContainsKey($cacheKey)) { $script:RolloutDiscoveryCache[$cacheKey] } else { $null }
-      if ($null -eq $cache -or $nowUnixMs -ge [int64](Get-ObjectValue $cache 'next_unix_ms' 0)) {
+      if ($rootRefreshDue) {
+        $script:ColdDiscoveryRanThisScan = $true
         $firstDiscovery = $null -eq $cache
         $previousForcePaths = @{}
         if (-not $firstDiscovery) {
@@ -2101,7 +2697,10 @@ function Get-RecentRolloutFiles {
         $discoveredPaths = @()
         $forceReplayPaths = @()
         $discoveredCount = 0
-        foreach ($rootName in @('sessions', 'archived_sessions')) {
+        # Full archive walks are kept only for explicit/manual ScanScope=All.
+        # Continuous local and remote workers use the SQLite recent-thread index,
+        # current-day paths, and durable cursors without traversing multi-GB trees.
+        foreach ($rootName in $(if ($isRemoteRoot -or $ScanScope -ne 'All') { @() } else { @('sessions', 'archived_sessions') })) {
           $searchRoot = Join-Path $sessionHome $rootName
           if (-not (Test-Path -LiteralPath $searchRoot -PathType Container -ErrorAction SilentlyContinue)) { continue }
           $remainingCapacity = 4096 - $discoveredCount
@@ -2122,7 +2721,9 @@ function Get-RecentRolloutFiles {
           if ($discoveredCount -ge 4096) { break }
         }
         $cache = [pscustomobject]@{
-          next_unix_ms = $nowUnixMs + [int64]($discoverySeconds * 1000)
+          # Start the next discovery interval after this potentially slow walk;
+          # otherwise a walk longer than the interval immediately repeats.
+          next_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [int64]($discoverySeconds * 1000)
           paths = @($discoveredPaths)
           force_replay_paths = @($forceReplayPaths)
         }
@@ -2193,6 +2794,19 @@ function Scan-RolloutFile {
   } else {
     $offset = [int64](Get-ObjectValue $state 'offset' 0)
     if ($offset -lt 0 -or $offset -gt [int64]$fileInfo.Length) { $offset = [int64]$fileInfo.Length }
+    $observedLengthProperty = $state.PSObject.Properties['observed_length']
+    $observedTicksProperty = $state.PSObject.Properties['observed_write_ticks']
+    $snapshotUnchanged = $null -ne $observedLengthProperty -and
+      $null -ne $observedTicksProperty -and
+      [int64]$observedLengthProperty.Value -eq [int64]$fileInfo.Length -and
+      [int64]$observedTicksProperty.Value -eq [int64]$fileInfo.LastWriteTimeUtc.Ticks
+    # Rollouts are append-only. Legacy cursors do not have snapshot metadata,
+    # but offset==length is still a safe no-op and avoids one mass rewrite on
+    # upgrade. New cursors also skip unchanged partial-line snapshots.
+    if ($snapshotUnchanged -or
+        ($null -eq $observedLengthProperty -and $offset -eq [int64]$fileInfo.Length)) {
+      return 0
+    }
   }
 
   $stream = $null
@@ -2235,6 +2849,8 @@ function Scan-RolloutFile {
         origin = $rootOrigin
         offset = $offset
         seen_unix_ms = $NowUnixMs
+        observed_length = [int64]$snapshotLength
+        observed_write_ticks = [int64]$fileInfo.LastWriteTimeUtc.Ticks
       })
     return 0
   }
@@ -2302,7 +2918,13 @@ function Scan-RolloutFile {
       continue
     }
     if (-not (Test-RolloutScanParentAlive)) { return 0 }
-    $classification = Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $sessionHome
+    $classification = if ($source -is [string] -and -not [string]::IsNullOrWhiteSpace($source)) {
+      if ($source.Trim().Equals('subagent', [StringComparison]::OrdinalIgnoreCase)) { 'subagent' } else { 'root' }
+    } elseif ($null -ne $source -and $source -isnot [string] -and $null -ne (Get-ObjectValue $source 'subagent')) {
+      'subagent'
+    } else {
+      Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $sessionHome
+    }
     $eventOrigin = if (-not [string]::IsNullOrWhiteSpace($rootOrigin)) {
       $rootOrigin
     } elseif (-not [string]::IsNullOrWhiteSpace($originator)) {
@@ -2335,6 +2957,8 @@ function Scan-RolloutFile {
       offset = $newOffset
       seen_unix_ms = $NowUnixMs
       thread_id = $threadId
+      observed_length = [int64]$snapshotLength
+      observed_write_ticks = [int64]$fileInfo.LastWriteTimeUtc.Ticks
     })
   return $observed
 }
@@ -2572,7 +3196,9 @@ function Process-PendingCandidates {
 
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $nextDue = $null
-  $files = @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc, Name)
+  # New completions must never sit behind hours-old unverifiable records.
+  $files = @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+      Sort-Object @{ Expression = 'CreationTimeUtc'; Descending = $true }, Name)
   foreach ($file in $files) {
     try {
       $record = Read-JsonFile -Path $file.FullName
@@ -2613,6 +3239,12 @@ function Process-PendingCandidates {
         $promote = $false
         break
       }
+      if ($gate.state -eq 'unverifiable') {
+        Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'unverifiable'
+        Write-RuntimeLog "suppressed unverifiable candidate key=$($record.key.Substring(0, 12)) reason=$($gate.reason)"
+        $promote = $false
+        break
+      }
       if ($gate.state -ne 'ready') {
         Set-RecordValue -Record $record -Name 'next_attempt_unix_ms' -Value ([int64]$gate.retryAtUnixMs)
         Set-RecordValue -Record $record -Name 'gate_reason' -Value $gate.reason
@@ -2648,13 +3280,28 @@ function Write-RolloutScanHealth {
   )
 
   try {
-    Write-JsonAtomic -Path $ScanHealthPath -Value ([ordered]@{
+    $healthPath = if ($ScanScope -eq 'Remote') { $RemoteScanHealthPath } else { $ScanHealthPath }
+    $previous = if (Test-Path -LiteralPath $healthPath) { Read-JsonFile -Path $healthPath } else { [pscustomobject]@{} }
+    $lastCompletedAt = if (-not [string]::IsNullOrWhiteSpace($CompletedAt)) {
+      $CompletedAt
+    } else {
+      [string](Get-ObjectValue $previous 'last_completed_at' (Get-ObjectValue $previous 'completed_at' ''))
+    }
+    $lastDurationMs = if (-not [string]::IsNullOrWhiteSpace($CompletedAt)) {
+      $DurationMs
+    } else {
+      [int64](Get-ObjectValue $previous 'last_duration_ms' (Get-ObjectValue $previous 'duration_ms' 0))
+    }
+    Write-JsonAtomic -Path $healthPath -Value ([ordered]@{
         schema = 1
+        scope = $ScanScope.ToLowerInvariant()
         status = $Status
         pid = $PID
         started_at = $StartedAt
         completed_at = $CompletedAt
         duration_ms = $DurationMs
+        last_completed_at = $lastCompletedAt
+        last_duration_ms = $lastDurationMs
         observed = $Observed
         error = $ErrorText
       })
@@ -2682,8 +3329,9 @@ function Test-RolloutScanParentAlive {
 function Invoke-RolloutScanWorker {
   Ensure-RuntimeDirectories
   $lockStream = $null
+  $scanLockPath = if ($ScanScope -eq 'Remote') { $RemoteScanLockPath } else { $ScanLockPath }
   try {
-    $lockStream = [System.IO.File]::Open($ScanLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $lockStream = [System.IO.File]::Open($scanLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
   } catch {
     return 0
   }
@@ -2696,7 +3344,7 @@ function Invoke-RolloutScanWorker {
       $started = [DateTimeOffset]::Now
       $startedAt = $started.ToString('o')
       Write-RolloutScanHealth -Status 'running' -StartedAt $startedAt
-      Write-RuntimeLog "rollout scan started pid=$PID"
+      Write-RuntimeLog "rollout scan started scope=$($ScanScope.ToLowerInvariant()) pid=$PID"
       try {
         $testDelayMs = 0
         if ([int]::TryParse([string]$env:CODEX_NTFY_TEST_SCAN_DELAY_MS, [ref]$testDelayMs) -and $testDelayMs -gt 0) {
@@ -2705,15 +3353,22 @@ function Invoke-RolloutScanWorker {
         $config = Get-Config
         $observed = Invoke-RolloutWatchScan -Config $config -NowUnixMs ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
         $completed = [DateTimeOffset]::Now
+        if ($script:ColdDiscoveryRanThisScan) {
+          $nextColdRefreshMs = $completed.ToUnixTimeMilliseconds() + [int64]([Math]::Max(0.1, $config.watchDiscoverySeconds) * 1000)
+          $script:NextDurableCursorRefreshUnixMs = $nextColdRefreshMs
+          foreach ($cacheKey in @($script:RolloutDiscoveryCache.Keys)) {
+            Set-RecordValue -Record $script:RolloutDiscoveryCache[$cacheKey] -Name 'next_unix_ms' -Value $nextColdRefreshMs
+          }
+        }
         $durationMs = [int64][Math]::Max(0, ($completed - $started).TotalMilliseconds)
         Write-RolloutScanHealth -Status 'completed' -StartedAt $startedAt -CompletedAt $completed.ToString('o') -DurationMs $durationMs -Observed $observed
-        Write-RuntimeLog "rollout scan completed observed=$observed duration_ms=$durationMs"
+        Write-RuntimeLog "rollout scan completed scope=$($ScanScope.ToLowerInvariant()) observed=$observed duration_ms=$durationMs"
       } catch {
         $completed = [DateTimeOffset]::Now
         $durationMs = [int64][Math]::Max(0, ($completed - $started).TotalMilliseconds)
         $errorText = Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 300
         Write-RolloutScanHealth -Status 'failed' -StartedAt $startedAt -CompletedAt $completed.ToString('o') -DurationMs $durationMs -ErrorText $errorText
-        Write-RuntimeLog "rollout watcher error: $errorText"
+        Write-RuntimeLog "rollout watcher error scope=$($ScanScope.ToLowerInvariant()): $errorText"
         return 1
       }
       if (-not $Continuous) {
@@ -2736,14 +3391,19 @@ function Invoke-RolloutScanWorker {
 }
 
 function Start-RolloutScanProcess {
-  param([string]$ParentToken)
+  param(
+    [string]$ParentToken,
+    [ValidateSet('Local', 'Remote')]
+    [string]$Scope = 'Local',
+    [switch]$OneShot
+  )
   try {
     $powerShellExe = Join-Path $PSHOME 'powershell.exe'
     if (-not (Test-Path -LiteralPath $powerShellExe)) {
       $powerShellExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     }
-    $scanMode = if ($env:CODEX_NTFY_SCAN_ONCE -eq '1') { '' } else { ' -Continuous' }
-    $arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ScanRollouts -ScanParentPid {1} -ScanParentToken "{2}"{3}' -f $PSCommandPath, $PID, $ParentToken, $scanMode)
+    $scanMode = if ($OneShot -or $env:CODEX_NTFY_SCAN_ONCE -eq '1') { '' } else { ' -Continuous' }
+    $arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ScanRollouts -ScanScope {1} -ScanParentPid {2} -ScanParentToken "{3}"{4}' -f $PSCommandPath, $Scope, $PID, $ParentToken, $scanMode)
     return Start-Process -FilePath $powerShellExe -ArgumentList $arguments -WindowStyle Hidden -PassThru
   } catch {
     Write-RuntimeLog "failed to start rollout scan: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 300)"
@@ -2766,6 +3426,21 @@ function Start-DeliveryProcess {
   }
 }
 
+function Start-MaintenanceProcess {
+  if ($NoSpawn -or $env:CODEX_NTFY_NO_SPAWN -eq '1') { return $null }
+  try {
+    $powerShellExe = Join-Path $PSHOME 'powershell.exe'
+    if (-not (Test-Path -LiteralPath $powerShellExe)) {
+      $powerShellExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    }
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Maintenance' -f $PSCommandPath
+    return Start-Process -FilePath $powerShellExe -ArgumentList $arguments -WindowStyle Hidden -PassThru
+  } catch {
+    Write-RuntimeLog "failed to start maintenance: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 240)"
+    return $null
+  }
+}
+
 function Invoke-OutboxWorker {
   Ensure-RuntimeDirectories
   $lockStream = $null
@@ -2777,10 +3452,18 @@ function Invoke-OutboxWorker {
   }
 
   $workerToken = if ($DeliveryOnly) { $ScanParentToken } else { [Guid]::NewGuid().ToString('N') }
-  $cleaned = $false
   $nextWatchScanMs = [int64]0
+  $nextRemoteWatchScanMs = [int64]0
   $scanProcess = $null
+  $remoteScanProcess = $null
+  $remoteScanStartedUnixMs = [int64]0
   $deliveryProcess = $null
+  $maintenanceProcess = $null
+  $maintenanceStarted = $false
+  $deliveryReadyForMaintenance = $false
+  $localScanReadyForMaintenance = $false
+  $remoteScanReadyForMaintenance = $false
+  $maintenanceDueUnixMs = [DateTimeOffset]::UtcNow.AddSeconds(60).ToUnixTimeMilliseconds()
   try {
     if (-not $DeliveryOnly) {
       Write-JsonAtomic -Path $WorkerHealthPath -Value ([ordered]@{
@@ -2807,11 +3490,9 @@ function Invoke-OutboxWorker {
         return 0
       }
       $config = Get-Config
-      if (-not $cleaned -and -not $DeliveryOnly) {
-        Clean-RuntimeState -ReceiptRetentionDays $config.sentRetentionDays -DeadRetentionDays $config.deadRetentionDays
-        $cleaned = $true
-      }
-
+      $hasRemoteWatchRoots = @($config.watchRoots | Where-Object {
+          ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' ''))).StartsWith('\\')
+        }).Count -gt 0
       $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
       if (-not $DeliveryOnly -and $Continuous -and $null -ne $deliveryProcess -and $deliveryProcess.HasExited) {
         Write-RuntimeLog "delivery worker exited code=$($deliveryProcess.ExitCode)"
@@ -2831,6 +3512,17 @@ function Invoke-OutboxWorker {
         }
         $scanProcess = $null
       }
+      if ((-not $config.watchRollouts -or -not $hasRemoteWatchRoots) -and $null -ne $remoteScanProcess) {
+        try {
+          if (-not $remoteScanProcess.HasExited) {
+            Stop-Process -Id $remoteScanProcess.Id -Force -ErrorAction SilentlyContinue
+          }
+          $remoteScanProcess.Dispose()
+        } catch {
+        }
+        $remoteScanProcess = $null
+        $remoteScanStartedUnixMs = [int64]0
+      }
       if ($null -ne $scanProcess -and $scanProcess.HasExited) {
         if ($scanProcess.ExitCode -ne 0) {
           Write-RuntimeLog "rollout scan process exited code=$($scanProcess.ExitCode)"
@@ -2839,11 +3531,96 @@ function Invoke-OutboxWorker {
         $scanProcess = $null
         $nextWatchScanMs = $nowMs + [int64]([Math]::Max(0.1, $config.watchScanSeconds) * 1000)
       }
+      if ($null -ne $remoteScanProcess -and -not $remoteScanProcess.HasExited -and
+          $remoteScanStartedUnixMs -gt 0 -and
+          $nowMs -ge $remoteScanStartedUnixMs + [int64]([Math]::Max(5, $config.remoteWatchTimeoutSeconds) * 1000)) {
+        Write-RuntimeLog "remote rollout scan timed out after $([Math]::Round([Math]::Max(5, $config.remoteWatchTimeoutSeconds), 1))s"
+        Stop-Process -Id $remoteScanProcess.Id -Force -ErrorAction SilentlyContinue
+        try {
+          $remoteHealth = if (Test-Path -LiteralPath $RemoteScanHealthPath) { Read-JsonFile -Path $RemoteScanHealthPath } else { [pscustomobject]@{} }
+          Write-JsonAtomic -Path $RemoteScanHealthPath -Value ([ordered]@{
+              schema = 1
+              scope = 'remote'
+              status = 'timed-out'
+              pid = $remoteScanProcess.Id
+              started_at = [string](Get-ObjectValue $remoteHealth 'started_at' '')
+              completed_at = [DateTimeOffset]::Now.ToString('o')
+              duration_ms = [int64]([Math]::Max(5, $config.remoteWatchTimeoutSeconds) * 1000)
+              observed = 0
+              error = 'remote scan timeout'
+            })
+        } catch {
+        }
+        $remoteScanStartedUnixMs = [int64]0
+      }
+      if ($null -ne $remoteScanProcess -and $remoteScanProcess.HasExited) {
+        if ($remoteScanProcess.ExitCode -ne 0) {
+          Write-RuntimeLog "remote rollout scan process exited code=$($remoteScanProcess.ExitCode)"
+        }
+        $remoteScanProcess.Dispose()
+        $remoteScanProcess = $null
+        $remoteScanStartedUnixMs = [int64]0
+        $nextRemoteWatchScanMs = $nowMs + [int64]([Math]::Max(5, $config.watchDiscoverySeconds) * 1000)
+      }
       if (-not $DeliveryOnly -and $Continuous -and $config.watchRollouts -and $null -eq $scanProcess -and $nowMs -ge $nextWatchScanMs) {
-        $scanProcess = Start-RolloutScanProcess -ParentToken $workerToken
+        $scanProcess = Start-RolloutScanProcess -ParentToken $workerToken -Scope Local
         if ($null -eq $scanProcess) {
           $nextWatchScanMs = $nowMs + [int64]([Math]::Max(0.1, $config.watchScanSeconds) * 1000)
         }
+      }
+      if (-not $DeliveryOnly -and $Continuous -and $config.watchRollouts -and $hasRemoteWatchRoots -and
+          $null -eq $remoteScanProcess -and $nowMs -ge $nextRemoteWatchScanMs) {
+        $remoteScanProcess = Start-RolloutScanProcess -ParentToken $workerToken -Scope Remote -OneShot
+        if ($null -eq $remoteScanProcess) {
+          $nextRemoteWatchScanMs = $nowMs + [int64]([Math]::Max(5, $config.watchDiscoverySeconds) * 1000)
+        } else {
+          $remoteScanStartedUnixMs = $nowMs
+        }
+      }
+      if (-not $DeliveryOnly -and $Continuous -and -not $deliveryReadyForMaintenance) {
+        try {
+          $deliveryHealth = Read-JsonFile -Path $DeliveryHealthPath
+          $deliveryReadyForMaintenance = [int](Get-ObjectValue $deliveryHealth 'pid' 0) -gt 0 -and
+            [string](Get-ObjectValue $deliveryHealth 'token' '') -eq $workerToken
+        } catch {
+        }
+      }
+      if (-not $DeliveryOnly -and -not $localScanReadyForMaintenance) {
+        if (-not $config.watchRollouts) {
+          $localScanReadyForMaintenance = $true
+        } else {
+          try {
+            $localHealth = Read-JsonFile -Path $ScanHealthPath
+            $localScanReadyForMaintenance = -not [string]::IsNullOrWhiteSpace([string](Get-ObjectValue $localHealth 'last_completed_at' '')) -or
+              [string](Get-ObjectValue $localHealth 'status' '') -eq 'error'
+          } catch {
+          }
+        }
+      }
+      if (-not $DeliveryOnly -and -not $remoteScanReadyForMaintenance) {
+        if (-not $config.watchRollouts -or -not $hasRemoteWatchRoots) {
+          $remoteScanReadyForMaintenance = $true
+        } else {
+          try {
+            $remoteHealth = Read-JsonFile -Path $RemoteScanHealthPath
+            $remoteStatus = [string](Get-ObjectValue $remoteHealth 'status' '')
+            $remoteScanReadyForMaintenance = -not [string]::IsNullOrWhiteSpace([string](Get-ObjectValue $remoteHealth 'last_completed_at' '')) -or
+              $remoteStatus -in @('completed', 'timed-out', 'error')
+          } catch {
+          }
+        }
+      }
+      if (-not $DeliveryOnly -and $Continuous -and -not $maintenanceStarted -and $nowMs -ge $maintenanceDueUnixMs -and
+          $deliveryReadyForMaintenance -and $localScanReadyForMaintenance -and $remoteScanReadyForMaintenance) {
+        $maintenanceProcess = Start-MaintenanceProcess
+        $maintenanceStarted = $true
+      }
+      if ($null -ne $maintenanceProcess -and $maintenanceProcess.HasExited) {
+        if ($maintenanceProcess.ExitCode -ne 0) {
+          Write-RuntimeLog "maintenance process exited code=$($maintenanceProcess.ExitCode)"
+        }
+        $maintenanceProcess.Dispose()
+        $maintenanceProcess = $null
       }
       if (-not $DeliveryOnly) {
         Coalesce-ThreadCandidates -Config $config
@@ -2950,6 +3727,13 @@ function Invoke-OutboxWorker {
       $remaining = @(Get-ChildItem -LiteralPath $OutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count +
         @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
       if (-not $Continuous -and $remaining -eq 0) {
+        if (-not $DeliveryOnly) {
+          if ($NoSpawn -or $env:CODEX_NTFY_NO_SPAWN -eq '1') {
+            Clean-RuntimeState -ReceiptRetentionDays $config.sentRetentionDays -DeadRetentionDays $config.deadRetentionDays
+          } else {
+            Start-MaintenanceProcess | Out-Null
+          }
+        }
         return 0
       }
       $sleepMs = [Math]::Max(100, $PollSeconds * 1000)
@@ -2960,6 +3744,10 @@ function Invoke-OutboxWorker {
       if (-not $DeliveryOnly -and $Continuous -and $config.watchRollouts -and $null -eq $scanProcess) {
         $untilWatch = [Math]::Max(100, $nextWatchScanMs - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
         $sleepMs = [Math]::Min($sleepMs, $untilWatch)
+      }
+      if (-not $DeliveryOnly -and $Continuous -and $config.watchRollouts -and $hasRemoteWatchRoots -and $null -eq $remoteScanProcess) {
+        $untilRemoteWatch = [Math]::Max(100, $nextRemoteWatchScanMs - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+        $sleepMs = [Math]::Min($sleepMs, $untilRemoteWatch)
       }
       Start-Sleep -Milliseconds ([int]$sleepMs)
     }
@@ -2979,6 +3767,24 @@ function Invoke-OutboxWorker {
           Stop-Process -Id $scanProcess.Id -Force -ErrorAction SilentlyContinue
         }
         $scanProcess.Dispose()
+      } catch {
+      }
+    }
+    if ($null -ne $remoteScanProcess) {
+      try {
+        if (-not $remoteScanProcess.HasExited) {
+          Stop-Process -Id $remoteScanProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        $remoteScanProcess.Dispose()
+      } catch {
+      }
+    }
+    if ($null -ne $maintenanceProcess) {
+      try {
+        if (-not $maintenanceProcess.HasExited) {
+          Stop-Process -Id $maintenanceProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        $maintenanceProcess.Dispose()
       } catch {
       }
     }
@@ -3039,15 +3845,41 @@ function Show-Doctor {
   Ensure-RuntimeDirectories
   $config = Get-Config
   $outboxFiles = @(Get-ChildItem -LiteralPath $OutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+  $pendingFiles = @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
   $oldestOutboxSeconds = 0
   if ($outboxFiles.Count -gt 0) {
     $oldestOutbox = $outboxFiles | Sort-Object LastWriteTimeUtc | Select-Object -First 1
     $oldestOutboxSeconds = [Math]::Round([Math]::Max(0, ([DateTime]::UtcNow - $oldestOutbox.LastWriteTimeUtc).TotalSeconds), 1)
   }
+  $oldestPendingSeconds = 0
+  $pendingReasons = [ordered]@{}
+  if ($pendingFiles.Count -gt 0) {
+    $oldestPending = $pendingFiles | Sort-Object CreationTimeUtc | Select-Object -First 1
+    $oldestPendingSeconds = [Math]::Round([Math]::Max(0, ([DateTime]::UtcNow - $oldestPending.CreationTimeUtc).TotalSeconds), 1)
+    foreach ($file in $pendingFiles) {
+      try {
+        $pendingRecord = Read-JsonFile -Path $file.FullName
+        $reason = [string](Get-ObjectValue $pendingRecord 'gate_reason' 'new')
+        if ([string]::IsNullOrWhiteSpace($reason)) { $reason = 'new' }
+        if (-not $pendingReasons.Contains($reason)) { $pendingReasons[$reason] = 0 }
+        $pendingReasons[$reason] = [int]$pendingReasons[$reason] + 1
+      } catch {
+        if (-not $pendingReasons.Contains('invalid')) { $pendingReasons['invalid'] = 0 }
+        $pendingReasons['invalid'] = [int]$pendingReasons['invalid'] + 1
+      }
+    }
+  }
   $scanHealth = [pscustomobject]@{}
   if (Test-Path -LiteralPath $ScanHealthPath) {
     try {
       $scanHealth = Read-JsonFile -Path $ScanHealthPath
+    } catch {
+    }
+  }
+  $remoteScanHealth = [pscustomobject]@{}
+  if (Test-Path -LiteralPath $RemoteScanHealthPath) {
+    try {
+      $remoteScanHealth = Read-JsonFile -Path $RemoteScanHealthPath
     } catch {
     }
   }
@@ -3070,13 +3902,19 @@ function Show-Doctor {
     state_dir = $StateRoot
     idle_detection_mode = $config.idleDetectionMode
     idle_grace_seconds = $config.idleGraceSeconds
+    idle_probe_grace_seconds = $config.idleProbeGraceSeconds
+    unknown_retry_max_seconds = $config.unknownRetryMaxSeconds
     goal_aware = $config.goalAware
     watch_rollouts = $config.watchRollouts
     watch_discovery_seconds = $config.watchDiscoverySeconds
+    watch_cursor_batch_size = $config.watchCursorBatchSize
+    watch_remote_timeout_seconds = $config.remoteWatchTimeoutSeconds
     watch_roots = @($config.watchRoots).Count
     sqlite_home_configured = [bool]$config.workerSqliteConfigured
-    pending_idle = @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
-    pending = @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+    pending_idle = $pendingFiles.Count
+    pending = $pendingFiles.Count
+    oldest_pending_seconds = $oldestPendingSeconds
+    pending_reasons = $pendingReasons
     watched_rollouts = @(Get-ChildItem -LiteralPath $WatchDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     queued = $outboxFiles.Count
     oldest_queued_seconds = $oldestOutboxSeconds
@@ -3085,6 +3923,11 @@ function Show-Doctor {
     watch_scan_completed_at = [string](Get-ObjectValue $scanHealth 'completed_at' '')
     watch_scan_duration_ms = [int64](Get-ObjectValue $scanHealth 'duration_ms' 0)
     watch_scan_observed = [int](Get-ObjectValue $scanHealth 'observed' 0)
+    remote_watch_scan_status = [string](Get-ObjectValue $remoteScanHealth 'status' 'unknown')
+    remote_watch_scan_started_at = [string](Get-ObjectValue $remoteScanHealth 'started_at' '')
+    remote_watch_scan_completed_at = [string](Get-ObjectValue $remoteScanHealth 'completed_at' '')
+    remote_watch_scan_duration_ms = [int64](Get-ObjectValue $remoteScanHealth 'duration_ms' 0)
+    remote_watch_scan_observed = [int](Get-ObjectValue $remoteScanHealth 'observed' 0)
     sent_receipts = @(Get-ChildItem -LiteralPath $SentDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     suppressed = @(Get-ChildItem -LiteralPath $SuppressedDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     dead_letters = @(Get-ChildItem -LiteralPath $DeadDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
@@ -3099,6 +3942,13 @@ try {
     Show-Doctor
     exit 0
   }
+  if ($CleanupTestState) {
+    Write-Output (Clear-SyntheticTestState)
+    exit 0
+  }
+  if ($Maintenance) {
+    exit (Invoke-RuntimeMaintenance)
+  }
   if ($ScanRollouts) {
     exit (Invoke-RolloutScanWorker)
   }
@@ -3109,7 +3959,7 @@ try {
   $raw = if ($Test) {
     ConvertTo-CompactJson ([ordered]@{
       type = 'agent-turn-complete'
-      'thread-id' = '00000000-0000-4000-8000-000000000001'
+      'thread-id' = $SyntheticTestThreadId
       'turn-id' = [Guid]::NewGuid().ToString()
       cwd = (Get-Location).Path
       'last-assistant-message' = 'Test codex-ntfy-notifier: delivery, queueing, and deduplication work.'
