@@ -1344,6 +1344,7 @@ class NotifierContractTests(unittest.TestCase):
             goal_poll_seconds=0.05,
             subagent_orphan_seconds=60,
             suppress_technical_turns=True,
+            watch_rollouts=False,
         )
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
@@ -1359,11 +1360,27 @@ class NotifierContractTests(unittest.TestCase):
                 self.append_rollout(child_rollout, "task_started", turn_id=child_turn)
                 database = self.create_state_database(root_id, root_rollout, child_id, child_rollout)
                 self.run_ok(self.hook_command(implementation, self.event(thread_id=root_id, turn_id=root_turn)))
-                process = self.start_worker(implementation)
+                process = subprocess.Popen(
+                    self.continuous_worker_command(implementation),
+                    env=self.env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                worker_output: tuple[str, str] | None = None
                 try:
-                    deadline = time.monotonic() + 30
+                    deadline = time.monotonic() + 60
                     observed_reason = ""
-                    while time.monotonic() < deadline and "subagent" not in observed_reason:
+                    active_descendants = 0
+                    while time.monotonic() < deadline and (
+                        observed_reason != "subagents-active" or active_descendants != 1
+                    ):
+                        with self.server.lock:
+                            self.assertEqual(
+                                self.server.payloads,
+                                [],
+                                "root notification arrived while its descendant was still active",
+                            )
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
                                 pending_record = json.loads(pending_path.read_text(encoding="utf-8-sig"))
@@ -1372,19 +1389,30 @@ class NotifierContractTests(unittest.TestCase):
                             observed_reason = str(
                                 pending_record.get("idle_reason") or pending_record.get("gate_reason") or ""
                             )
+                            active_descendants = int(pending_record.get("active_descendants") or 0)
                         if process.poll() is not None:
-                            break
+                            worker_output = process.communicate()
+                            self.fail(
+                                "continuous worker exited before observing the active descendant: "
+                                f"returncode={process.returncode}\n"
+                                f"stdout={worker_output[0]}\nstderr={worker_output[1]}"
+                            )
                         time.sleep(0.05)
-                    self.assertIn("subagent", observed_reason, "worker never observed the active descendant")
+                    self.assertEqual(observed_reason, "subagents-active", "worker never observed the active descendant")
+                    self.assertEqual(active_descendants, 1, "worker did not persist the active descendant count")
                     with self.server.lock:
                         self.assertEqual(self.server.payloads, [])
                     self.append_rollout(child_rollout, "task_complete", turn_id=child_turn, message="Child done")
-                    self.assert_worker_ok(process)
+                    payloads = self.wait_for_payloads(1, timeout=60)
+                    self.assertEqual(len(payloads), 1)
                 finally:
-                    if process.poll() is None:
-                        process.terminate()
-                        process.communicate(timeout=5)
-                self.assertEqual(len(self.wait_for_payloads(1)), 1)
+                    if worker_output is None:
+                        worker_output = self.stop_continuous_worker(process)
+                    self.assertIn(
+                        process.returncode,
+                        (0, 1, -15),
+                        msg=f"stdout={worker_output[0]}\nstderr={worker_output[1]}",
+                    )
                 shutil.rmtree(self.state, ignore_errors=True)
                 database.unlink(missing_ok=True)
                 with self.server.lock:
