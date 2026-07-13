@@ -2,7 +2,7 @@
 
 There are useful notification projects for Codex and other coding agents. Durable Codex ntfy notifier is not claimed to be the first or only solution. The best choice depends on whether the priority is true root-task idle detection, durable ntfy delivery, native desktop interaction, broad provider support, tmux integration, or a lightweight explicit workflow.
 
-This comparison was reviewed for version 2.4.2 on 2026-07-11, including the compact notification patterns described below. Projects change; verify their current documentation, code, supported platforms, maintenance status, security model, and license before adoption. The descriptions below are orientation, not security reviews or feature guarantees.
+This comparison was reviewed for version 2.4.3 on 2026-07-13, including the compact notification patterns described below. Projects change; verify their current documentation, code, supported platforms, maintenance status, security model, and license before adoption. The descriptions below are orientation, not security reviews or feature guarantees.
 
 ## Project map
 

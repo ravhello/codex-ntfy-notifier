@@ -33,8 +33,9 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.4.2"
+VERSION = "2.4.3"
 MAX_NTFY_MESSAGE_BYTES = 3500
+SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
 
 
@@ -154,6 +155,9 @@ class Runtime:
         self.last_watch_discovery_ms = 0
         self.watch_discovery_cache: dict[str, Path] = {}
         self.watch_force_replay_paths: set[str] = set()
+        self.last_watch_cursor_refresh_ms = 0
+        self.watch_cursor_cache: dict[str, Path] = {}
+        self.cold_discovery_ran_this_scan = False
 
     def ensure(self) -> None:
         for path in (
@@ -268,6 +272,7 @@ def load_config(runtime: Runtime) -> dict[str, Any]:
         "idle_detection_mode": idle_detection_mode,
         "idle_grace_seconds": float(file_config.get("idle_grace_seconds", 1.5)),
         "idle_probe_grace_seconds": float(file_config.get("idle_probe_grace_seconds", 30)),
+        "unknown_retry_max_seconds": float(file_config.get("unknown_retry_max_seconds", 60)),
         "goal_aware": bool(file_config.get("goal_aware", True)),
         "goal_poll_seconds": float(file_config.get("goal_poll_seconds", 1)),
         "subagent_orphan_seconds": float(file_config.get("subagent_orphan_seconds", 1800)),
@@ -825,6 +830,25 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
     return probe
 
 
+def unknown_probe_schedule(
+    record: dict[str, Any], config: dict[str, Any], now_ms: int, reason: str
+) -> tuple[bool, int]:
+    """Return (expired, next probe) for evidence that cannot be verified yet."""
+    created_ms = int(record.get("created_unix_ms", now_ms) or now_ms)
+    deadline = created_ms + int(max(0, float(config.get("idle_probe_grace_seconds", 30))) * 1000)
+    if str(config.get("idle_detection_mode", "strict")).lower() == "strict" and now_ms >= deadline:
+        return True, now_ms
+    previous_reason = str(record.get("unknown_probe_reason", ""))
+    count = int(record.get("unknown_probe_count", 0) or 0) if previous_reason == reason else 0
+    base = max(0.1, float(config.get("goal_poll_seconds", 1)))
+    maximum = max(base, float(config.get("unknown_retry_max_seconds", 60)))
+    delay = min(maximum, base * (2 ** min(10, count)))
+    record["unknown_probe_reason"] = reason
+    record["unknown_probe_count"] = count + 1
+    due = now_ms + int(delay * 1000)
+    return False, min(due, deadline) if deadline > now_ms else due
+
+
 def idle_gate(
     runtime: Runtime,
     record: dict[str, Any],
@@ -863,11 +887,16 @@ def idle_gate(
         return False, poll_due, "rollout-changing"
 
     probe_status = str(probe.get("status", "unknown"))
-    if probe_status == "busy":
-        return False, poll_due, "turn-active"
-
     candidate_completed = bool(probe.get("candidate_completed", False))
     candidate_is_latest = str(probe.get("last_lifecycle_turn_id", "")) == str(record.get("turn_id", ""))
+    if probe_status == "busy":
+        if candidate_completed and not candidate_is_latest:
+            # A later turn is open. Its own terminal event is the only useful
+            # notification candidate; holding this predecessor creates stale
+            # notifications after the conversation has moved on.
+            return False, now_ms, "superseded"
+        return False, poll_due, "turn-active"
+
     if probe_status == "idle" and candidate_completed and candidate_is_latest:
         quiet_due = int(probe.get("mtime_unix_ms", 0) or 0) + int(max(0, float(config["idle_grace_seconds"])) * 1000)
         if quiet_due > now_ms:
@@ -884,7 +913,10 @@ def idle_gate(
     )
     if mode == "balanced" and fallback_due <= now_ms:
         return True, now_ms, "balanced-fallback"
-    return False, max(poll_due, fallback_due if mode == "balanced" else poll_due), "probe-incomplete"
+    expired, unknown_due = unknown_probe_schedule(record, config, now_ms, "probe-incomplete")
+    if expired:
+        return False, now_ms, "unverifiable"
+    return False, min(unknown_due, fallback_due) if mode == "balanced" else unknown_due, "probe-incomplete"
 
 
 def technical_suppression_reason(record: dict[str, Any], config: dict[str, Any]) -> str:
@@ -970,7 +1002,7 @@ def _enqueue_unlocked(runtime: Runtime, record: dict[str, Any]) -> str:
         return "sent"
     if suppressed_path.exists():
         receipt = read_json(suppressed_path)
-        if str(record.get("source_event", "")) == "Stop" and receipt.get("reason") == "technical-turn":
+        if str(record.get("source_event", "")) == "Stop" and receipt.get("reason") in ("technical-turn", "unverifiable"):
             suppressed_path.unlink(missing_ok=True)
         else:
             runtime.log(f"deduplicated suppressed event key={record['key'][:12]}")
@@ -1038,7 +1070,7 @@ def _enqueue_pending_unlocked(runtime: Runtime, record: dict[str, Any]) -> str:
                     receipt = read_json(path)
                 except (OSError, json.JSONDecodeError):
                     receipt = {}
-                if isinstance(receipt, dict) and receipt.get("reason") == "technical-turn":
+                if isinstance(receipt, dict) and receipt.get("reason") in ("technical-turn", "unverifiable"):
                     path.unlink(missing_ok=True)
                     continue
             if is_stop and status == "pending":
@@ -1273,7 +1305,8 @@ def has_newer_thread_record(runtime: Runtime, record: dict[str, Any]) -> bool:
 def process_pending(runtime: Runtime, config: dict[str, Any], now_ms: int) -> int | None:
     next_due: int | None = None
     mode = str(config.get("idle_detection_mode", "strict")).lower()
-    for path in sorted(runtime.pending.glob("*.json"), key=lambda item: (item.stat().st_mtime_ns, item.name)):
+    # New completions must not wait behind hours-old unverifiable records.
+    for path in sorted(runtime.pending.glob("*.json"), key=lambda item: (item.stat().st_mtime_ns, item.name), reverse=True):
         try:
             record = validate_record(read_json(path), path.stem)
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -1294,9 +1327,17 @@ def process_pending(runtime: Runtime, config: dict[str, Any], now_ms: int) -> in
         suppressed_path = runtime.suppressed / path.name
         if suppressed_path.exists() and reconcile_suppressed_pending(runtime, path, record):
             continue
-        if mode != "off" and has_newer_thread_record(runtime, record):
-            write_suppressed_receipt(runtime, record, "superseded")
-            continue
+        previous_reason = str(record.get("idle_reason", ""))
+        if mode == "strict" and previous_reason in (
+            "classification-unknown",
+            "probe-incomplete",
+            "newer-completion-awaiting-candidate",
+        ):
+            expired, _ = unknown_probe_schedule(record, config, now_ms, previous_reason)
+            if expired:
+                write_suppressed_receipt(runtime, record, "unverifiable")
+                runtime.log(f"suppressed unverifiable pending key={record['key'][:12]} reason={previous_reason}")
+                continue
         due = int(record.get("next_probe_unix_ms", 0) or 0)
         if due > now_ms:
             next_due = due if next_due is None else min(next_due, due)
@@ -1318,7 +1359,13 @@ def process_pending(runtime: Runtime, config: dict[str, Any], now_ms: int) -> in
                 runtime.log(f"suppressed subagent pending key={record['key'][:12]}")
                 continue
             if classification == "unknown" and mode == "strict":
-                record["next_probe_unix_ms"] = now_ms + int(max(0.25, config["goal_poll_seconds"]) * 1000)
+                record["idle_reason"] = "classification-unknown"
+                expired, next_probe = unknown_probe_schedule(record, config, now_ms, "classification-unknown")
+                if expired:
+                    write_suppressed_receipt(runtime, record, "unverifiable")
+                    runtime.log(f"suppressed unverifiable pending key={record['key'][:12]} reason=classification-unknown")
+                    continue
+                record["next_probe_unix_ms"] = next_probe
                 persist_pending_record(runtime, path, record)
                 next_due = (
                     record["next_probe_unix_ms"]
@@ -1330,8 +1377,8 @@ def process_pending(runtime: Runtime, config: dict[str, Any], now_ms: int) -> in
         ready, probe_due, reason = idle_gate(runtime, record, config, now_ms)
         record["idle_reason"] = reason
         if not ready:
-            if reason == "superseded":
-                write_suppressed_receipt(runtime, record, "superseded")
+            if reason in ("superseded", "unverifiable"):
+                write_suppressed_receipt(runtime, record, reason)
                 continue
             record["next_probe_unix_ms"] = probe_due
             persist_pending_record(runtime, path, record)
@@ -1351,8 +1398,8 @@ def process_pending(runtime: Runtime, config: dict[str, Any], now_ms: int) -> in
         ready, probe_due, reason = idle_gate(runtime, record, config, final_now_ms)
         record["idle_reason"] = reason
         if not ready:
-            if reason == "superseded":
-                write_suppressed_receipt(runtime, record, "superseded")
+            if reason in ("superseded", "unverifiable"):
+                write_suppressed_receipt(runtime, record, reason)
                 continue
             record["next_probe_unix_ms"] = probe_due
             persist_pending_record(runtime, path, record)
@@ -1371,35 +1418,51 @@ def process_pending(runtime: Runtime, config: dict[str, Any], now_ms: int) -> in
 
 
 def recent_rollouts(runtime: Runtime, config: dict[str, Any], now_ms: int) -> list[Path]:
+    runtime.cold_discovery_ran_this_scan = False
     root = runtime.codex_home / "sessions"
     if not root.is_dir():
         root = runtime.codex_home / "sessions"
     found: dict[str, Path] = {}
+    discovery_ms = int(max(5, float(config.get("watch_discovery_seconds", 60))) * 1000)
+    recent_ms = max(
+        discovery_ms * 2,
+        int(max(0, float(config["watch_initial_replay_seconds"])) * 1000),
+    )
+    cutoff_ms = now_ms - recent_ms
     today = dt.datetime.now().astimezone().date()
     for days_back in (0, 1):
         day = today - dt.timedelta(days=days_back)
         directory = root / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
         if directory.is_dir():
             for path in directory.glob("*.jsonl"):
-                found[str(path)] = path
+                with contextlib.suppress(OSError):
+                    if path.stat().st_mtime_ns // 1_000_000 >= cutoff_ms:
+                        found[str(path)] = path
     for path in root.glob("*.jsonl"):
-        found[str(path)] = path
+        with contextlib.suppress(OSError):
+            if path.stat().st_mtime_ns // 1_000_000 >= cutoff_ms:
+                found[str(path)] = path
 
     # Once a file has a cursor, keep following it regardless of the date in
     # its directory. This supports long-lived tasks that cross day boundaries.
-    for state_path in runtime.watch.glob("*.json"):
-        with contextlib.suppress(OSError, json.JSONDecodeError):
-            state = read_json(state_path)
-            watched = Path(str(state.get("rollout_path", ""))) if isinstance(state, dict) else None
-            if watched is not None and watched.is_file():
-                found[str(watched)] = watched
+    refresh_cursors = now_ms - runtime.last_watch_cursor_refresh_ms >= discovery_ms
+    if refresh_cursors:
+        runtime.cold_discovery_ran_this_scan = True
+        refreshed: dict[str, Path] = {}
+        for state_path in runtime.watch.glob("*.json"):
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                state = read_json(state_path)
+                watched = Path(str(state.get("rollout_path", ""))) if isinstance(state, dict) else None
+                if watched is not None and watched.is_file():
+                    refreshed[str(watched)] = watched
+        runtime.watch_cursor_cache = refreshed
+        runtime.last_watch_cursor_refresh_ms = unix_ms()
+    # The cached paths are already validated on the cold cadence; reusing them
+    # keeps long-lived local sessions observable without rereading every cursor.
+    found.update(runtime.watch_cursor_cache)
 
-    discovery_ms = int(max(5, float(config.get("watch_discovery_seconds", 60))) * 1000)
     if now_ms - runtime.last_watch_discovery_ms >= discovery_ms:
-        cutoff_ms = now_ms - max(
-            discovery_ms * 2,
-            int(max(0, float(config["watch_initial_replay_seconds"])) * 1000),
-        )
+        runtime.cold_discovery_ran_this_scan = True
         discovered: dict[str, Path] = {}
         for root_name in ("sessions", "archived_sessions"):
             discovery_root = runtime.codex_home / root_name
@@ -1420,7 +1483,8 @@ def recent_rollouts(runtime: Runtime, config: dict[str, Any], now_ms: int) -> li
                     if now_ms - path.stat().st_mtime_ns // 1_000_000 <= replay_ms:
                         runtime.watch_force_replay_paths.add(key)
         runtime.watch_discovery_cache = discovered
-        runtime.last_watch_discovery_ms = now_ms
+        # Measure cadence from completion, not from the start of a slow walk.
+        runtime.last_watch_discovery_ms = unix_ms()
     for path in runtime.watch_discovery_cache.values():
         if path.is_file():
             found[str(path)] = path
@@ -1468,6 +1532,16 @@ def scan_rollout_file(
         offset = int(state.get("offset", 0) or 0)
         if offset < 0 or offset > stat.st_size:
             offset = stat.st_size
+        has_snapshot = "observed_size" in state and "observed_mtime_ns" in state
+        snapshot_unchanged = (
+            has_snapshot
+            and int(state.get("observed_size", -1)) == stat.st_size
+            and int(state.get("observed_mtime_ns", -1)) == stat.st_mtime_ns
+        )
+        # Rollouts are append-only. offset==size is also a safe no-op for
+        # legacy cursors that predate snapshot metadata.
+        if snapshot_unchanged or (not has_snapshot and offset == stat.st_size):
+            return 0
     try:
         with path.open("rb") as handle:
             handle.seek(offset)
@@ -1480,7 +1554,14 @@ def scan_rollout_file(
             return 0
         atomic_write_json(
             state_path,
-            {"schema": 1, "rollout_path": str(path), "offset": offset, "seen_unix_ms": now_ms},
+            {
+                "schema": 1,
+                "rollout_path": str(path),
+                "offset": offset,
+                "seen_unix_ms": now_ms,
+                "observed_size": stat.st_size,
+                "observed_mtime_ns": stat.st_mtime_ns,
+            },
         )
         return 0
     complete = data[: newline + 1]
@@ -1527,13 +1608,18 @@ def scan_rollout_file(
                 "completion-event-type": event_type,
                 "source": source,
             }
-            classification = event_classification(
-                runtime,
-                event,
-                thread_id,
-                str(runtime.codex_home),
-                str(runtime.sqlite_home),
-            )
+            if isinstance(source, str) and source.strip():
+                classification = "subagent" if source.strip().lower() == "subagent" else "root"
+            elif isinstance(source, dict) and source.get("subagent") is not None:
+                classification = "subagent"
+            else:
+                classification = event_classification(
+                    runtime,
+                    event,
+                    thread_id,
+                    str(runtime.codex_home),
+                    str(runtime.sqlite_home),
+                )
             origin = originator or platform.node() or "Codex"
             record = new_record(
                 event,
@@ -1570,6 +1656,8 @@ def scan_rollout_file(
             "offset": new_offset,
             "seen_unix_ms": now_ms,
             "thread_id": thread_id,
+            "observed_size": stat.st_size,
+            "observed_mtime_ns": stat.st_mtime_ns,
         },
     )
     return queued
@@ -1777,6 +1865,27 @@ def clean_runtime_state(runtime: Runtime, receipt_retention_days: int, dead_rete
         with contextlib.suppress(OSError):
             if path.stat().st_mtime < dead_cutoff:
                 path.unlink()
+    for path in runtime.state_root.glob("mutation-*.lock"):
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def clear_synthetic_test_state(runtime: Runtime) -> int:
+    """Remove only records created by the explicit --test/-Test command."""
+    runtime.ensure()
+    removed = 0
+    for directory in (runtime.pending, runtime.outbox, runtime.sent, runtime.suppressed, runtime.dead):
+        for path in directory.glob("*.json"):
+            try:
+                record = read_json(path)
+                if not isinstance(record, dict) or str(record.get("thread_id", "")) != SYNTHETIC_TEST_THREAD_ID:
+                    continue
+                path.unlink()
+                removed += 1
+            except (OSError, json.JSONDecodeError):
+                # Never infer test state from a filename or free-form message.
+                continue
+    return removed
 
 
 def validate_record(record: Any, expected_key: str) -> dict[str, Any]:
@@ -1911,6 +2020,10 @@ def scan_worker(runtime: Runtime, *, continuous: bool, parent_pid: int, parent_t
                     parent_token=parent_token,
                 )
                 completed = utc_now()
+                if runtime.cold_discovery_ran_this_scan:
+                    completed_ms = unix_ms()
+                    runtime.last_watch_cursor_refresh_ms = completed_ms
+                    runtime.last_watch_discovery_ms = completed_ms
                 duration_ms = max(0, int((completed - started).total_seconds() * 1000))
                 write_scan_health(
                     runtime,
@@ -2093,7 +2206,7 @@ def worker(
                     continue
                 if suppressed_receipt.exists():
                     receipt_data = read_json(suppressed_receipt)
-                    if str(record.get("source_event", "")) == "Stop" and receipt_data.get("reason") == "technical-turn":
+                    if str(record.get("source_event", "")) == "Stop" and receipt_data.get("reason") in ("technical-turn", "unverifiable"):
                         suppressed_receipt.unlink(missing_ok=True)
                     else:
                         path.unlink(missing_ok=True)
@@ -2215,9 +2328,21 @@ def doctor(runtime: Runtime) -> int:
     runtime.ensure()
     config = load_config(runtime)
     outbox_files = list(runtime.outbox.glob("*.json"))
+    pending_files = list(runtime.pending.glob("*.json"))
     oldest_queued_seconds = 0.0
     if outbox_files:
         oldest_queued_seconds = round(max(0.0, time.time() - min(path.stat().st_mtime for path in outbox_files)), 1)
+    oldest_pending_seconds = 0.0
+    pending_reasons: dict[str, int] = {}
+    if pending_files:
+        oldest_pending_seconds = round(max(0.0, time.time() - min(path.stat().st_ctime for path in pending_files)), 1)
+        for path in pending_files:
+            reason = "invalid"
+            with contextlib.suppress(OSError, json.JSONDecodeError, TypeError):
+                value = read_json(path)
+                if isinstance(value, dict):
+                    reason = str(value.get("idle_reason", "") or "new")
+            pending_reasons[reason] = pending_reasons.get(reason, 0) + 1
     scan_health: dict[str, Any] = {}
     with contextlib.suppress(OSError, json.JSONDecodeError, TypeError):
         value = read_json(runtime.scan_health_path)
@@ -2242,7 +2367,10 @@ def doctor(runtime: Runtime) -> int:
                     else "anonymous"
                 ),
                 "state_dir": str(runtime.state_root),
-                "pending_idle": sum(1 for _ in runtime.pending.glob("*.json")),
+                "pending_idle": len(pending_files),
+                "pending": len(pending_files),
+                "oldest_pending_seconds": oldest_pending_seconds,
+                "pending_reasons": pending_reasons,
                 "queued": len(outbox_files),
                 "oldest_queued_seconds": oldest_queued_seconds,
                 "watch_scan_status": str(scan_health.get("status", "unknown")),
@@ -2257,6 +2385,8 @@ def doctor(runtime: Runtime) -> int:
                 "dead_retention_days": config["dead_retention_days"],
                 "idle_detection_mode": config["idle_detection_mode"],
                 "idle_grace_seconds": config["idle_grace_seconds"],
+                "idle_probe_grace_seconds": config["idle_probe_grace_seconds"],
+                "unknown_retry_max_seconds": config["unknown_retry_max_seconds"],
                 "goal_aware": config["goal_aware"],
                 "watch_rollouts": config["watch_rollouts"],
             },
@@ -2282,6 +2412,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-parent-token", default="", help=argparse.SUPPRESS)
     parser.add_argument("--no-spawn", action="store_true")
     parser.add_argument("--doctor", action="store_true")
+    parser.add_argument("--cleanup-test-state", action="store_true", help="Remove local receipts/queue records created by --test")
     parser.add_argument("--classify", action="store_true", help="Classify one hook payload without queueing or network access")
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=2)
@@ -2296,6 +2427,9 @@ def main(argv: list[str] | None = None) -> int:
         runtime.ensure()
         if args.doctor:
             return doctor(runtime)
+        if args.cleanup_test_state:
+            print(clear_synthetic_test_state(runtime))
+            return 0
         if args.scan_rollouts:
             return scan_worker(
                 runtime,
@@ -2320,7 +2454,7 @@ def main(argv: list[str] | None = None) -> int:
             raw = compact_json(
                 {
                     "type": "agent-turn-complete",
-                    "thread-id": "00000000-0000-4000-8000-000000000001",
+                    "thread-id": SYNTHETIC_TEST_THREAD_ID,
                     "turn-id": str(uuid.uuid4()),
                     "cwd": os.getcwd(),
                     "last-assistant-message": "Test codex-ntfy-notifier: delivery, queueing, and deduplication work.",

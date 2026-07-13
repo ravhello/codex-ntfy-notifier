@@ -24,7 +24,7 @@ tail -n 40 "$HOME/.codex/ntfy-state/notify.log"
 
 The doctor output does not print the topic or credentials. Check:
 
-- `version` is `2.4.2` or a newer compatible release;
+- `version` is `2.4.3` or a newer compatible release;
 - `topic_configured` is `true`;
 - `idle_detection_mode` is `strict` when intermediate notifications must never be sent;
 - `goal_aware` and `watch_rollouts` are `true`;
@@ -43,7 +43,7 @@ The explicit test bypasses idle detection and sends a real notification:
 python3 "$HOME/.codex/notify-ntfy.py" --test
 ```
 
-Use `-Test`/`--test` only when publishing to the configured topic is acceptable. A successful test proves delivery, not hook or idle detection.
+Use `-Test`/`--test` only when publishing to the configured topic is acceptable. A successful test proves delivery, not hook or idle detection. The version 2.4.3 Windows/WSL installer removes only local queue/receipt records explicitly marked as synthetic tests during upgrade; it cannot retract a notification already accepted by ntfy.
 
 ## Understand pending versus queued
 
@@ -108,6 +108,20 @@ Pure cloud tasks that do not mirror lifecycle state into the local environment c
 
 On Windows, an exceptionally large legacy payload can fail before the notifier process launches. The continuous rollout watcher can recover it only when a local `task_complete` or `turn_aborted` was persisted.
 
+## Notifications are unusually late
+
+Version 2.4.3 keeps the persistent Windows local scanner off the historical recursive path: it follows active and recently resumed rollout paths from Codex's read-only SQLite index and checks hot current-day files. This removes the repeated full-tree walk that reached 23 GB in the installation where the regression was found. UNC/WSL recovery runs in a different timeout-bounded process, and large local rollout lifecycle checks use a native streaming summary instead of line-by-line PowerShell JSON replay. A full recursive archive walk occurs only when an operator explicitly runs the manual all-scope scanner. Remote SSH installs have their own host-local worker and queue, so they cannot block the local Windows delivery path.
+
+Check the scheduled task action and scanner health without printing private state:
+
+```powershell
+(Get-ScheduledTask -TaskName CodexNtfyWatcher).Actions | Select-Object Execute, Arguments
+Get-Content "$HOME\.codex\ntfy-state\watch-health.json" -Raw | ConvertFrom-Json | Select-Object status, last_completed_at, duration_ms
+Get-Content "$HOME\.codex\ntfy-state\remote-watch-health.json" -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json | Select-Object status, last_completed_at, duration_ms
+```
+
+The task should execute `wscript.exe` with `watch-codex-ntfy-hidden.vbs`; that VBS supervises `notify-ntfy.ps1` directly and avoids two cold PowerShell launcher starts. Reinstall 2.4.3 if the action still points to the old PowerShell wrapper. A slow or timed-out remote health record should not delay a healthy local scan or an already queued delivery. Maintenance waits at least 60 seconds and starts only after delivery and the applicable scanners report readiness, so cleanup should not be the startup bottleneck.
+
 ## A candidate remains pending
 
 Inspect the sanitized log first. Common idle reasons are:
@@ -120,9 +134,9 @@ Inspect the sanitized log first. Common idle reasons are:
 | `subagents-active` | At least one descendant rollout still looks active. | Let the descendant finish; check stale-child policy if it crashed. |
 | `probe-incomplete` | Matching local rollout evidence is missing or unreadable. | Verify the real Codex/session paths and upstream state format. |
 
-### Strict mode waits indefinitely
+### Strict mode suppresses unverifiable evidence
 
-This is intentional for unresolved root classification or missing matching rollout completion. `strict` has no timed fail-open. It prefers no notification over a false final notification.
+This is intentional for unresolved root classification or missing matching rollout completion. `strict` retries unknown evidence with exponential intervals capped by `unknown_retry_max_seconds`, then writes an `unverifiable` suppressed receipt after `idle_probe_grace_seconds`. It never uses the timeout as permission to notify.
 
 Check:
 
@@ -138,7 +152,7 @@ If that environment cannot retain usable rollout evidence, `idle_detection_mode:
 
 With `goal_aware: true`, `active` blocks notification. Other observed statuses, including `complete`, `paused`, `blocked`, `usage_limited`, and `budget_limited`, are non-running and do not block.
 
-These terminal states still control whether a task is running, but version 2.4.2 deliberately omits lifecycle status from the notification title to save space. The title identifies only the task or project.
+These terminal states still control whether a task is running, but since version 2.4.2 the notification title deliberately omits lifecycle status to save space. The title identifies only the task or project.
 
 The notifier reads only the goal status. If a stale upstream goal is permanently `active`, correct/finish the task state. Setting `goal_aware: false` is possible but weakens the final-only guarantee.
 
@@ -152,7 +166,7 @@ Lowering that timeout can notify while a genuinely long-running child is still a
 
 Confirm all of the following:
 
-- doctor reports version 2.4.2+ and `idle_detection_mode: "strict"`;
+- doctor reports version 2.4.3+ and `idle_detection_mode: "strict"`;
 - the alert comes from this installation/topic rather than an older custom hook or another notifier;
 - old managed notifier handlers are not still registered under `UserPromptSubmit`, `SubagentStop`, or another hook event;
 - only one intended `notify-ntfy` `Stop` group exists per environment;
@@ -160,7 +174,7 @@ Confirm all of the following:
 - `suppress_subagents` and `suppress_technical_turns` are `true`;
 - Windows, WSL, and SSH environments are not publishing to the same topic through separate old installations.
 
-Per-thread coalescing writes older candidates to `suppressed/` with reason `superseded`. Known descendants use reason `subagent`; non-user-facing legacy/watcher turns use `technical-turn`. Those receipts are expected and are not sent.
+Per-thread coalescing writes older candidates to `suppressed/` with reason `superseded`; this includes a predecessor followed by a later open task. Known descendants use reason `subagent`, non-user-facing legacy/watcher turns use `technical-turn`, and evidence still unknown after the strict probe window uses `unverifiable`. Those receipts are expected and are not sent.
 
 If `balanced` is enabled, a fallback after `idle_probe_grace_seconds` can be premature. Switch back to `strict`.
 
@@ -171,7 +185,7 @@ Separate detection from delivery:
 1. If `pending_idle > 0`, use the pending guidance above.
 2. If `queued > 0`, inspect worker/network/authentication.
 3. If `sent_receipts` increased, ntfy accepted the event; inspect topic, client subscription, client privacy, and server retention.
-4. If only `suppressed` increased, the candidate was classified as subagent, technical, or superseded.
+4. If only `suppressed` increased, inspect the compact reason: the candidate was classified as subagent, technical, superseded, or unverifiable.
 5. If no state changed, verify hooks, continuous watcher, and local rollout availability.
 
 A terminal goal status makes an otherwise matching candidate eligible; it does not synthesize a missing thread/turn identity on its own. The rollout watcher is the recovery source for a persisted completion whose hook signal was lost.
@@ -200,6 +214,8 @@ systemctl --user is-active codex-ntfy.service
 An on-demand worker drains known queues but cannot continuously discover a hook that never ran. For missed-hook recovery, keep the scheduled task or systemd user service active.
 
 Only one worker per state directory acquires `worker.lock`. A second worker exiting immediately is expected.
+
+On Windows, the scheduled task action should be `wscript.exe //B //Nologo ...watch-codex-ntfy-hidden.vbs`. The hidden VBS is the supervisor and directly launches the continuous notifier; an action that still starts `watch-codex-ntfy.ps1` through PowerShell is stale and should be replaced by rerunning the current installer.
 
 ### Authentication or authorization fails
 
@@ -268,7 +284,7 @@ printf '%s\n' "$WSL_DISTRO_NAME"
 
 Run Windows and WSL doctor commands separately. Install into the exact distribution name returned by `wsl.exe -l -q`; configuring one distribution does not configure another. Review `/hooks` inside the affected WSL Codex environment.
 
-The Windows scheduled watcher scans its Windows `CODEX_HOME` plus WSL roots registered by `install.ps1 -WslDistro`. Check the private config's `watch_roots` entries when both WSL hooks were missed. Each entry must point to the correct distribution Codex root and, when different, `sqlite_path`; reinstall that distribution to refresh them. Unregistered distributions are intentionally not crawled.
+The Windows scheduled watcher covers its Windows `CODEX_HOME` plus WSL roots registered by `install.ps1 -WslDistro`. Its persistent local path obtains recent rollout paths from the Codex SQLite index and hot current-day directories without repeatedly walking the complete local session archive. UNC/WSL roots run in an isolated one-shot scanner, inspect their own remote cursors independently, and are terminated after `watch_remote_timeout_seconds`, so an unavailable distro cannot stall local recovery or delivery. Check the private config's `watch_roots` entries when both WSL hooks were missed. Each entry must point to the correct distribution Codex root and, when different, `sqlite_path`; reinstall that distribution to refresh them. Unregistered distributions are intentionally not crawled.
 
 ## Remote SSH checks
 
@@ -291,7 +307,7 @@ Without a persistent service, hook-driven on-demand delivery still works, but au
 
 ## Notification content looks wrong
 
-- The 2.4.2 JSON title is only `<task-or-project>`. With the default single `white_check_mark` tag, ntfy displays one completion emoji before it. `Codex`, `done`, model names, and lifecycle status are intentionally absent.
+- Since 2.4.2, the JSON title is only `<conversation-or-project>`. With the default single `white_check_mark` tag, the complete visible title is one status emoji plus that title. `Codex`, `done`, model names, lifecycle text, and duplicate emoji are intentionally absent.
 - The default body is one plain-text line, `<origin> · #<thread8>`, without `Project:`, `Source:`, or `Thread:` labels. A project is prepended only when a distinct task title occupies the title, or a sanitized path is added when full-path output is enabled.
 - Keep `include_message: false` unless the final assistant response should be captured and sent. With it enabled, the excerpt is prepended to the context and `max_message_chars` defaults to 180.
 - Keep `include_full_path: false` to avoid sending the sanitized working-directory path.

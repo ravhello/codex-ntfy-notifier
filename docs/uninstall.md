@@ -1,6 +1,6 @@
 # Uninstall and rollback
 
-These procedures apply to version 2.4.2. They are intentionally explicit because `~/.codex` also belongs to Codex; never remove that whole directory.
+These procedures apply to version 2.4.3. They are intentionally explicit because `~/.codex` also belongs to Codex; never remove that whole directory.
 
 An **uninstall** removes only this project’s managed `notify` command, `notify-ntfy` hook handlers, scripts, and worker while preserving unrelated Codex settings and hooks. A **rollback** restores the timestamped snapshot taken immediately before a particular installation or upgrade. Decide which outcome is wanted before deleting anything.
 
@@ -244,7 +244,7 @@ if (Test-Path -LiteralPath $SavedTask -PathType Leaf) {
 
 This full rollback restores or removes `hooks.json` exactly as captured. Do not use it when later unrelated hooks must survive; use the selective handler cleanup instead.
 
-Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.4.2 uses record schema 1 and retains the `pending/` and `watch/` state introduced in 2.4.0; compatibility with an arbitrary older build is not guaranteed.
+Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.4.3 uses record schema 1 and retains the `pending/` and `watch/` state introduced in 2.4.0; compatibility with an arbitrary older build is not guaranteed.
 
 Remote Windows backups use the same scheduled-task XML snapshot. The installer refuses to overwrite a task named `CodexNtfyWatcher` unless its action belongs to this project, and an installation failure restores the prior definition and running state automatically.
 
@@ -371,7 +371,7 @@ systemctl --user daemon-reload 2>/dev/null || true
 systemctl --user reset-failed codex-ntfy.service 2>/dev/null || true
 ```
 
-An on-demand worker normally exits when both `pending/` and `outbox/` are empty. In strict mode, incomplete evidence can keep it alive. To stop one deliberately, first review matching processes, then terminate them:
+An on-demand worker normally exits when both `pending/` and `outbox/` are empty. A genuinely busy task can keep a pending record alive; unknown evidence is instead suppressed after `idle_probe_grace_seconds` in strict mode. To stop a worker deliberately, first review matching processes, then terminate them:
 
 ```sh
 pgrep -af 'notify-ntfy.py.*--worker' || true

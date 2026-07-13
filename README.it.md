@@ -20,6 +20,7 @@ Una sola notifica push ntfy compatta quando una task root locale di OpenAI Codex
 - **Idle-aware:** la task root deve risultare inattiva da prove locali; turni intermedi, goal attivi e subagent ancora in esecuzione mantengono la notifica in attesa.
 - **Consegna durevole:** outbox atomica, deduplicazione stabile e retry con backoff forniscono consegna at-least-once dopo la conferma di idle.
 - **Multi-ambiente:** lo stesso classificatore supporta app Codex, VS Code, CLI, Windows, WSL, Linux nativo e installazioni Remote SSH locali all'host.
+- **Recovery rapido e isolato:** su Windows lo scanner locale persistente segue le entry recenti di Codex in SQLite invece di ripercorrere ogni volta tutto l'archivio delle sessioni; il recovery UNC/WSL gira separatamente e non blocca la consegna locale. Le installazioni Remote SSH mantengono worker e coda sull'host remoto.
 - **Privacy predefinita:** prompt e messaggi finali sono esclusi; titolo della task, estratto del messaggio e percorso completo richiedono ciascuno un opt-in esplicito.
 
 ## Avvio rapido
@@ -89,15 +90,17 @@ python3 ~/.codex/notify-ntfy.py --test
 
 Una singola task Codex può produrre più segnali di fine turno mentre ha ancora lavoro: può partire subito una continuazione automatica, il goal può essere ancora `active` oppure un subagent può stare lavorando. Inviare ogni segnale crea notifiche “completato” premature.
 
-La versione 2.4 ha introdotto il **periodo di idle logico** mantenuto dalla 2.4.2:
+La versione 2.4 ha introdotto il **periodo di idle logico** mantenuto dalla 2.4.3:
 
 - l’hook moderno Codex `Stop` crea un candidato, ma non pubblica direttamente;
 - la notifica legacy `agent-turn-complete` rimane come segnale di compatibilità;
 - il watcher continuo dei rollout recupera completion perse dagli hook quando osserva lo stesso `CODEX_HOME`;
+- su Windows il watcher locale persistente ottiene i rollout attivi o ripresi di recente dall'indice SQLite Codex in sola lettura e controlla soltanto i percorsi correnti più caldi; il percorso continuo non ripete scansioni ricorsive di alberi `sessions/` e `archived_sessions/` da molti gigabyte;
+- il recovery fallback UNC/WSL usa uno scanner separato con timeout, quindi una distro sospesa o una share lenta non ritarda lo scanner locale né una consegna ntfy già pronta;
 - ogni candidato entra prima in `pending/`;
-- l’idle gate verifica che lo stesso turno sia completo, che non sia iniziato un turno successivo, che il goal non sia più attivo, che i discendenti abbiano finito e che il rollout sia rimasto quieto per una breve finestra;
-- i candidati ancora pending della stessa chat root vengono consolidati: sopravvive soltanto la completion idonea più recente, mentre un’epoca già promossa nell’outbox resta immutabile;
-- la modalità predefinita `strict` è fail-closed: se manca una prova locale, la notifica aspetta invece di annunciare prematuramente la fine.
+- l’idle gate verifica che lo stesso turno sia completo, che non sia iniziato un turno successivo, che il goal non sia più attivo, che i discendenti abbiano finito e che il rollout sia rimasto quieto per una breve finestra; su Windows un riepilogo nativo in streaming evita di rileggere un rollout grande riga per riga in PowerShell;
+- i candidati ancora pending della stessa chat root vengono consolidati; una completion seguita da una task successiva ancora aperta viene soppressa come predecessore superato, mentre un’epoca già promossa nell’outbox resta immutabile;
+- la modalità predefinita `strict` non fa mai fail-open: ritenta le prove mancanti per `idle_probe_grace_seconds`, poi sopprime localmente un candidato non verificabile invece di annunciare prematuramente la fine.
 
 Dopo la conferma di idle, il motore di consegna:
 
@@ -111,14 +114,14 @@ La garanzia di consegna è **at-least-once durevole**, non exactly-once transazi
 
 ## Titolo minimo della notifica
 
-La versione 2.4.2 mantiene la regola idle-only della 2.4 ed elimina ogni prefisso ridondante dal titolo:
+Dalla versione 2.4.2, la regola idle-only della 2.4 usa un titolo senza prefissi ridondanti:
 
 ```text
-Titolo visibile: ✅ <task-o-progetto>
+Titolo visibile: ✅ <conversazione-o-progetto>
 Corpo:  [messaggio finale ·] [progetto ·] origine · #thread8
 ```
 
-Il campo JSON `title` contiene soltanto il titolo locale della task, oppure la directory progetto quando la condivisione del titolo è disattivata o non disponibile. Il titolo viene risolto tramite ID esatto dal database di stato Codex aperto in sola lettura e, come fallback di compatibilità, dall'indice locale delle sessioni. L'unico tag predefinito `white_check_mark` fornisce la sola emoji di completamento mostrata da ntfy: il notifier non aggiunge `Codex`, `done`, il nome del modello, uno stato testuale o altre emoji decorative. Se `include_thread_title: true` abilita un titolo locale disponibile e distinto dal progetto, il progetto passa nel corpo per non essere duplicato né perso.
+Il titolo visibile è composto esattamente da una sola emoji di completamento/stato resa da ntfy e dal titolo locale della conversazione, oppure dalla directory progetto quando la condivisione del titolo è disattivata o non disponibile. Il campo JSON `title` contiene soltanto quel valore testuale. Il titolo viene risolto tramite ID esatto dal database di stato Codex aperto in sola lettura e, come fallback di compatibilità, dall'indice locale delle sessioni. L'unico tag predefinito `white_check_mark` fornisce l'emoji: il notifier non aggiunge `Codex`, `done`, il nome del modello, uno stato testuale o altre emoji decorative. Se `include_thread_title: true` abilita un titolo locale disponibile e distinto dal progetto, il progetto passa nel corpo per non essere duplicato né perso.
 
 Con il default `markdown: false`, il corpo occupa una sola riga e il contesto non usa etichette come `Project:`, `Source:` o `Thread:`. Con il default privacy `include_message: false` contiene soltanto il progetto necessario (quando non è già nel titolo), l'origine e `#` seguito dai primi otto caratteri dell'ID della chat. Con `include_message: true` viene anteposto un estratto redatto del messaggio finale; `max_message_chars` vale 180 per default. L'intero campo ntfy `message` ha comunque un limite rigido di 3.500 byte UTF-8. Un opt-in esplicito a Markdown può conservare le righe dell'estratto opzionale.
 
@@ -147,10 +150,11 @@ L'avvio rapido Windows/WSL riportato sopra chiede il topic con input nascosto su
 
 1. crea la configurazione privata;
 2. salva un backup di rollback;
-3. installa il worker `CodexNtfyWatcher`;
-4. conserva o installa `notify` come fallback legacy;
-5. registra `hooks.Stop` senza sostituire handler non gestiti dal progetto;
-6. installa bridge e fallback nativo WSL e registra nel watcher Windows le root Codex/SQLite della distribuzione.
+3. rimuove soltanto i record locali creati esplicitamente dal comando di test sintetico del notifier;
+4. installa il worker `CodexNtfyWatcher`; Utilità di pianificazione avvia direttamente il supervisore VBS nascosto, evitando due avvii PowerShell a freddo prima che il notifier sia pronto;
+5. conserva o installa `notify` come fallback legacy;
+6. registra `hooks.Stop` senza sostituire handler non gestiti dal progetto;
+7. installa bridge e fallback nativo WSL e registra nel watcher Windows le root Codex/SQLite della distribuzione.
 
 Per Windows senza WSL:
 
@@ -194,21 +198,24 @@ La configurazione privata è `~/.codex/ntfy-config.json`; vedere [ntfy-config.ex
 
 | Impostazione | Default | Significato |
 | --- | ---: | --- |
-| `idle_detection_mode` | `"strict"` | `strict` aspetta una prova completa; `balanced` può usare il fallback temporale; `off` torna alla coda immediata per turno. |
+| `idle_detection_mode` | `"strict"` | `strict` non trasforma mai una prova mancante in notifica; `balanced` può usare il fallback temporale; `off` torna alla coda immediata per turno. |
 | `idle_grace_seconds` | `1.5` | Quiet time richiesto dopo la completion corrispondente. |
-| `idle_probe_grace_seconds` | `30` | Attesa prima del fallback di `balanced`; non indebolisce `strict`. |
+| `idle_probe_grace_seconds` | `30` | Finestra di verifica: alla scadenza `balanced` può accettare prove incomplete, mentre `strict` sopprime localmente il candidato non verificabile senza inviarlo. |
+| `unknown_retry_max_seconds` | `60` | Intervallo massimo tra i tentativi esponenziali quando la prova root o rollout resta sconosciuta. |
 | `goal_aware` | `true` | Trattiene il candidato finché il goal root è `active`. |
 | `goal_poll_seconds` | `1` | Intervallo di ricontrollo di goal, turno e discendenti. |
 | `subagent_orphan_seconds` | `1800` | Età dopo la quale un rollout figlio fermo non blocca per sempre. |
 | `suppress_technical_turns` | `true` | Sopprime completion legacy/watcher non rivolte all’utente; un `Stop` classificato come root resta candidato. |
 | `watch_rollouts` | `true` | Recupera completion persistite localmente ma perse dagli hook. |
-| `watch_scan_seconds` | `2` | Frequenza di scansione del worker continuo. |
-| `watch_discovery_seconds` | `60` | Frequenza della discovery ricorsiva limitata dei rollout recenti in directory vecchie o archiviate; i cursor esistenti sono sempre seguiti. |
+| `watch_scan_seconds` | `2` | Frequenza rapida per i rollout recenti modificati di recente. |
+| `watch_discovery_seconds` | `60` | Frequenza di refresh dei cursor storici e della discovery limitata in directory vecchie o archiviate; i cursor invariati non vengono riscritti. |
+| `watch_cursor_batch_size` | `64` | Numero Windows di rollout storici verificati per ciclo freddo; i metadati dei cursor impediscono comunque il replay della cronologia. |
+| `watch_remote_timeout_seconds` | `90` | Limite Windows per una scansione fallback UNC/WSL isolata; un blocco remoto non rallenta recovery locale o consegna. |
 | `watch_initial_replay_seconds` | `15` | Alla prima osservazione recupera solo una coda del rollout molto recente. |
 | `watch_roots` | `[]` | Root Codex aggiuntive osservate dal worker Windows; `install.ps1` gestisce quelle delle distribuzioni WSL selezionate, con root SQLite e origine. |
 | `worker_sqlite_path` | gestito dall'installer | Root SQLite locale usata dal watcher pianificato Windows se diversa da `CODEX_HOME`; gli installer remoti la reimpostano sulla destinazione. |
 
-Usare `strict` quando evitare falsi “finito” è la priorità. `balanced` privilegia la disponibilità dopo 30 secondi anche con prove incomplete e può quindi produrre un falso positivo. `off` è una modalità di compatibilità/diagnostica.
+Usare `strict` quando evitare falsi “finito” è la priorità. Ritenta le prove sconosciute con intervalli esponenziali limitati, poi registra localmente `unverifiable` al termine della finestra senza inviarlo a ntfy. `balanced` privilegia la disponibilità dopo 30 secondi anche con prove incomplete e può quindi produrre un falso positivo. `off` è una modalità di compatibilità/diagnostica.
 
 ### Privacy e consegna
 
@@ -273,7 +280,7 @@ Non cancellare `pending/` o `outbox/` durante un problema normale. Consultare [R
 ## Limiti noti
 
 - Gli hook moderni richiedono approvazione esplicita tramite `/hooks`.
-- `strict` può lasciare in attesa una vera completion se Codex non conserva più le prove locali necessarie.
+- `strict` sopprime localmente come `unverifiable` una vera completion se, trascorsi `idle_probe_grace_seconds`, Codex non conserva più le prove necessarie.
 - `balanced` può notificare con prova incompleta dopo il grace period.
 - I formati rollout e gli schemi SQLite locali appartengono a Codex e possono cambiare.
 - Un figlio abbandonato smette di bloccare dopo `subagent_orphan_seconds`.

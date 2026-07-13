@@ -38,7 +38,11 @@ native_notifier="$script_dir/notify-ntfy.py"
 native_python="$(command -v python3 2>/dev/null || true)"
 session_classification="unknown"
 if [ -x "$native_notifier" ] && [ -n "$native_python" ]; then
-  detected="$(printf '%s' "$payload" | "$native_python" "$native_notifier" --classify --kick-worker --read-stdin 2>/dev/null || true)"
+  # Classification must be side-effect free. Kicking the native worker here
+  # used to flush old fallback/test queues even when the Windows bridge below
+  # succeeded. The fallback notifier starts its worker only after it queues the
+  # current event.
+  detected="$(printf '%s' "$payload" | "$native_python" "$native_notifier" --classify --read-stdin 2>/dev/null || true)"
   case "$detected" in
     subagent)
       session_classification="subagent"

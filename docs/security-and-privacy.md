@@ -1,6 +1,6 @@
 # Security and privacy
 
-Durable Codex ntfy notifier 2.4.2 is an unofficial local hook and worker that reads local Codex lifecycle metadata and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, Codex state, notifier state, and backups as private data.
+Durable Codex ntfy notifier 2.4.3 is an unofficial local hook and worker that reads local Codex lifecycle metadata and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, Codex state, notifier state, and backups as private data.
 
 ## Privacy defaults
 
@@ -20,6 +20,8 @@ Fresh installations use:
   "suppress_subagents": true,
   "suppress_technical_turns": true,
   "idle_detection_mode": "strict",
+  "idle_probe_grace_seconds": 30,
+  "unknown_retry_max_seconds": 60,
   "goal_aware": true,
   "watch_rollouts": true,
   "allow_insecure_auth": false,
@@ -29,7 +31,7 @@ Fresh installations use:
 
 The installers migrate existing private configuration conservatively and do not print secrets. Review content-related settings after any upgrade from a private or older public build.
 
-`strict` is also the privacy/conservatism default for behavior: when root classification or matching rollout evidence is unresolved, the candidate stays local instead of becoming an uncertain network notification.
+`strict` is also the privacy/conservatism default for behavior: unresolved root classification or matching rollout evidence is retried locally, then becomes an `unverifiable` suppressed receipt after `idle_probe_grace_seconds` instead of an uncertain network notification. Time alone never promotes it.
 
 ## Local data read for idle detection
 
@@ -179,7 +181,7 @@ Prefer a host-specific publish-only token. Verify a new host interactively befor
 
 Defaults are 14 days for sent/suppressed receipts and 30 days for dead letters. Cleanup runs when a worker starts.
 
-Pending idle candidates and network-ready outbox records have no time-based expiry because silently dropping an unfinished/offline notification would violate the delivery goal. Watch cursors persist so scans can resume without replaying old rollout history. In `strict` mode, a candidate with permanently missing evidence can therefore remain on disk until corrected or deliberately removed.
+Busy pending candidates and network-ready outbox records have no time-based expiry because silently dropping an unfinished/offline notification would violate the delivery goal. Unknown evidence is different: in `strict` mode it is retried locally only through `idle_probe_grace_seconds`, then reduced to an `unverifiable` suppressed receipt and never sent. Watch cursors persist so scans can resume without replaying old rollout history; unchanged cursor files are not rewritten.
 
 For deliberate local erasure:
 

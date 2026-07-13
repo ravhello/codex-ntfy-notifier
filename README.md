@@ -20,6 +20,7 @@ One compact ntfy push when a local OpenAI Codex root task is verifiably idle—n
 - **Idle-aware:** the root task must be locally verifiable as idle; intermediate turns, active goals, and running subagents keep the notification pending.
 - **Durable delivery:** an atomic outbox, stable deduplication, and retry with backoff provide at-least-once delivery after idle confirmation.
 - **Multi-environment:** the same classifier supports Codex app, VS Code, CLI, Windows, WSL, native Linux, and host-local Remote SSH installs.
+- **Fast isolated recovery:** on Windows, the persistent local scanner follows recent Codex SQLite entries instead of repeatedly walking the full session archive, while UNC/WSL recovery runs separately and cannot block local delivery. Remote SSH installs keep their worker and queue on the remote host.
 - **Privacy by default:** prompts and final messages are excluded; task titles, message excerpts, and full paths each require an explicit opt-in.
 
 ## Quick start
@@ -89,15 +90,17 @@ python3 ~/.codex/notify-ntfy.py --test
 
 Codex may emit several turn-completion signals while one task is still progressing: an automatic continuation can start immediately, a goal can remain active, or a delegated subagent can still be working. Publishing every signal produces noisy “finished” notifications that are not actually final.
 
-Version 2.4 introduced the logical **idle epoch** used by 2.4.2:
+Version 2.4 introduced the logical **idle epoch** used by 2.4.3:
 
 - the modern Codex `Stop` hook contributes a candidate; it never publishes directly;
 - the legacy `agent-turn-complete` notification remains a compatibility signal;
 - a continuous rollout watcher can recover a completion missed by either hook when it watches that same `CODEX_HOME`;
+- on Windows, the persistent local watcher obtains active and recently resumed rollout paths from Codex's read-only SQLite index and checks only hot current-day paths; its continuous path does not recursively rescan a multi-gigabyte `sessions/` and `archived_sessions/` tree;
+- UNC/WSL fallback recovery runs as a separate timeout-bounded scanner, so a suspended distro or slow share cannot delay the local scanner or an already-ready ntfy delivery;
 - candidates first enter a private `pending/` area;
-- the idle gate confirms the same turn completed, no later turn is open, any goal is no longer active, descendants are no longer running, and the rollout stayed quiet for a short settling window;
-- pending candidates for one root thread are coalesced, so only its newest eligible completion survives; an already promoted outbox epoch remains immutable;
-- `strict` mode fails closed when the local evidence is incomplete: an uncertain notification waits instead of becoming a false “done” alert.
+- the idle gate confirms the same turn completed, no later turn is open, any goal is no longer active, descendants are no longer running, and the rollout stayed quiet for a short settling window; on Windows, a native streaming lifecycle summary avoids replaying a large rollout line by line in PowerShell;
+- pending candidates for one root thread are coalesced, and a completion followed by a later open task is suppressed as an obsolete predecessor; an already promoted outbox epoch remains immutable;
+- `strict` mode never fails open: incomplete evidence is retried during `idle_probe_grace_seconds`, then an unverifiable candidate is suppressed locally instead of becoming a false “done” alert.
 
 After the idle gate, the existing durable delivery engine takes over:
 
@@ -112,14 +115,14 @@ The delivery guarantee after idle confirmation is **durable at-least-once**, not
 
 ## Minimal notification title
 
-Version 2.4.2 keeps the 2.4 idle-only delivery rule and removes every redundant title prefix:
+Since version 2.4.2, the 2.4 idle-only delivery rule uses a title without redundant prefixes:
 
 ```text
-Visible title: ✅ <task-or-project>
+Visible title: ✅ <conversation-or-project>
 Body:  [final message ·] [project ·] origin · #thread8
 ```
 
-The JSON `title` contains only the local task title, or the project directory when task-title sharing is disabled or unavailable. The title is resolved by exact thread ID from the read-only Codex state database, then from the local session index as a compatibility fallback. The single default `white_check_mark` tag supplies the one completion emoji displayed by ntfy; the notifier does not add `Codex`, `done`, a model name, a status label, or another decorative emoji. If `include_thread_title: true` opts into an available local task title and that title differs from the project, the project moves into the body so the location is not duplicated or lost.
+The visible title is exactly one completion/status emoji supplied by ntfy plus the local conversation title, or the project directory when task-title sharing is disabled or unavailable. The JSON `title` contains only that text value. It is resolved by exact thread ID from the read-only Codex state database, then from the local session index as a compatibility fallback. The single default `white_check_mark` tag supplies the emoji; the notifier does not add `Codex`, `done`, a model name, a status label, or another decorative emoji. If `include_thread_title: true` opts into an available local task title and that title differs from the project, the project moves into the body so the location is not duplicated or lost.
 
 With the default `markdown: false`, the body is one line and its context has no labels such as `Project:`, `Source:`, or `Thread:`. With the privacy default `include_message: false`, it contains only the necessary project (when not already in the title), origin, and `#` plus the first eight thread-ID characters. With `include_message: true`, a redacted final-message excerpt is prepended; `max_message_chars` defaults to 180. The complete ntfy `message` is hard-capped at 3,500 UTF-8 bytes regardless of that character setting. An explicit Markdown opt-in can preserve lines in the optional excerpt.
 
@@ -153,10 +156,11 @@ The Windows/WSL quick start above prompts for the topic with hidden input on a f
 
 1. creates `~/.codex/ntfy-config.json` with private ACLs;
 2. makes a timestamped rollback backup in `~/.codex/ntfy-backups`;
-3. installs the durable Windows worker as `CodexNtfyWatcher`;
-4. preserves or installs the root-level legacy `notify` command;
-5. registers the managed modern `hooks.Stop` command without replacing unrelated hook handlers;
-6. installs the WSL classifier, bridge, and native fallback, then registers that distribution's Codex/SQLite roots with the Windows recovery watcher.
+3. removes only local records explicitly created by the notifier's synthetic test command;
+4. installs the durable Windows worker as `CodexNtfyWatcher`; Task Scheduler launches its hidden VBS supervisor directly, avoiding two cold PowerShell launcher starts before the notifier can become ready;
+5. preserves or installs the root-level legacy `notify` command;
+6. registers the managed modern `hooks.Stop` command without replacing unrelated hook handlers;
+7. installs the WSL classifier, bridge, and native fallback, then registers that distribution's Codex/SQLite roots with the Windows recovery watcher.
 
 For Windows without WSL:
 
@@ -207,21 +211,24 @@ The private configuration lives at `~/.codex/ntfy-config.json`. Start from [ntfy
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
-| `idle_detection_mode` | `"strict"` | `strict` waits on missing evidence; `balanced` may fall back after the probe grace period; `off` restores immediate per-turn queueing. |
+| `idle_detection_mode` | `"strict"` | `strict` never turns missing evidence into a notification; `balanced` may fall back after the probe grace period; `off` restores immediate per-turn queueing. |
 | `idle_grace_seconds` | `1.5` | Required quiet time after the matching completion before the task is considered idle. |
-| `idle_probe_grace_seconds` | `30` | Maximum wait before `balanced` accepts incomplete rollout evidence. It does not weaken `strict`. |
+| `idle_probe_grace_seconds` | `30` | Evidence-probe window. At expiry, `balanced` may accept incomplete evidence; `strict` suppresses an unverifiable candidate locally and never sends it. |
+| `unknown_retry_max_seconds` | `60` | Maximum interval between exponential retries while root or rollout evidence remains unknown. |
 | `goal_aware` | `true` | Hold a candidate while the root task goal status is `active`. |
 | `goal_poll_seconds` | `1` | Poll cadence while goal, turn, or descendant state can still change. |
 | `subagent_orphan_seconds` | `1800` | Stop treating a stale child rollout as active after this interval. |
 | `suppress_technical_turns` | `true` | Suppress legacy/watcher completions that do not look like a user-facing root turn. Modern `Stop` candidates classified as root are retained. |
 | `watch_rollouts` | `true` | Let a continuous worker discover locally persisted completions missed by hooks. |
-| `watch_scan_seconds` | `2` | Continuous rollout scan cadence. |
-| `watch_discovery_seconds` | `60` | Cadence for a bounded recursive discovery of recently modified old-date and archived rollouts. Existing cursors are always followed. |
+| `watch_scan_seconds` | `2` | Fast cadence for hot, recently modified rollout files. |
+| `watch_discovery_seconds` | `60` | Cadence for refreshing historical cursors and bounded old-date/archive discovery. Unchanged cursor files are not rewritten. |
+| `watch_cursor_batch_size` | `64` | Windows-only number of historical rollout files probed per cold cycle; cursor metadata still prevents old-history replay. |
+| `watch_remote_timeout_seconds` | `90` | Windows-only limit for one isolated UNC/WSL fallback scan; remote stalls never block local recovery or delivery. |
 | `watch_initial_replay_seconds` | `15` | On first sight, replay only a very recent rollout tail instead of old history. |
 | `watch_roots` | `[]` | Additional Codex roots watched by the Windows worker. `install.ps1` manages entries for selected WSL distributions, including their SQLite root and source label. |
 | `worker_sqlite_path` | installer-managed | Host-local SQLite root used by the Windows scheduled watcher when it differs from `CODEX_HOME`; remote installers reset it for the destination. |
 
-Leave `strict` enabled when “no intermediate notifications” is more important than receiving a notification despite missing local evidence. `balanced` is an explicit availability/noise tradeoff. `off` is primarily a compatibility and diagnostic mode.
+Leave `strict` enabled when “no intermediate notifications” is more important than receiving a notification despite missing local evidence. It retries unknown evidence with bounded exponential intervals, then records `unverifiable` locally after the probe window; it never promotes that uncertainty to ntfy. `balanced` is an explicit availability/noise tradeoff. `off` is primarily a compatibility and diagnostic mode.
 
 ### Delivery and privacy
 
@@ -301,7 +308,7 @@ Read [Security and privacy](docs/security-and-privacy.md) before enabling messag
 ## Known limitations
 
 - Modern hooks require explicit user review through `/hooks`. The installer never edits the trust store.
-- `strict` mode intentionally keeps a candidate pending if the matching rollout, root classification, or completion evidence cannot be verified. This avoids a false final notification but can withhold a true one after an upstream format or storage change.
+- `strict` mode suppresses a candidate locally as `unverifiable` when matching rollout, root classification, or completion evidence is still missing after `idle_probe_grace_seconds`. This avoids a false final notification but can withhold a true one after an upstream format or storage change.
 - `balanced` can notify after `idle_probe_grace_seconds` when evidence stays incomplete, so it has a higher false-positive risk.
 - Rollout and local Codex database schemas are upstream implementation details and may require adapter updates.
 - A stale child is ignored after `subagent_orphan_seconds` so an abandoned rollout cannot block forever.

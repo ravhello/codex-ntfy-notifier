@@ -146,6 +146,7 @@ function New-PrivateConfigIfNeeded {
     $changed = (Add-ConfigDefault -Config $config -Name 'idle_detection_mode' -Value 'strict') -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'idle_grace_seconds' -Value 1.5) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'idle_probe_grace_seconds' -Value 30) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'unknown_retry_max_seconds' -Value 60) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'goal_aware' -Value $true) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'goal_poll_seconds' -Value 1) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'subagent_orphan_seconds' -Value 1800) -or $changed
@@ -153,6 +154,8 @@ function New-PrivateConfigIfNeeded {
     $changed = (Add-ConfigDefault -Config $config -Name 'watch_rollouts' -Value $true) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'watch_scan_seconds' -Value 2) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'watch_discovery_seconds' -Value 60) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'watch_cursor_batch_size' -Value 64) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'watch_remote_timeout_seconds' -Value 90) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'watch_initial_replay_seconds' -Value 15) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'watch_roots' -Value @()) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'worker_sqlite_path' -Value $workerSqlitePath) -or $changed
@@ -237,6 +240,7 @@ function New-PrivateConfigIfNeeded {
     idle_detection_mode = 'strict'
     idle_grace_seconds = 1.5
     idle_probe_grace_seconds = 30
+    unknown_retry_max_seconds = 60
     goal_aware = $true
     goal_poll_seconds = 1
     subagent_orphan_seconds = 1800
@@ -244,6 +248,8 @@ function New-PrivateConfigIfNeeded {
     watch_rollouts = $true
     watch_scan_seconds = 2
     watch_discovery_seconds = 60
+    watch_cursor_batch_size = 64
+    watch_remote_timeout_seconds = 90
     watch_initial_replay_seconds = 15
     watch_roots = @()
     worker_sqlite_path = $workerSqlitePath
@@ -497,7 +503,7 @@ function Stop-LegacyTask {
     $watchers = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -in @('powershell.exe', 'pwsh.exe', 'wscript.exe') -and
         ($_.CommandLine -match '(?i)watch-codex-ntfy(?:-hidden)?\.(?:ps1|vbs)' -or
-         $_.CommandLine -match '(?i)notify-ntfy\.ps1.*-(?:Worker|Continuous)(?:\s|$)')
+         $_.CommandLine -match '(?i)notify-ntfy\.ps1.*-(?:Worker|Continuous|ScanRollouts|Maintenance)(?:\s|$)')
       })
     if ($watchers.Count -eq 0) {
       return
@@ -507,6 +513,21 @@ function Stop-LegacyTask {
   foreach ($process in $watchers) {
     Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
   }
+  $ownedIds = @($watchers.ProcessId | Sort-Object -Unique)
+  $forcedDeadline = [DateTimeOffset]::UtcNow.AddSeconds(120)
+  do {
+    $aliveIds = @()
+    foreach ($ownedId in $ownedIds) {
+      try {
+        [System.Diagnostics.Process]::GetProcessById([int]$ownedId) | Out-Null
+        $aliveIds += $ownedId
+      } catch {
+      }
+    }
+    if ($aliveIds.Count -eq 0) { return }
+    Start-Sleep -Milliseconds 250
+  } while ([DateTimeOffset]::UtcNow -lt $forcedDeadline)
+  throw "Could not stop existing notifier process(es): $($aliveIds -join ', ')."
 }
 
 function Install-WindowsFiles {
@@ -521,6 +542,13 @@ function Install-WindowsFiles {
   }
   $state = Join-Path $HomePath 'ntfy-state'
   New-Item -ItemType Directory -Path $state -Force | Out-Null
+  # 2.4.2 and earlier left one zero-byte lock per completion. The worker is
+  # stopped while installing, so these obsolete lock names are safe to remove.
+  Get-ChildItem -LiteralPath $state -Filter 'mutation-*.lock' -File -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+  foreach ($healthName in @('worker-health.json', 'delivery-health.json', 'watch-health.json', 'remote-watch-health.json')) {
+    Remove-Item -LiteralPath (Join-Path $state $healthName) -Force -ErrorAction SilentlyContinue
+  }
   Protect-PrivatePath $state
 
   $scriptPath = Join-Path $HomePath 'notify-ntfy.ps1'
@@ -560,6 +588,28 @@ function Ensure-ScheduledWorker {
   $state = (Get-ScheduledTask -TaskName $TaskName).State
   if ($state -ne 'Running') {
     throw "Scheduled worker did not start (state: $state)."
+  }
+  $workerHealthPath = Join-Path (Join-Path $HomePath 'ntfy-state') 'worker-health.json'
+  $workerReady = $false
+  # PowerShell cold starts can be delayed substantially by AMSI/Defender on
+  # slower Windows hosts. The launcher now skips one PowerShell hop, but keep a
+  # generous verification window so installation does not roll back a healthy
+  # worker merely because process creation was temporarily slow.
+  $workerDeadline = [DateTimeOffset]::UtcNow.AddSeconds(240)
+  do {
+    try {
+      $health = Get-Content -LiteralPath $workerHealthPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      $healthProcess = [System.Diagnostics.Process]::GetProcessById([int]$health.pid)
+      if ($null -ne $healthProcess) {
+        $workerReady = $true
+        break
+      }
+    } catch {
+    }
+    Start-Sleep -Milliseconds 250
+  } while ([DateTimeOffset]::UtcNow -lt $workerDeadline)
+  if (-not $workerReady) {
+    throw 'Scheduled worker task started but its notifier process did not become healthy.'
   }
   Write-Status 'Windows durable worker is running.'
 }
@@ -732,6 +782,8 @@ function Install-WslNotifier {
     if ($LASTEXITCODE -ne 0) { throw "Could not protect WSL executables in $Distro." }
     & wsl.exe -d $Distro -- chmod 600 "$linuxCodex/ntfy-config.json" "$linuxCodex/config.toml" "$linuxCodex/hooks.json"
     if ($LASTEXITCODE -ne 0) { throw "Could not protect WSL private configuration in $Distro." }
+    & wsl.exe -d $Distro -- python3 "$linuxCodex/notify-ntfy.py" --cleanup-test-state | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not clean synthetic test state in $Distro." }
     & wsl.exe -d $Distro -- python3 "$linuxCodex/notify-ntfy.py" --doctor | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "WSL doctor failed for $Distro." }
     Write-Status "Installed WSL bridge and native fallback in $Distro."
@@ -773,6 +825,11 @@ try {
     Stop-LegacyTask
   }
   Install-WindowsFiles -HomePath $CodexHome
+  $removedSyntheticTests = & (Join-Path $CodexHome 'notify-ntfy.ps1') -CleanupTestState
+  if ($LASTEXITCODE -ne 0) { throw 'Could not clean synthetic Windows test state.' }
+  if ([int]$removedSyntheticTests -gt 0) {
+    Write-Status "Removed $removedSyntheticTests synthetic test receipt(s) from local notifier state."
+  }
   Ensure-ScheduledWorker -HomePath $CodexHome
   if (-not $NoWsl) {
     foreach ($distro in $WslDistro) {

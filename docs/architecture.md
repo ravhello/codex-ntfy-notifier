@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the completion-detection and delivery model implemented by version 2.4.2. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI or ntfy component.
+This document describes the completion-detection and delivery model implemented by version 2.4.3. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI or ntfy component.
 
 ## Design goal
 
@@ -27,9 +27,9 @@ The design favors:
 | --- | --- |
 | Codex modern `Stop` hook | Supplies an explicit session-stop candidate on standard input. Local rollout/database evidence still determines whether that session is a root or descendant. It is never sent directly. |
 | Codex legacy root-level `notify` | Supplies `agent-turn-complete` as a compatibility/fallback candidate. |
-| Incremental rollout watcher | Discovers recent local `task_complete` or `turn_aborted` records that hooks missed. |
+| Incremental rollout watcher | Discovers recent local `task_complete` or `turn_aborted` records that hooks missed. On Windows, the persistent local scanner is seeded by Codex's read-only SQLite thread index; UNC/WSL roots use a separate bounded scanner. |
 | `notify-ntfy.ps1` / `notify-ntfy.py` | Normalizes signals, classifies roots/subagents, maintains pending probes, applies the idle gate, and delivers the outbox. |
-| Windows scheduled task `CodexNtfyWatcher` | Runs the continuous Windows worker and rollout watcher. |
+| Windows scheduled task `CodexNtfyWatcher` | Launches the hidden VBS supervisor directly. The VBS starts and restarts the notifier worker without the former two-hop cold PowerShell launcher chain. |
 | Linux user unit `codex-ntfy.service` | Runs the continuous Python worker and rollout watcher when user systemd is available. |
 | `notify-ntfy-wsl.sh` | Preserves WSL session paths and classification, prefers the Windows queue, and falls back to native Python state. |
 | `ntfy-config.json` | Stores the private destination, credentials, idle policy, delivery policy, and privacy options. |
@@ -43,9 +43,11 @@ Three sources feed the same record schema:
 
 1. **Modern `Stop`.** The installer registers a managed `hooks.Stop` handler. The notifier reads its JSON from standard input, returns an empty JSON object as the hook result, classifies the session from local Codex state, and stores only an accepted root candidate. It intentionally ignores an event explicitly named `SubagentStop`; current Codex versions can also report descendant sessions through `Stop`, so the classifier remains mandatory.
 2. **Legacy `notify`.** The existing root-level notification remains installed as a compatibility path. Its `agent-turn-complete` payload is normalized to the same candidate schema.
-3. **Rollout watcher.** A continuous worker tails recent rollout JSONL files under its own `CODEX_HOME` and any explicitly registered roots using a persisted byte offset. It consumes only complete newline-terminated records and leaves an incomplete trailing line for the next scan. Existing cursors remain active across date boundaries; a slower bounded discovery finds recently modified old-date and archived rollouts. A local `task_complete` or `turn_aborted` can therefore reconstruct a candidate when a hook process was never launched. The Windows installer registers the selected WSL Codex and SQLite roots without globally guessing a newest session.
+3. **Rollout watcher.** A continuous worker tails rollout JSONL files under its own `CODEX_HOME` and any explicitly registered roots using a persisted byte offset. On Windows, the persistent local scanner queries Codex's read-only SQLite thread index for active and recently resumed rollout paths, then supplements those results with hot current-day files. It does not enumerate historical cursor files or recursively walk `sessions/` and `archived_sessions/` on every continuous scan; the expensive full archive walk is reserved for an explicit manual `ScanScope=All` run. UNC/WSL roots run in a separate one-shot scanner with independent cursor handling and a `watch_remote_timeout_seconds` limit, so a suspended distro or slow share cannot block local recovery or delivery. The watcher consumes only complete newline-terminated records, leaves an incomplete trailing line for the next scan, and does not rewrite a cursor when file size and modification time are unchanged. A local `task_complete` or `turn_aborted` can therefore reconstruct a candidate when a hook process was never launched. The Windows installer registers the selected WSL Codex and SQLite roots without globally guessing a newest session.
 
 The watcher initializes an old rollout at its current end; it only replays a newly discovered rollout when the file was modified within `watch_initial_replay_seconds`. This avoids turning historical sessions into fresh notifications after installation.
+
+Receipt retention and legacy lock cleanup run in a separate maintenance process no earlier than 60 seconds after startup and only after delivery plus the applicable local and remote scanners have reported ready, completed, timed out, or failed. Maintenance holds its own lock and cannot delay worker readiness or a completion notification.
 
 All sources share the same deterministic key when Codex provides both thread and turn IDs. Consequently, the recovery paths normally converge on one local record.
 
@@ -61,9 +63,9 @@ rollout watcher ────────┘                              |
                                                        v
                                            idle gate + final snapshot
                          ┌─────────────────────────────┼───────────────────────┐
-                         | busy/unknown                | superseded            | idle
-                         v                             v                       v
-                    remain pending/              suppressed receipt       outbox/
+                         | busy                 | superseded/unverifiable  | idle
+                         v                      v                           v
+                    remain pending/        suppressed receipt           outbox/
                                                                                |
                                                                                v
                                                                        POST to ntfy
@@ -72,15 +74,15 @@ rollout watcher ────────┘                              |
                                                                         sent receipt
 ```
 
-Candidates are written through a private temporary file and an atomic filesystem operation. Simultaneous signals cannot expose a partial JSON record. Sharded cross-process mutation locks serialize changes to the same event key, so a worker using an older snapshot cannot overwrite or suppress newer authoritative `Stop` evidence.
+Candidates are written through a private temporary file and an atomic filesystem operation. Simultaneous signals cannot expose a partial JSON record. A bounded set of hash-prefix cross-process mutation locks serializes changes to the same event key, so a worker using an older snapshot cannot overwrite or suppress newer authoritative `Stop` evidence without leaving one lock file per event in the state root. Cleanup removes legacy root-level mutation-lock debris.
 
 ## Logical-idle gate
 
 For the default `strict` mode, a root candidate becomes network-ready only after these checks:
 
-1. **Root classification.** A known subagent is suppressed. An unknown root/subagent classification stays pending in strict mode.
+1. **Root classification.** A known subagent is suppressed. An unknown root/subagent classification is retried during the evidence-probe window, then suppressed locally as `unverifiable` in strict mode.
 2. **Matching completion.** The root rollout contains `task_complete` or `turn_aborted` for the candidate turn.
-3. **No later open turn.** A later `task_started` makes the root busy again.
+3. **No later open turn.** A later `task_started` makes the earlier completion an obsolete predecessor, so it is suppressed; the later task's own terminal event creates the useful candidate.
 4. **Goal not active.** With `goal_aware: true`, a goal whose status is `active` keeps the candidate pending. Terminal/non-running states such as `complete`, `paused`, `blocked`, `usage_limited`, and `budget_limited` do not block delivery.
 5. **No active descendants.** The notifier traverses Codex `thread_spawn_edges` recursively and inspects child rollout lifecycles. A recent child ending in `task_started` or an unknown active tail keeps the root pending.
 6. **Quiet window.** The matching rollout must remain unchanged for `idle_grace_seconds`.
@@ -91,11 +93,13 @@ The notifier reads Codex SQLite databases read-only and enables query-only mode.
 
 Active descendants are bounded by `subagent_orphan_seconds`. The timeout prevents a crashed or abandoned child rollout from blocking its root forever; it is a liveness tradeoff rather than proof that the child succeeded.
 
+For a large Windows rollout, the idle probe first builds the required lifecycle summary with a native streaming reader. It returns only terminal/open-turn, goal, user/final-message, and snapshot facts needed by the existing gate; the PowerShell parser remains the compatibility fallback. This keeps the decision semantics unchanged while avoiding a tens-of-megabytes line-by-line PowerShell replay.
+
 ## Detection modes
 
 | Mode | Behavior | Intended use |
 | --- | --- | --- |
-| `strict` | Requires verifiable root classification and matching rollout completion. Incomplete evidence remains pending with no time-based fail-open. | Default; prioritize no premature notification. |
+| `strict` | Requires verifiable root classification and matching rollout completion. Unknown evidence is retried exponentially and, after `idle_probe_grace_seconds`, suppressed locally as `unverifiable`; it is never promoted by time alone. | Default; prioritize no premature notification. |
 | `balanced` | Applies the same positive busy checks but may accept incomplete rollout evidence after `idle_probe_grace_seconds`. | Prefer eventual notification when local history may be unavailable. |
 | `off` | Skips idle detection and queues each accepted completion signal immediately. | Compatibility, diagnostics, or intentionally per-turn behavior. |
 
@@ -103,7 +107,7 @@ Active descendants are bounded by `subagent_orphan_seconds`. The timeout prevent
 
 ## Coalescing and technical-turn suppression
 
-The worker compares pending records with the same root thread ID. Older pending candidates become compact `suppressed/` receipts with reason `superseded`; only the newest pending candidate can be promoted for that logical-idle epoch. A record already promoted to `outbox/` is immutable and is not coalesced with a later request. Coalescing is per root thread, never a global delay, so unrelated simultaneous tasks remain independent.
+The worker compares pending records with the same root thread ID. Older pending candidates become compact `suppressed/` receipts with reason `superseded`; a candidate whose rollout already contains a later open task is also suppressed immediately as an obsolete predecessor. Only that later task's terminal candidate can be promoted. A record already promoted to `outbox/` is immutable and is not coalesced with a later request. Coalescing is per root thread, never a global delay, so unrelated simultaneous tasks remain independent.
 
 With `suppress_technical_turns: true`, a legacy/watcher candidate without both a user-message marker and a final assistant-message marker is suppressed unless it represents a terminal goal state. A modern `Stop` candidate classified as root bypasses this heuristic because it is the more explicit user-facing lifecycle signal.
 
@@ -135,11 +139,11 @@ After logical idle is confirmed, the intended guarantee is **durable at-least-on
 
 If ntfy accepts a request and the worker crashes or times out before the receipt is written, the worker retries with the same sequence ID. Exactly-once display cannot be guaranteed.
 
-Strict idle detection changes the liveness boundary: a true completion can remain indefinitely in `pending/` when Codex no longer exposes enough local evidence. This is deliberate. The project prefers a withheld notification over a false “finished” notification in strict mode.
+Strict idle detection changes the liveness boundary: a true completion whose evidence cannot be verified is retried only during `idle_probe_grace_seconds`, then becomes a local `unverifiable` receipt. It is deliberately withheld rather than turned into a false “finished” notification; strict never fails open.
 
 ## Send-time payload assembly
 
-Version 2.4.2 changes the wire presentation, not the logical-idle decision. The worker renders the ntfy JSON from the durable record and the current private configuration immediately before each delivery attempt.
+The compact wire presentation introduced in version 2.4.2 is independent of the logical-idle decision. The worker renders the ntfy JSON from the durable record and the current private configuration immediately before each delivery attempt.
 
 With the default tag, the visible title is:
 
@@ -169,6 +173,10 @@ The send-time `include_message` check is a privacy gate for durable state. A rec
 
 Hooks and rollout scans may run concurrently. Each state directory has one non-blocking worker lock, so a scheduled/service worker and an on-demand worker do not process the same host queue simultaneously. Sharded `mutation-locks/` additionally serialize hook/worker changes to the same deterministic event key without serializing unrelated chats.
 
+On Windows, the supervisor starts three independent runtime paths: durable delivery, the persistent local scanner, and a timeout-bounded one-shot remote scanner when UNC/WSL roots are configured. Their separate locks and health files prevent remote latency from serializing local discovery or network delivery.
+
+Remote SSH does not share that UNC scanner: each remote installation owns a host-local worker, queue, rollout state, and network path. A stalled SSH host therefore cannot serialize the local Windows queue either.
+
 The lock is a delivery serialization mechanism, not a global chat debounce. Pending probes and coalescing use the root thread ID, so several VS Code windows, app tasks, or CLI sessions can reach idle independently.
 
 Queues are deliberately not shared between machines:
@@ -183,13 +191,14 @@ WSL routing:
 1. the WSL hook preserves its Linux `CODEX_HOME` and optional `CODEX_SQLITE_HOME`;
 2. when Windows interop is available, the bridge sends the candidate plus those session locations to PowerShell;
 3. Windows owns pending/outbox delivery while evaluating the WSL rollout and database paths;
-4. if the bridge fails, native Python state owns the candidate and starts an on-demand worker.
+4. classification itself is side-effect free and cannot start or flush the native worker;
+5. only if the bridge fails does native Python state own the candidate and start an on-demand worker.
 
 The Windows continuous watcher does not enumerate arbitrary WSL distributions. `install.ps1 -WslDistro <name>` records that distribution's Codex root, optional distinct SQLite root, and source label in the private configuration. If neither WSL hook launches, the Windows worker can then recover the persisted completion directly; unregistered distributions remain isolated.
 
 ## Retry and failure policy
 
-The delivery worker uses exponential backoff with jitter, capped by `retry_max_seconds` (900 seconds by default). A numeric `Retry-After` is honored within the same cap.
+Before network delivery, unknown root or rollout evidence is retried with exponential intervals capped by `unknown_retry_max_seconds` (60 seconds by default) and bounded by `idle_probe_grace_seconds`. The delivery worker separately uses exponential backoff with jitter, capped by `retry_max_seconds` (900 seconds by default). A numeric `Retry-After` is honored within the delivery cap.
 
 | Failure | Default handling |
 | --- | --- |
@@ -212,8 +221,11 @@ ntfy-state/
   sent/         compact successful-delivery receipts
   suppressed/   compact subagent, technical, and superseded receipts
   dead/         invalid or permanently failed records
-  mutation-locks/ sharded cross-process locks for same-key state changes
+  mutation-locks/ bounded sharded cross-process locks for same-key state changes
   worker.lock   per-state-directory worker lock
+  maintenance.lock retention-cleanup lock
+  watch-health.json local scanner health
+  remote-watch-health.json isolated UNC/WSL scanner health
   notify.log    bounded operational log (one rotated generation)
 ```
 

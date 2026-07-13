@@ -161,6 +161,7 @@ def migrate_private_config(path: Path) -> None:
         "idle_detection_mode": "strict",
         "idle_grace_seconds": 1.5,
         "idle_probe_grace_seconds": 30,
+        "unknown_retry_max_seconds": 60,
         "goal_aware": True,
         "goal_poll_seconds": 1,
         "subagent_orphan_seconds": 1800,

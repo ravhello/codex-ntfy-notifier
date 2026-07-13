@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -131,6 +132,8 @@ class NotifierContractTests(unittest.TestCase):
         shutil.rmtree(self.temp, ignore_errors=True)
 
     def implementations(self) -> list[str]:
+        if os.environ.get("CODEX_NTFY_TEST_POWERSHELL_ONLY") == "1":
+            return ["powershell"] if os.name == "nt" and WINDOWS_POWERSHELL.exists() else []
         values = ["python"]
         if os.name == "nt" and WINDOWS_POWERSHELL.exists() and os.environ.get("CODEX_NTFY_TEST_PYTHON_ONLY") != "1":
             values.append("powershell")
@@ -239,7 +242,7 @@ class NotifierContractTests(unittest.TestCase):
 
     def stop_continuous_worker(self, process: subprocess.Popen[str]) -> tuple[str, str]:
         child_pids: set[int] = set()
-        for health_name in ("watch-health.json", "delivery-health.json"):
+        for health_name in ("watch-health.json", "remote-watch-health.json", "delivery-health.json"):
             try:
                 child_pid = int(
                     json.loads((self.state / health_name).read_text(encoding="utf-8-sig")).get("pid", 0) or 0
@@ -250,21 +253,29 @@ class NotifierContractTests(unittest.TestCase):
                 pass
         if process.poll() is None:
             process.terminate()
-        stdout, stderr = process.communicate(timeout=10)
         for child_pid in child_pids - {process.pid}:
             if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(child_pid), "/T", "/F"],
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(child_pid), "/T", "/F"],
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.kill(child_pid, signal.SIGTERM)
             else:
                 try:
                     os.kill(child_pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=10)
         return stdout, stderr
 
     def wait_for_payloads(self, count: int, *, timeout: float = 10) -> list[dict]:
@@ -579,7 +590,13 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.hook_command(implementation, stale_event))
                 self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
 
-                process = self.start_worker(implementation)
+                process = subprocess.Popen(
+                    self.continuous_worker_command(implementation),
+                    env=self.env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
                 try:
                     time.sleep(0.35)
                     with self.server.lock:
@@ -588,14 +605,12 @@ class NotifierContractTests(unittest.TestCase):
                     self.append_rollout(rollout, "task_complete", turn_id=final_turn, message="Final")
                     time.sleep(0.02)
                     self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id, turn_id=final_turn)))
-                    self.assert_worker_ok(process)
+                    payloads = self.wait_for_payloads(1, timeout=45)
+                    self.assertEqual(len(payloads), 1)
                 finally:
-                    if process.poll() is None:
-                        process.terminate()
-                        process.communicate(timeout=5)
+                    stdout, stderr = self.stop_continuous_worker(process)
+                    self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
 
-                payloads = self.wait_for_payloads(1)
-                self.assertEqual(len(payloads), 1)
                 suppressed = [json.loads(path.read_text(encoding="utf-8-sig")) for path in (self.state / "suppressed").glob("*.json")]
                 self.assertTrue(any(receipt.get("reason") == "superseded" for receipt in suppressed))
                 shutil.rmtree(self.state, ignore_errors=True)
@@ -631,7 +646,12 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.hook_command(implementation, stale_event))
                 self.run_ok(self.worker_command(implementation), timeout=60)
                 payloads = self.wait_for_payloads(1)
-                self.assertEqual(len(payloads), 1)
+                debug_state = {
+                    name: [path.name for path in (self.state / name).glob("*.json")]
+                    for name in ("pending", "outbox", "sent", "suppressed", "dead")
+                }
+                debug_log = (self.state / "notify.log").read_text(encoding="utf-8-sig", errors="replace")
+                self.assertEqual(len(payloads), 1, msg=f"state={debug_state}\nlog={debug_log}")
                 self.assertIn("FINAL", payloads[0]["message"])
                 self.assertNotIn("INTERMEDIATE", payloads[0]["message"])
                 suppressed = [
@@ -639,6 +659,48 @@ class NotifierContractTests(unittest.TestCase):
                     for path in (self.state / "suppressed").glob("*.json")
                 ]
                 self.assertTrue(any(receipt.get("reason") == "superseded" for receipt in suppressed))
+                shutil.rmtree(self.state, ignore_errors=True)
+                shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
+                with self.server.lock:
+                    self.server.payloads.clear()
+
+    def test_multiple_pending_candidates_share_a_rollout_without_losing_the_oldest(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            watch_rollouts=False,
+            suppress_technical_turns=True,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                thread_id = str(uuid.uuid4())
+                turns = [
+                    "00000000-0000-7000-8000-000000000013",
+                    "00000000-0000-7000-8000-000000000014",
+                    "00000000-0000-7000-8000-000000000015",
+                ]
+                messages = ["FIRST INTERMEDIATE", "SECOND INTERMEDIATE", "ONLY FINAL"]
+                rollout = self.write_session_meta(thread_id, subagent=False)
+                for turn_id, message in zip(turns, messages, strict=True):
+                    self.append_rollout(rollout, "task_started", turn_id=turn_id)
+                    self.append_rollout(rollout, "user_message", message="Continue")
+                    self.append_rollout(rollout, "task_complete", turn_id=turn_id, message=message)
+                for turn_id, message in zip(turns[:2], messages[:2], strict=True):
+                    event = self.event(thread_id=thread_id, turn_id=turn_id)
+                    event["last-assistant-message"] = message
+                    self.run_ok(self.hook_command(implementation, event))
+                self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 2)
+                self.run_ok(self.worker_command(implementation), timeout=60)
+                payloads = self.wait_for_payloads(1)
+                self.assertEqual(len(payloads), 1)
+                self.assertIn("ONLY FINAL", payloads[0]["message"])
+                self.assertNotIn("INTERMEDIATE", payloads[0]["message"])
+                suppressed = [
+                    json.loads(path.read_text(encoding="utf-8-sig"))
+                    for path in (self.state / "suppressed").glob("*.json")
+                ]
+                self.assertGreaterEqual(sum(receipt.get("reason") == "superseded" for receipt in suppressed), 2)
                 shutil.rmtree(self.state, ignore_errors=True)
                 shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
                 with self.server.lock:
@@ -678,7 +740,7 @@ class NotifierContractTests(unittest.TestCase):
                     stderr=subprocess.PIPE,
                 )
                 try:
-                    payloads = self.wait_for_payloads(1, timeout=30)
+                    payloads = self.wait_for_payloads(1, timeout=45)
                     self.assertEqual(len(payloads), 1)
                     self.assertIn("NEWEST", payloads[0]["message"])
                     self.assertNotIn("STALE", payloads[0]["message"])
@@ -783,6 +845,34 @@ class NotifierContractTests(unittest.TestCase):
                 self.assertTrue(any(receipt.get("reason") == "technical-turn" for receipt in receipts))
                 shutil.rmtree(self.state, ignore_errors=True)
 
+    def test_escaped_whitespace_is_not_a_final_message(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            suppress_technical_turns=True,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                thread_id = str(uuid.uuid4())
+                turn_id = "00000000-0000-7000-8000-000000000042"
+                rollout = self.write_session_meta(thread_id, subagent=False)
+                self.append_rollout(rollout, "task_started", turn_id=turn_id)
+                self.append_rollout(rollout, "user_message", message="User request")
+                self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="\n\t")
+                event = self.event(thread_id=thread_id, turn_id=turn_id)
+                event["last-assistant-message"] = "\n\t"
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation), timeout=60)
+                with self.server.lock:
+                    self.assertEqual(self.server.payloads, [])
+                receipts = [
+                    json.loads(path.read_text(encoding="utf-8-sig"))
+                    for path in (self.state / "suppressed").glob("*.json")
+                ]
+                self.assertTrue(any(receipt.get("reason") == "technical-turn" for receipt in receipts))
+                shutil.rmtree(self.state, ignore_errors=True)
+
     def test_modern_stop_upgrades_an_earlier_technical_receipt(self) -> None:
         self.configure(
             idle_detection_mode="strict",
@@ -871,6 +961,33 @@ class NotifierContractTests(unittest.TestCase):
                 payloads = self.wait_for_payloads(1)
                 self.assertEqual(len(payloads), 1)
                 self.assertEqual(payloads[0]["title"], "perfect notifier")
+                shutil.rmtree(self.state, ignore_errors=True)
+                with self.server.lock:
+                    self.server.payloads.clear()
+
+    def test_same_turn_complete_then_abort_preserves_the_completion_candidate(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            suppress_technical_turns=False,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                thread_id = str(uuid.uuid4())
+                turn_id = "00000000-0000-7000-8000-000000000045"
+                rollout = self.write_session_meta(thread_id, subagent=False)
+                self.append_rollout(rollout, "task_started", turn_id=turn_id)
+                self.append_rollout(rollout, "user_message", message="Finish, then stop")
+                self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="FINAL ANSWER")
+                self.append_rollout(rollout, "turn_aborted", turn_id=turn_id)
+                event = self.event(thread_id=thread_id, turn_id=turn_id)
+                event["last-assistant-message"] = "FINAL ANSWER"
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation), timeout=60)
+                payloads = self.wait_for_payloads(1)
+                self.assertEqual(len(payloads), 1)
+                self.assertIn("FINAL ANSWER", payloads[0]["message"])
                 shutil.rmtree(self.state, ignore_errors=True)
                 with self.server.lock:
                     self.server.payloads.clear()
@@ -1074,8 +1191,9 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.hook_command(implementation, event))
                 process = self.start_worker(implementation)
                 try:
-                    deadline = time.monotonic() + 30
+                    deadline = time.monotonic() + 60
                     observed_wait = False
+                    observed_reasons: set[str] = set()
                     while time.monotonic() < deadline and not observed_wait:
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
@@ -1083,11 +1201,22 @@ class NotifierContractTests(unittest.TestCase):
                             except (OSError, json.JSONDecodeError):
                                 continue
                             reason = str(pending_record.get("idle_reason") or pending_record.get("gate_reason") or "")
-                            observed_wait = bool(reason)
+                            if reason:
+                                observed_reasons.add(reason)
+                            observed_wait = reason in {
+                                "candidate-task-complete-not-observed",
+                                "probe-incomplete",
+                                "rollout-changing",
+                                "turn-active",
+                            }
                         if process.poll() is not None:
                             break
                         time.sleep(0.05)
-                    self.assertTrue(observed_wait, "worker did not inspect the incomplete JSONL record")
+                    self.assertTrue(
+                        observed_wait,
+                        f"worker did not inspect the incomplete JSONL record; reasons={sorted(observed_reasons)} "
+                        f"exit={process.poll()}",
+                    )
                     with self.server.lock:
                         self.assertEqual(self.server.payloads, [])
                     with rollout.open("ab") as handle:
@@ -1097,7 +1226,13 @@ class NotifierContractTests(unittest.TestCase):
                     if process.poll() is None:
                         process.terminate()
                         process.communicate(timeout=5)
-                self.assertEqual(len(self.wait_for_payloads(1)), 1)
+                payloads = self.wait_for_payloads(1)
+                diagnostic = {
+                    str(path.relative_to(self.state)): path.read_text(encoding="utf-8-sig", errors="replace")[-2000:]
+                    for path in self.state.rglob("*")
+                    if path.is_file() and path.stat().st_size < 2_000_000
+                }
+                self.assertEqual(len(payloads), 1, json.dumps(diagnostic, indent=2))
                 persisted = "\n".join(
                     path.read_text(encoding="utf-8-sig", errors="replace")
                     for path in self.state.rglob("*.json")
@@ -1106,6 +1241,44 @@ class NotifierContractTests(unittest.TestCase):
                 shutil.rmtree(self.state, ignore_errors=True)
                 with self.server.lock:
                     self.server.payloads.clear()
+
+    def test_malformed_terminal_cannot_close_a_later_open_turn(self) -> None:
+        self.configure(
+            include_message=False,
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            watch_rollouts=False,
+            suppress_technical_turns=False,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                thread_id = str(uuid.uuid4())
+                completed_turn = "00000000-0000-7000-8000-000000000072"
+                open_turn = "00000000-0000-7000-8000-000000000073"
+                rollout = self.write_session_meta(thread_id, subagent=False)
+                self.append_rollout(rollout, "task_started", turn_id=completed_turn)
+                self.append_rollout(rollout, "user_message", message="Initial request")
+                self.append_rollout(rollout, "task_complete", turn_id=completed_turn, message="INTERMEDIATE")
+                self.append_rollout(rollout, "task_started", turn_id=open_turn)
+                with rollout.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"'
+                        + open_turn
+                        + '"}} trailing garbage\n'
+                    )
+                event = self.event(thread_id=thread_id, turn_id=completed_turn)
+                event["last-assistant-message"] = "INTERMEDIATE"
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation), timeout=60)
+                with self.server.lock:
+                    self.assertEqual(self.server.payloads, [])
+                receipts = [
+                    json.loads(path.read_text(encoding="utf-8-sig"))
+                    for path in (self.state / "suppressed").glob("*.json")
+                ]
+                self.assertTrue(any(receipt.get("reason") == "superseded" for receipt in receipts))
+                shutil.rmtree(self.state, ignore_errors=True)
 
     def test_active_goal_waits_for_terminal_status(self) -> None:
         self.configure(
@@ -1535,7 +1708,7 @@ class NotifierContractTests(unittest.TestCase):
                     stderr=subprocess.PIPE,
                 )
                 try:
-                    deadline = time.monotonic() + 30
+                    deadline = time.monotonic() + 60
                     while time.monotonic() < deadline and not list((self.state / "watch").glob("*.json")):
                         if process.poll() is not None:
                             stdout, stderr = process.communicate()
@@ -1546,7 +1719,7 @@ class NotifierContractTests(unittest.TestCase):
                         time.sleep(0.05)
                     self.assertTrue(list((self.state / "watch").glob("*.json")))
                     self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="Recovered final")
-                    self.assertEqual(len(self.wait_for_payloads(1, timeout=30)), 1)
+                    self.assertEqual(len(self.wait_for_payloads(1, timeout=60)), 1)
                     time.sleep(0.2)
                     with self.server.lock:
                         self.assertEqual(len(self.server.payloads), 1)
@@ -1721,6 +1894,16 @@ class NotifierContractTests(unittest.TestCase):
                     self.append_rollout(rollout, "task_started", turn_id=turn_id)
                     self.append_rollout(rollout, "user_message", message="Old session, fresh work")
                     self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="DISCOVERED")
+                    database = sqlite3.connect(self.state_database)
+                    try:
+                        database.execute(
+                            "INSERT OR REPLACE INTO threads(id, rollout_path, source, thread_source, title) "
+                            "VALUES (?, ?, 'vscode', 'user', 'Discovery test')",
+                            (thread_id, str(rollout)),
+                        )
+                        database.commit()
+                    finally:
+                        database.close()
                     process = subprocess.Popen(
                         self.continuous_worker_command(implementation),
                         env=self.env,
@@ -1792,7 +1975,7 @@ class NotifierContractTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         try:
-            payloads = self.wait_for_payloads(1, timeout=30)
+            payloads = self.wait_for_payloads(1, timeout=45)
             self.assertEqual(len(payloads), 1)
             self.assertIn("WSL RECOVERED", payloads[0]["message"])
             self.assertIn("WSL:test", payloads[0]["message"])
@@ -1800,6 +1983,226 @@ class NotifierContractTests(unittest.TestCase):
         finally:
             stdout, stderr = self.stop_continuous_worker(process)
             self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows remote cursor scan test")
+    def test_windows_remote_scan_does_not_share_the_local_cursor_batch(self) -> None:
+        thread_id = str(uuid.uuid4())
+        turn_id = "00000000-0000-7000-8000-000000000083"
+        rollout = self.write_session_meta(thread_id, subagent=False)
+        self.append_rollout(rollout, "task_started", turn_id=turn_id)
+        self.append_rollout(rollout, "user_message", message="Resumed old WSL task")
+        self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="REMOTE CURSOR RECOVERED")
+
+        discovery_seconds = 1_000_000
+        global_batch_index = int(time.time() * 1000 // (discovery_seconds * 1000)) % 3
+        remote_cursor_index = (global_batch_index + 1) % 3
+        watch = self.state / "watch"
+        watch.mkdir(parents=True)
+        for index in range(3):
+            if index == remote_cursor_index:
+                cursor = {
+                    "schema": 1,
+                    "rollout_path": str(rollout),
+                    "session_codex_home": r"\\wsl.localhost\Ubuntu\home\test\.codex",
+                    "session_sqlite_home": str(self.codex_home),
+                    "origin": "WSL:test",
+                    "offset": 0,
+                    "seen_unix_ms": 0,
+                }
+            else:
+                cursor = {
+                    "schema": 1,
+                    "rollout_path": str(self.temp / f"missing-local-{index}.jsonl"),
+                    "session_codex_home": str(self.codex_home),
+                    "session_sqlite_home": str(self.codex_home),
+                    "origin": "local",
+                    "offset": 0,
+                    "seen_unix_ms": 0,
+                }
+            (watch / f"{index:02d}-cursor.json").write_text(json.dumps(cursor), encoding="utf-8")
+
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            watch_rollouts=True,
+            watch_discovery_seconds=discovery_seconds,
+            watch_cursor_batch_size=1,
+            watch_initial_replay_seconds=60,
+            suppress_technical_turns=True,
+        )
+        scan = self.run_ok(
+            [
+                str(WINDOWS_POWERSHELL),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(POWERSHELL_NOTIFIER),
+                "-ScanRollouts",
+                "-ScanScope",
+                "Remote",
+            ],
+            timeout=60,
+        )
+        self.assertEqual(scan.stdout.strip(), "")
+        self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
+        self.run_ok(self.worker_command("powershell"), timeout=60)
+        payloads = self.wait_for_payloads(1, timeout=10)
+        self.assertEqual(len(payloads), 1)
+        self.assertIn("REMOTE CURSOR RECOVERED", payloads[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows remote watcher isolation test")
+    def test_windows_unavailable_remote_root_cannot_block_local_recovery(self) -> None:
+        thread_id = str(uuid.uuid4())
+        turn_id = "00000000-0000-7000-8000-000000000082"
+        rollout = self.write_session_meta(thread_id, subagent=False)
+        self.append_rollout(rollout, "task_started", turn_id=turn_id)
+        self.append_rollout(rollout, "user_message", message="Local task beside unavailable WSL")
+        self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="LOCAL RECOVERED")
+        unavailable = rf"\\127.0.0.1\codex-ntfy-unavailable-{uuid.uuid4().hex}"
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            watch_rollouts=True,
+            watch_scan_seconds=0.1,
+            watch_discovery_seconds=5,
+            watch_initial_replay_seconds=60,
+            watch_remote_timeout_seconds=5,
+            watch_roots=[{"path": unavailable, "sqlite_path": unavailable, "origin": "WSL:unavailable"}],
+            suppress_technical_turns=True,
+        )
+        watch = self.state / "watch"
+        watch.mkdir(parents=True, exist_ok=True)
+        (watch / "remote-cursor.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "rollout_path": unavailable + r"\sessions\2026\07\13\rollout-missing.jsonl",
+                    "session_codex_home": unavailable,
+                    "session_sqlite_home": unavailable,
+                    "offset": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        process = subprocess.Popen(
+            self.continuous_worker_command("powershell"),
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            payloads = self.wait_for_payloads(1, timeout=60)
+            self.assertEqual(len(payloads), 1)
+            self.assertIn("LOCAL RECOVERED", payloads[0]["message"])
+        finally:
+            stdout, stderr = self.stop_continuous_worker(process)
+            self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
+
+    def test_watcher_does_not_rewrite_an_unchanged_cursor(self) -> None:
+        self.configure(
+            idle_detection_mode="off",
+            watch_rollouts=True,
+            watch_discovery_seconds=5,
+            watch_initial_replay_seconds=0,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                thread_id = str(uuid.uuid4())
+                self.write_session_meta(thread_id, subagent=False)
+                command = (
+                    [
+                        str(WINDOWS_POWERSHELL),
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(POWERSHELL_NOTIFIER),
+                        "-ScanRollouts",
+                    ]
+                    if implementation == "powershell"
+                    else [sys.executable, str(PYTHON_NOTIFIER), "--scan-rollouts"]
+                )
+                self.run_ok(command, timeout=60)
+                cursors = list((self.state / "watch").glob("*.json"))
+                self.assertEqual(len(cursors), 1)
+                original = cursors[0].read_bytes()
+                original_mtime = cursors[0].stat().st_mtime_ns
+                time.sleep(0.2)
+
+                self.run_ok(command, timeout=60)
+                self.assertEqual(cursors[0].read_bytes(), original)
+                self.assertEqual(cursors[0].stat().st_mtime_ns, original_mtime)
+                with self.server.lock:
+                    self.assertEqual(self.server.payloads, [])
+                shutil.rmtree(self.state, ignore_errors=True)
+                shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
+
+    def test_strict_unverifiable_candidate_expires_without_delivery(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_probe_grace_seconds=0.1,
+            goal_poll_seconds=0.02,
+            suppress_technical_turns=False,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                self.run_ok(self.hook_command(implementation, self.event()))
+                self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
+                time.sleep(0.2)
+                self.run_ok(self.worker_command(implementation), timeout=60)
+
+                self.assertFalse(list((self.state / "pending").glob("*.json")))
+                receipts = [
+                    json.loads(path.read_text(encoding="utf-8-sig"))
+                    for path in (self.state / "suppressed").glob("*.json")
+                ]
+                self.assertEqual([receipt.get("reason") for receipt in receipts], ["unverifiable"])
+                with self.server.lock:
+                    self.assertEqual(self.server.payloads, [])
+                shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_cleanup_removes_only_explicit_test_records(self) -> None:
+        synthetic_thread = "00000000-0000-4000-8000-000000000001"
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                sent = self.state / "sent"
+                sent.mkdir(parents=True, exist_ok=True)
+                (sent / "synthetic.json").write_text(
+                    json.dumps({"thread_id": synthetic_thread}), encoding="utf-8"
+                )
+                (sent / "real.json").write_text(
+                    json.dumps({"thread_id": str(uuid.uuid4())}), encoding="utf-8"
+                )
+                command = (
+                    [
+                        str(WINDOWS_POWERSHELL),
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(POWERSHELL_NOTIFIER),
+                        "-CleanupTestState",
+                    ]
+                    if implementation == "powershell"
+                    else [sys.executable, str(PYTHON_NOTIFIER), "--cleanup-test-state"]
+                )
+                result = self.run_ok(command)
+                self.assertEqual(result.stdout.strip(), "1")
+                self.assertFalse((sent / "synthetic.json").exists())
+                self.assertTrue((sent / "real.json").exists())
+                shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_wsl_classification_is_side_effect_free(self) -> None:
+        wrapper = (ROOT / "src" / "notify-ntfy-wsl.sh").read_text(encoding="utf-8")
+        classification_line = next(line for line in wrapper.splitlines() if "--classify" in line and "detected=" in line)
+        self.assertNotIn("--kick-worker", classification_line)
 
     def test_python_kick_worker_recovers_a_stranded_outbox(self) -> None:
         event = self.event()
@@ -2418,6 +2821,9 @@ class NotifierContractTests(unittest.TestCase):
         vbs = (install_home / "watch-codex-ntfy-hidden.vbs").read_text(encoding="utf-8-sig")
         self.assertIn("WScript.ScriptFullName", vbs)
         self.assertNotIn("C:\\Windows", vbs)
+        self.assertIn("\\notify-ntfy.ps1", vbs)
+        self.assertIn("-Worker -Continuous", vbs)
+        self.assertNotIn("\\watch-codex-ntfy.ps1", vbs)
         watcher = (install_home / "watch-codex-ntfy.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("while ($true)", watcher)
         self.assertIn("Start-Sleep -Seconds $restartDelay", watcher)

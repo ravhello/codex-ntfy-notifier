@@ -6,21 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.4.3] - 2026-07-13
+
 ### Added
 
 - Added an opt-in authenticated ChatGPT task URL as the ntfy `click` target, with canonical UUID validation and a browser fallback when the mobile app does not claim the link.
 - Added a separate, default-off `include_task_link_action` option for one visible **Open task** button without consuming notification space by default.
 
+### Changed
+
+- `strict` still never fails open: unverifiable root classification or completion evidence is now retried with exponential backoff, capped by `unknown_retry_max_seconds` (60 seconds by default), then recorded locally as `unverifiable` after `idle_probe_grace_seconds` instead of remaining pending forever.
+- A completion followed by a later open task is now suppressed immediately as an obsolete predecessor; only that later task's terminal candidate can notify.
+- The persistent Windows local scanner now gets active and recently resumed rollout paths from Codex's read-only SQLite index plus hot current-day paths. Continuous scans no longer recursively walk multi-gigabyte `sessions/` and `archived_sessions/` trees—including the 23 GB history that exposed the regression; a full archive walk remains available only through an explicit manual all-scope scan.
+
 ### Fixed
 
 - Preserved existing custom ntfy tag arrays with more than three entries instead of rejecting the entire notifier configuration during an upgrade.
 - Moved rollout recovery scans and HTTP delivery into separate supervised background workers so slow local/WSL discovery or idle probes can no longer block ready ntfy deliveries; the scheduled-task supervisor now survives lock collisions and worker exits, with worker leases, scan health, and queued-item age diagnostics.
+- Isolated UNC/WSL fallback discovery in its own timeout-bounded scanner, with independent remote cursor handling, so a suspended distro or slow share cannot delay local lost-hook recovery or delivery.
+- Added a native streaming lifecycle summary for large Windows rollout files, avoiding slow line-by-line JSON replay in PowerShell while preserving the same idle checks.
+- Changed the Windows scheduled task to launch the hidden VBS supervisor directly, eliminating two cold PowerShell launcher starts before the notifier worker becomes ready.
+- Deferred receipt-retention cleanup to an isolated maintenance process that starts only after delivery and the applicable local/remote scanners have reported readiness, so large historical state cannot delay worker startup or a completion notification.
+- Made WSL classification side-effect free, so a successful Windows bridge cannot accidentally start the native fallback worker and flush old fallback or test records.
+- Replaced per-event mutation-lock files in the state root with a fixed set of sharded locks and cleanup for legacy lock debris.
+- Windows/WSL upgrades remove only records explicitly created by the notifier's synthetic test command before restarting delivery.
 
 ### Documentation
 
 - Redesigned the README opening around the final-only value proposition, an anonymized notification preview, and an earlier install-to-test path.
 - Added a GitHub Pages landing page, a reusable 1280×640 social preview, support guidance, and a Contributor Covenant code of conduct.
 - Clarified ntfy topic setup and added concise, verifiable discovery language without changing notifier behavior or delivery guarantees.
+- Documented the final-only rule and compact title explicitly: one ntfy status emoji plus the conversation title (or privacy-preserving project fallback), with no completion word or model name.
 
 ## [2.4.2] - 2026-07-11
 
@@ -156,7 +172,8 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.4.2...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.4.3...HEAD
+[2.4.3]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.3
 [2.4.2]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.2
 [2.4.1]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.1
 [2.4.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.0
