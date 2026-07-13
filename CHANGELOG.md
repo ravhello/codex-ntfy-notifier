@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Preserved existing custom ntfy tag arrays with more than three entries instead of rejecting the entire notifier configuration during an upgrade.
+- Moved rollout recovery scans and HTTP delivery into separate supervised background workers so slow local/WSL discovery or idle probes can no longer block ready ntfy deliveries; the scheduled-task supervisor now survives lock collisions and worker exits, with worker leases, scan health, and queued-item age diagnostics.
 
 ### Documentation
 

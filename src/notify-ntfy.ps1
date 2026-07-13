@@ -12,6 +12,10 @@ param(
   [switch]$BridgeFallback,
   [switch]$Worker,
   [switch]$Continuous,
+  [switch]$DeliveryOnly,
+  [switch]$ScanRollouts,
+  [int]$ScanParentPid = 0,
+  [string]$ScanParentToken = '',
   [switch]$NoSpawn,
   [switch]$Doctor,
   [switch]$Test,
@@ -50,6 +54,11 @@ $SentDir = Join-Path $StateRoot 'sent'
 $SuppressedDir = Join-Path $StateRoot 'suppressed'
 $DeadDir = Join-Path $StateRoot 'dead'
 $WorkerLockPath = Join-Path $StateRoot 'worker.lock'
+$DeliveryLockPath = Join-Path $StateRoot 'delivery.lock'
+$WorkerHealthPath = Join-Path $StateRoot 'worker-health.json'
+$DeliveryHealthPath = Join-Path $StateRoot 'delivery-health.json'
+$ScanLockPath = Join-Path $StateRoot 'watch-scan.lock'
+$ScanHealthPath = Join-Path $StateRoot 'watch-health.json'
 $LogPath = Join-Path $StateRoot 'notify.log'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
@@ -2163,6 +2172,7 @@ function Scan-RolloutFile {
 
   $File = Get-ObjectValue $Entry 'file'
   if ($null -eq $File) { return 0 }
+  if (-not (Test-RolloutScanParentAlive)) { return 0 }
   $sessionHome = [string](Get-ObjectValue $Entry 'session_codex_home' $CodexHome)
   if ([string]::IsNullOrWhiteSpace($sessionHome)) { $sessionHome = $CodexHome }
   $sqliteHome = [string](Get-ObjectValue $Entry 'session_sqlite_home' $sessionHome)
@@ -2216,6 +2226,7 @@ function Scan-RolloutFile {
     if ($data[$index] -eq 10) { $lastNewline = $index; break }
   }
   if ($lastNewline -lt 0) {
+    if (-not (Test-RolloutScanParentAlive)) { return 0 }
     Write-JsonAtomic -Path $statePath -Value ([ordered]@{
         schema = 1
         rollout_path = $File.FullName
@@ -2231,6 +2242,7 @@ function Scan-RolloutFile {
   if ($stateWasMissing) {
     # Persist the starting cursor before accounting any completion. If queueing
     # fails, the next scan must retry from here even after the replay window.
+    if (-not (Test-RolloutScanParentAlive)) { return 0 }
     Write-JsonAtomic -Path $statePath -Value ([ordered]@{
         schema = 1
         rollout_path = $File.FullName
@@ -2289,6 +2301,7 @@ function Scan-RolloutFile {
       # queue/receipt operations below intentionally remain outside this catch.
       continue
     }
+    if (-not (Test-RolloutScanParentAlive)) { return 0 }
     $classification = Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $sessionHome
     $eventOrigin = if (-not [string]::IsNullOrWhiteSpace($rootOrigin)) {
       $rootOrigin
@@ -2298,6 +2311,7 @@ function Scan-RolloutFile {
       Get-DefaultOrigin
     }
     $record = New-EventRecord -Event $event -EventOrigin $eventOrigin -EventSessionHome $sessionHome -EventSqliteHome $sqliteHome -EventClassification $classification -EventIncludeMessage $Config.includeMessage -CandidateKind 'rollout_watch' -SourceEvent 'rollout-watch'
+    if (-not (Test-RolloutScanParentAlive)) { return 0 }
     if ($Config.suppressSubagents -and $classification -eq 'subagent') {
       Move-ToSuppressed -Path (Join-Path $PendingDir ($record.key + '.json')) -Record $record -Reason 'subagent'
     } else {
@@ -2311,6 +2325,7 @@ function Scan-RolloutFile {
   }
   # This cursor advances only after every actionable line above has a durable
   # pending/outbox record or suppression receipt. Queue failures propagate.
+  if (-not (Test-RolloutScanParentAlive)) { return 0 }
   Write-JsonAtomic -Path $statePath -Value ([ordered]@{
       schema = 1
       rollout_path = $File.FullName
@@ -2622,40 +2637,226 @@ function Process-PendingCandidates {
   return [pscustomobject]@{ nextDueUnixMs = $nextDue }
 }
 
-function Invoke-OutboxWorker {
+function Write-RolloutScanHealth {
+  param(
+    [string]$Status,
+    [string]$StartedAt,
+    [string]$CompletedAt = '',
+    [int64]$DurationMs = 0,
+    [int]$Observed = 0,
+    [string]$ErrorText = ''
+  )
+
+  try {
+    Write-JsonAtomic -Path $ScanHealthPath -Value ([ordered]@{
+        schema = 1
+        status = $Status
+        pid = $PID
+        started_at = $StartedAt
+        completed_at = $CompletedAt
+        duration_ms = $DurationMs
+        observed = $Observed
+        error = $ErrorText
+      })
+  } catch {
+    Write-RuntimeLog "rollout scan health error: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 240)"
+  }
+}
+
+function Test-RolloutScanParentAlive {
+  if ($ScanParentPid -le 0 -and [string]::IsNullOrWhiteSpace($ScanParentToken)) {
+    return $true
+  }
+  if ($ScanParentPid -le 0 -or $null -eq (Get-Process -Id $ScanParentPid -ErrorAction SilentlyContinue)) {
+    return $false
+  }
+  try {
+    $health = Read-JsonFile -Path $WorkerHealthPath
+    return [int](Get-ObjectValue $health 'pid' 0) -eq $ScanParentPid -and
+      [string](Get-ObjectValue $health 'token' '') -eq $ScanParentToken
+  } catch {
+    return $false
+  }
+}
+
+function Invoke-RolloutScanWorker {
   Ensure-RuntimeDirectories
   $lockStream = $null
   try {
-    $lockStream = [System.IO.File]::Open($WorkerLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $lockStream = [System.IO.File]::Open($ScanLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
   } catch {
     return 0
   }
 
+  try {
+    while ($true) {
+      if (-not (Test-RolloutScanParentAlive)) {
+        return 0
+      }
+      $started = [DateTimeOffset]::Now
+      $startedAt = $started.ToString('o')
+      Write-RolloutScanHealth -Status 'running' -StartedAt $startedAt
+      Write-RuntimeLog "rollout scan started pid=$PID"
+      try {
+        $testDelayMs = 0
+        if ([int]::TryParse([string]$env:CODEX_NTFY_TEST_SCAN_DELAY_MS, [ref]$testDelayMs) -and $testDelayMs -gt 0) {
+          Start-Sleep -Milliseconds $testDelayMs
+        }
+        $config = Get-Config
+        $observed = Invoke-RolloutWatchScan -Config $config -NowUnixMs ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+        $completed = [DateTimeOffset]::Now
+        $durationMs = [int64][Math]::Max(0, ($completed - $started).TotalMilliseconds)
+        Write-RolloutScanHealth -Status 'completed' -StartedAt $startedAt -CompletedAt $completed.ToString('o') -DurationMs $durationMs -Observed $observed
+        Write-RuntimeLog "rollout scan completed observed=$observed duration_ms=$durationMs"
+      } catch {
+        $completed = [DateTimeOffset]::Now
+        $durationMs = [int64][Math]::Max(0, ($completed - $started).TotalMilliseconds)
+        $errorText = Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 300
+        Write-RolloutScanHealth -Status 'failed' -StartedAt $startedAt -CompletedAt $completed.ToString('o') -DurationMs $durationMs -ErrorText $errorText
+        Write-RuntimeLog "rollout watcher error: $errorText"
+        return 1
+      }
+      if (-not $Continuous) {
+        return 0
+      }
+      $sleepUntil = [DateTimeOffset]::UtcNow.AddSeconds([Math]::Max(0.1, $config.watchScanSeconds))
+      while ([DateTimeOffset]::UtcNow -lt $sleepUntil) {
+        if (-not (Test-RolloutScanParentAlive)) {
+          return 0
+        }
+        $remainingMs = [Math]::Max(1, ($sleepUntil - [DateTimeOffset]::UtcNow).TotalMilliseconds)
+        Start-Sleep -Milliseconds ([int][Math]::Min(500, $remainingMs))
+      }
+    }
+  } finally {
+    if ($null -ne $lockStream) {
+      $lockStream.Dispose()
+    }
+  }
+}
+
+function Start-RolloutScanProcess {
+  param([string]$ParentToken)
+  try {
+    $powerShellExe = Join-Path $PSHOME 'powershell.exe'
+    if (-not (Test-Path -LiteralPath $powerShellExe)) {
+      $powerShellExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    }
+    $scanMode = if ($env:CODEX_NTFY_SCAN_ONCE -eq '1') { '' } else { ' -Continuous' }
+    $arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ScanRollouts -ScanParentPid {1} -ScanParentToken "{2}"{3}' -f $PSCommandPath, $PID, $ParentToken, $scanMode)
+    return Start-Process -FilePath $powerShellExe -ArgumentList $arguments -WindowStyle Hidden -PassThru
+  } catch {
+    Write-RuntimeLog "failed to start rollout scan: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 300)"
+    return $null
+  }
+}
+
+function Start-DeliveryProcess {
+  param([string]$ParentToken)
+  try {
+    $powerShellExe = Join-Path $PSHOME 'powershell.exe'
+    if (-not (Test-Path -LiteralPath $powerShellExe)) {
+      $powerShellExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    }
+    $arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Worker -Continuous -DeliveryOnly -PollSeconds {1} -ScanParentPid {2} -ScanParentToken "{3}"' -f $PSCommandPath, $PollSeconds, $PID, $ParentToken)
+    return Start-Process -FilePath $powerShellExe -ArgumentList $arguments -WindowStyle Hidden -PassThru
+  } catch {
+    Write-RuntimeLog "failed to start delivery worker: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 300)"
+    return $null
+  }
+}
+
+function Invoke-OutboxWorker {
+  Ensure-RuntimeDirectories
+  $lockStream = $null
+  $lockPath = if ($DeliveryOnly) { $DeliveryLockPath } else { $WorkerLockPath }
+  try {
+    $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+  } catch {
+    return 0
+  }
+
+  $workerToken = if ($DeliveryOnly) { $ScanParentToken } else { [Guid]::NewGuid().ToString('N') }
   $cleaned = $false
   $nextWatchScanMs = [int64]0
+  $scanProcess = $null
+  $deliveryProcess = $null
   try {
-    Write-RuntimeLog "worker started continuous=$([bool]$Continuous)"
+    if (-not $DeliveryOnly) {
+      Write-JsonAtomic -Path $WorkerHealthPath -Value ([ordered]@{
+          schema = 1
+          pid = $PID
+          token = $workerToken
+          started_at = [DateTimeOffset]::Now.ToString('o')
+        })
+    } else {
+      Write-JsonAtomic -Path $DeliveryHealthPath -Value ([ordered]@{
+          schema = 1
+          pid = $PID
+          parent_pid = $ScanParentPid
+          token = $workerToken
+          started_at = [DateTimeOffset]::Now.ToString('o')
+        })
+    }
+    if ($Continuous -and -not $DeliveryOnly) {
+      $deliveryProcess = Start-DeliveryProcess -ParentToken $workerToken
+    }
+    Write-RuntimeLog "worker started continuous=$([bool]$Continuous) delivery_only=$([bool]$DeliveryOnly)"
     while ($true) {
+      if ($DeliveryOnly -and -not (Test-RolloutScanParentAlive)) {
+        return 0
+      }
       $config = Get-Config
-      if (-not $cleaned) {
+      if (-not $cleaned -and -not $DeliveryOnly) {
         Clean-RuntimeState -ReceiptRetentionDays $config.sentRetentionDays -DeadRetentionDays $config.deadRetentionDays
         $cleaned = $true
       }
 
       $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-      if ($Continuous -and $config.watchRollouts -and $nowMs -ge $nextWatchScanMs) {
+      if (-not $DeliveryOnly -and $Continuous -and $null -ne $deliveryProcess -and $deliveryProcess.HasExited) {
+        Write-RuntimeLog "delivery worker exited code=$($deliveryProcess.ExitCode)"
+        $deliveryProcess.Dispose()
+        $deliveryProcess = Start-DeliveryProcess -ParentToken $workerToken
+      }
+      if (-not $DeliveryOnly -and $Continuous -and $null -eq $deliveryProcess) {
+        $deliveryProcess = Start-DeliveryProcess -ParentToken $workerToken
+      }
+      if (-not $config.watchRollouts -and $null -ne $scanProcess) {
         try {
-          $observed = Invoke-RolloutWatchScan -Config $config -NowUnixMs $nowMs
-          if ($observed -gt 0) { Write-RuntimeLog "rollout watcher observed completions=$observed" }
+          if (-not $scanProcess.HasExited) {
+            Stop-Process -Id $scanProcess.Id -Force -ErrorAction SilentlyContinue
+          }
+          $scanProcess.Dispose()
         } catch {
-          Write-RuntimeLog "rollout watcher error: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 300)"
         }
+        $scanProcess = $null
+      }
+      if ($null -ne $scanProcess -and $scanProcess.HasExited) {
+        if ($scanProcess.ExitCode -ne 0) {
+          Write-RuntimeLog "rollout scan process exited code=$($scanProcess.ExitCode)"
+        }
+        $scanProcess.Dispose()
+        $scanProcess = $null
         $nextWatchScanMs = $nowMs + [int64]([Math]::Max(0.1, $config.watchScanSeconds) * 1000)
       }
-      Coalesce-ThreadCandidates -Config $config
-      $pendingResult = Process-PendingCandidates -Config $config
+      if (-not $DeliveryOnly -and $Continuous -and $config.watchRollouts -and $null -eq $scanProcess -and $nowMs -ge $nextWatchScanMs) {
+        $scanProcess = Start-RolloutScanProcess -ParentToken $workerToken
+        if ($null -eq $scanProcess) {
+          $nextWatchScanMs = $nowMs + [int64]([Math]::Max(0.1, $config.watchScanSeconds) * 1000)
+        }
+      }
+      if (-not $DeliveryOnly) {
+        Coalesce-ThreadCandidates -Config $config
+        $pendingResult = Process-PendingCandidates -Config $config
+      } else {
+        $pendingResult = [pscustomobject]@{ nextDueUnixMs = $null }
+      }
       $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-      $files = @(Get-ChildItem -LiteralPath $OutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc, Name)
+      $files = if ($DeliveryOnly -or -not $Continuous) {
+        @(Get-ChildItem -LiteralPath $OutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc, Name)
+      } else {
+        @()
+      }
       $nextDueMs = $pendingResult.nextDueUnixMs
 
       foreach ($file in $files) {
@@ -2756,15 +2957,50 @@ function Invoke-OutboxWorker {
         $untilDue = [Math]::Max(100, [int64]$nextDueMs - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
         $sleepMs = [Math]::Min($sleepMs, $untilDue)
       }
-      if ($Continuous -and $config.watchRollouts) {
+      if (-not $DeliveryOnly -and $Continuous -and $config.watchRollouts -and $null -eq $scanProcess) {
         $untilWatch = [Math]::Max(100, $nextWatchScanMs - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
         $sleepMs = [Math]::Min($sleepMs, $untilWatch)
       }
       Start-Sleep -Milliseconds ([int]$sleepMs)
     }
   } finally {
+    if ($null -ne $deliveryProcess) {
+      try {
+        if (-not $deliveryProcess.HasExited) {
+          Stop-Process -Id $deliveryProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        $deliveryProcess.Dispose()
+      } catch {
+      }
+    }
+    if ($null -ne $scanProcess) {
+      try {
+        if (-not $scanProcess.HasExited) {
+          Stop-Process -Id $scanProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        $scanProcess.Dispose()
+      } catch {
+      }
+    }
     if ($null -ne $lockStream) {
       $lockStream.Dispose()
+    }
+    if (-not $DeliveryOnly) {
+      try {
+        $health = Read-JsonFile -Path $WorkerHealthPath
+        if ([string](Get-ObjectValue $health 'token' '') -eq $workerToken) {
+          Remove-Item -LiteralPath $WorkerHealthPath -Force -ErrorAction SilentlyContinue
+        }
+      } catch {
+      }
+    } else {
+      try {
+        $health = Read-JsonFile -Path $DeliveryHealthPath
+        if ([string](Get-ObjectValue $health 'token' '') -eq $workerToken) {
+          Remove-Item -LiteralPath $DeliveryHealthPath -Force -ErrorAction SilentlyContinue
+        }
+      } catch {
+      }
     }
     Write-RuntimeLog 'worker stopped'
   }
@@ -2802,6 +3038,19 @@ function Get-SafeServerDisplay {
 function Show-Doctor {
   Ensure-RuntimeDirectories
   $config = Get-Config
+  $outboxFiles = @(Get-ChildItem -LiteralPath $OutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+  $oldestOutboxSeconds = 0
+  if ($outboxFiles.Count -gt 0) {
+    $oldestOutbox = $outboxFiles | Sort-Object LastWriteTimeUtc | Select-Object -First 1
+    $oldestOutboxSeconds = [Math]::Round([Math]::Max(0, ([DateTime]::UtcNow - $oldestOutbox.LastWriteTimeUtc).TotalSeconds), 1)
+  }
+  $scanHealth = [pscustomobject]@{}
+  if (Test-Path -LiteralPath $ScanHealthPath) {
+    try {
+      $scanHealth = Read-JsonFile -Path $ScanHealthPath
+    } catch {
+    }
+  }
   $result = [ordered]@{
     version = $ScriptVersion
     codex_home = $CodexHome
@@ -2829,7 +3078,13 @@ function Show-Doctor {
     pending_idle = @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     pending = @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     watched_rollouts = @(Get-ChildItem -LiteralPath $WatchDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
-    queued = @(Get-ChildItem -LiteralPath $OutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+    queued = $outboxFiles.Count
+    oldest_queued_seconds = $oldestOutboxSeconds
+    watch_scan_status = [string](Get-ObjectValue $scanHealth 'status' 'unknown')
+    watch_scan_started_at = [string](Get-ObjectValue $scanHealth 'started_at' '')
+    watch_scan_completed_at = [string](Get-ObjectValue $scanHealth 'completed_at' '')
+    watch_scan_duration_ms = [int64](Get-ObjectValue $scanHealth 'duration_ms' 0)
+    watch_scan_observed = [int](Get-ObjectValue $scanHealth 'observed' 0)
     sent_receipts = @(Get-ChildItem -LiteralPath $SentDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     suppressed = @(Get-ChildItem -LiteralPath $SuppressedDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     dead_letters = @(Get-ChildItem -LiteralPath $DeadDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
@@ -2843,6 +3098,9 @@ try {
   if ($Doctor) {
     Show-Doctor
     exit 0
+  }
+  if ($ScanRollouts) {
+    exit (Invoke-RolloutScanWorker)
   }
   if ($Worker -or $Continuous) {
     exit (Invoke-OutboxWorker)
@@ -2919,7 +3177,11 @@ try {
   } else {
     $eventSessionHome
   }
-  $detectedClassification = Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $eventSessionHome
+  $detectedClassification = if ($Test) {
+    'root'
+  } else {
+    Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $eventSessionHome
+  }
   $eventClassification = if ($detectedClassification -eq 'subagent') {
     'subagent'
   } elseif ($SessionClassification -in @('root', 'subagent')) {

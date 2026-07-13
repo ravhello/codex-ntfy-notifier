@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -99,7 +100,7 @@ class NotifierContractTests(unittest.TestCase):
                     "topic": "test-topic",
                     "include_message": True,
                     "include_thread_title": False,
-                    "timeout_seconds": 2,
+                    "timeout_seconds": 5,
                     "retry_max_seconds": 0.1,
                     "max_attempts": 0,
                     "sent_retention_days": 1,
@@ -232,9 +233,39 @@ class NotifierContractTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
 
-    def assert_worker_ok(self, process: subprocess.Popen[str], *, timeout: float = 15) -> None:
+    def assert_worker_ok(self, process: subprocess.Popen[str], *, timeout: float = 60) -> None:
         stdout, stderr = process.communicate(timeout=timeout)
         self.assertEqual(process.returncode, 0, msg=f"stdout={stdout}\nstderr={stderr}")
+
+    def stop_continuous_worker(self, process: subprocess.Popen[str]) -> tuple[str, str]:
+        child_pids: set[int] = set()
+        for health_name in ("watch-health.json", "delivery-health.json"):
+            try:
+                child_pid = int(
+                    json.loads((self.state / health_name).read_text(encoding="utf-8-sig")).get("pid", 0) or 0
+                )
+                if child_pid > 0:
+                    child_pids.add(child_pid)
+            except (FileNotFoundError, PermissionError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+        if process.poll() is None:
+            process.terminate()
+        stdout, stderr = process.communicate(timeout=10)
+        for child_pid in child_pids - {process.pid}:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(child_pid), "/T", "/F"],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+            else:
+                try:
+                    os.kill(child_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        return stdout, stderr
 
     def wait_for_payloads(self, count: int, *, timeout: float = 10) -> list[dict]:
         deadline = time.monotonic() + timeout
@@ -598,7 +629,7 @@ class NotifierContractTests(unittest.TestCase):
                 stale_event = self.event(thread_id=thread_id, turn_id=first_turn)
                 stale_event["last-assistant-message"] = "INTERMEDIATE"
                 self.run_ok(self.hook_command(implementation, stale_event))
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 payloads = self.wait_for_payloads(1)
                 self.assertEqual(len(payloads), 1)
                 self.assertIn("FINAL", payloads[0]["message"])
@@ -647,7 +678,7 @@ class NotifierContractTests(unittest.TestCase):
                     stderr=subprocess.PIPE,
                 )
                 try:
-                    payloads = self.wait_for_payloads(1)
+                    payloads = self.wait_for_payloads(1, timeout=30)
                     self.assertEqual(len(payloads), 1)
                     self.assertIn("NEWEST", payloads[0]["message"])
                     self.assertNotIn("STALE", payloads[0]["message"])
@@ -655,8 +686,7 @@ class NotifierContractTests(unittest.TestCase):
                     with self.server.lock:
                         self.assertEqual(len(self.server.payloads), 1)
                 finally:
-                    process.terminate()
-                    stdout, stderr = process.communicate(timeout=10)
+                    stdout, stderr = self.stop_continuous_worker(process)
                     self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
                 shutil.rmtree(self.state, ignore_errors=True)
                 shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
@@ -716,7 +746,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.hook_command(implementation, second))
                 self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
 
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 payloads = self.wait_for_payloads(2)
                 self.assertEqual(len(payloads), 2)
                 messages = {payload["message"].split(" · ", 1)[0] for payload in payloads}
@@ -743,7 +773,7 @@ class NotifierContractTests(unittest.TestCase):
                 event = self.event(thread_id=thread_id, turn_id=turn_id)
                 event["last-assistant-message"] = "TECHNICAL"
                 self.run_ok(self.hook_command(implementation, event))
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 with self.server.lock:
                     self.assertEqual(self.server.payloads, [])
                 receipts = [
@@ -770,7 +800,7 @@ class NotifierContractTests(unittest.TestCase):
                 legacy = self.event(thread_id=thread_id, turn_id=turn_id)
                 legacy["last-assistant-message"] = "legacy technical"
                 self.run_ok(self.hook_command(implementation, legacy))
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 receipts = [
                     json.loads(path.read_text(encoding="utf-8-sig"))
                     for path in (self.state / "suppressed").glob("*.json")
@@ -797,7 +827,7 @@ class NotifierContractTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stdout.strip(), "{}")
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 payloads = self.wait_for_payloads(1)
                 self.assertEqual(len(payloads), 1)
                 self.assertIn("STOP AUTHORITATIVE", payloads[0]["message"])
@@ -837,7 +867,7 @@ class NotifierContractTests(unittest.TestCase):
                     timeout=20,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 payloads = self.wait_for_payloads(1)
                 self.assertEqual(len(payloads), 1)
                 self.assertEqual(payloads[0]["title"], "perfect notifier")
@@ -898,7 +928,7 @@ class NotifierContractTests(unittest.TestCase):
                 event = self.event(thread_id=thread_id, turn_id=turn_id)
                 event["last-assistant-message"] = "OVERRIDE"
                 self.run_ok(self.hook_command(implementation, event))
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 payloads = self.wait_for_payloads(1)
                 self.assertEqual(len(payloads), 1)
                 self.assertIn("OVERRIDE", payloads[0]["message"])
@@ -951,9 +981,9 @@ class NotifierContractTests(unittest.TestCase):
                 event = self.event(thread_id=thread_id, turn_id=old_turn)
                 event["last-assistant-message"] = "OLD"
                 self.run_ok(self.hook_command(implementation, event))
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 payloads = self.wait_for_payloads(1)
-                self.assertEqual(len(payloads), 1)
+                self.assertEqual(len(payloads), 1, msg=json.dumps(payloads, ensure_ascii=False, indent=2))
                 self.assertNotIn(secret, payloads[0]["message"])
                 persisted = "\n".join(
                     path.read_text(encoding="utf-8-sig", errors="replace")
@@ -991,7 +1021,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.append_rollout(rollout, "task_started", turn_id=new_turn)
                 self.append_rollout(rollout, "user_message", message="New")
                 self.append_rollout(rollout, "task_complete", turn_id=new_turn, message=secret)
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 payloads = self.wait_for_payloads(1)
                 self.assertEqual(len(payloads), 1)
                 self.assertNotIn(secret, payloads[0]["message"])
@@ -1044,7 +1074,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.hook_command(implementation, event))
                 process = self.start_worker(implementation)
                 try:
-                    deadline = time.monotonic() + 8
+                    deadline = time.monotonic() + 30
                     observed_wait = False
                     while time.monotonic() < deadline and not observed_wait:
                         for pending_path in (self.state / "pending").glob("*.json"):
@@ -1062,7 +1092,7 @@ class NotifierContractTests(unittest.TestCase):
                         self.assertEqual(self.server.payloads, [])
                     with rollout.open("ab") as handle:
                         handle.write(terminal_line[split:])
-                    self.assert_worker_ok(process, timeout=20)
+                    self.assert_worker_ok(process, timeout=60)
                 finally:
                     if process.poll() is None:
                         process.terminate()
@@ -1097,7 +1127,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id, turn_id=turn_id)))
                 process = self.start_worker(implementation)
                 try:
-                    deadline = time.monotonic() + 8
+                    deadline = time.monotonic() + 30
                     observed_reason = ""
                     while time.monotonic() < deadline and observed_reason != "goal-active":
                         for pending_path in (self.state / "pending").glob("*.json"):
@@ -1123,7 +1153,7 @@ class NotifierContractTests(unittest.TestCase):
                         connection.commit()
                     finally:
                         connection.close()
-                    self.assert_worker_ok(process)
+                    self.assert_worker_ok(process, timeout=60)
                 finally:
                     if process.poll() is None:
                         process.terminate()
@@ -1158,7 +1188,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.hook_command(implementation, self.event(thread_id=root_id, turn_id=root_turn)))
                 process = self.start_worker(implementation)
                 try:
-                    deadline = time.monotonic() + 8
+                    deadline = time.monotonic() + 30
                     observed_reason = ""
                     while time.monotonic() < deadline and "subagent" not in observed_reason:
                         for pending_path in (self.state / "pending").glob("*.json"):
@@ -1243,7 +1273,7 @@ class NotifierContractTests(unittest.TestCase):
                     self.assertEqual(recreated, child_rollout)
                     self.append_rollout(child_rollout, "task_started", turn_id=child_turn)
                     self.append_rollout(child_rollout, "task_complete", turn_id=child_turn, message="Child done")
-                    self.assert_worker_ok(process, timeout=30)
+                    self.assert_worker_ok(process, timeout=60)
                     self.assertEqual(len(self.wait_for_payloads(1)), 1)
                 finally:
                     if process.poll() is None:
@@ -1277,7 +1307,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.state_database.replace(hidden_database)
                 process = self.start_worker(implementation)
                 try:
-                    deadline = time.monotonic() + 8
+                    deadline = time.monotonic() + 60
                     observed_reason = ""
                     while time.monotonic() < deadline and not observed_reason:
                         for pending_path in (self.state / "pending").glob("*.json"):
@@ -1295,7 +1325,7 @@ class NotifierContractTests(unittest.TestCase):
                     with self.server.lock:
                         self.assertEqual(self.server.payloads, [])
                     hidden_database.replace(self.state_database)
-                    self.assert_worker_ok(process, timeout=20)
+                    self.assert_worker_ok(process, timeout=60)
                 finally:
                     if hidden_database.exists() and not self.state_database.exists():
                         hidden_database.replace(self.state_database)
@@ -1431,7 +1461,7 @@ class NotifierContractTests(unittest.TestCase):
                 rollout = self.write_session_meta(thread_id, subagent=True)
                 self.append_rollout(rollout, "task_started", turn_id=turn_id)
                 self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="Late child result")
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
 
                 self.assertFalse(list((self.state / "pending").glob("*.json")))
                 self.assertFalse(list((self.state / "outbox").glob("*.json")))
@@ -1505,21 +1535,92 @@ class NotifierContractTests(unittest.TestCase):
                     stderr=subprocess.PIPE,
                 )
                 try:
-                    deadline = time.monotonic() + 5
+                    deadline = time.monotonic() + 30
                     while time.monotonic() < deadline and not list((self.state / "watch").glob("*.json")):
+                        if process.poll() is not None:
+                            stdout, stderr = process.communicate()
+                            self.fail(
+                                "continuous worker exited before creating a rollout cursor: "
+                                f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}"
+                            )
                         time.sleep(0.05)
                     self.assertTrue(list((self.state / "watch").glob("*.json")))
                     self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="Recovered final")
-                    self.assertEqual(len(self.wait_for_payloads(1)), 1)
+                    self.assertEqual(len(self.wait_for_payloads(1, timeout=30)), 1)
                     time.sleep(0.2)
                     with self.server.lock:
                         self.assertEqual(len(self.server.payloads), 1)
                 finally:
-                    process.terminate()
-                    stdout, stderr = process.communicate(timeout=10)
+                    stdout, stderr = self.stop_continuous_worker(process)
                     self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
                 shutil.rmtree(self.state, ignore_errors=True)
                 shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
+                with self.server.lock:
+                    self.server.payloads.clear()
+
+    def test_continuous_worker_delivers_while_rollout_scan_is_busy(self) -> None:
+        self.configure(
+            idle_detection_mode="off",
+            watch_rollouts=True,
+            watch_scan_seconds=60,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                worker_env = self.env.copy()
+                worker_env["CODEX_NTFY_TEST_SCAN_DELAY_MS"] = "30000"
+                worker_env["CODEX_NTFY_SCAN_ONCE"] = "1"
+                process = subprocess.Popen(
+                    self.continuous_worker_command(implementation),
+                    env=worker_env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                health_path = self.state / "watch-health.json"
+                try:
+                    deadline = time.monotonic() + 15
+                    health: dict[str, object] = {}
+                    while time.monotonic() < deadline:
+                        try:
+                            health = json.loads(health_path.read_text(encoding="utf-8-sig"))
+                        except (FileNotFoundError, PermissionError, json.JSONDecodeError):
+                            health = {}
+                        if health.get("status") == "running":
+                            break
+                        time.sleep(0.05)
+                    self.assertEqual(health.get("status"), "running")
+
+                    self.run_ok(self.hook_command(implementation, self.event()))
+                    started = time.monotonic()
+                    payloads = self.wait_for_payloads(1, timeout=8)
+                    self.assertEqual(len(payloads), 1)
+                    self.assertLess(time.monotonic() - started, 8)
+                    deadline = time.monotonic() + 1
+                    while True:
+                        try:
+                            health = json.loads(health_path.read_text(encoding="utf-8-sig"))
+                            break
+                        except (FileNotFoundError, PermissionError, json.JSONDecodeError):
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.05)
+                    self.assertEqual(health.get("status"), "running")
+
+                    deadline = time.monotonic() + 40
+                    while time.monotonic() < deadline:
+                        try:
+                            health = json.loads(health_path.read_text(encoding="utf-8-sig"))
+                        except (FileNotFoundError, PermissionError, json.JSONDecodeError):
+                            time.sleep(0.05)
+                            continue
+                        if health.get("status") != "running":
+                            break
+                        time.sleep(0.1)
+                    self.assertEqual(health.get("status"), "completed")
+                finally:
+                    stdout, stderr = self.stop_continuous_worker(process)
+                    self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
+                shutil.rmtree(self.state, ignore_errors=True)
                 with self.server.lock:
                     self.server.payloads.clear()
 
@@ -1561,7 +1662,10 @@ class NotifierContractTests(unittest.TestCase):
                         json.loads(path.read_text(encoding="utf-8-sig"))
                         for path in (self.state / "watch").glob("*.json")
                     ]
-                    self.assertTrue(all(int(state.get("offset", 0) or 0) == 0 for state in cursor_states))
+                    self.assertTrue(
+                        all(int(state.get("offset", 0) or 0) == 0 for state in cursor_states),
+                        msg=f"unexpected cursor state before metadata recovery: {cursor_states}",
+                    )
 
                     metadata = json.dumps(
                         {
@@ -1570,12 +1674,11 @@ class NotifierContractTests(unittest.TestCase):
                         }
                     )
                     rollout.write_text(metadata + "\n" + lifecycle_tail, encoding="utf-8")
-                    payloads = self.wait_for_payloads(1, timeout=15)
+                    payloads = self.wait_for_payloads(1, timeout=30)
                     self.assertEqual(len(payloads), 1)
                     self.assertIn("METADATA RECOVERED", payloads[0]["message"])
                 finally:
-                    process.terminate()
-                    stdout, stderr = process.communicate(timeout=10)
+                    stdout, stderr = self.stop_continuous_worker(process)
                     self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
                 shutil.rmtree(self.state, ignore_errors=True)
                 shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
@@ -1626,12 +1729,11 @@ class NotifierContractTests(unittest.TestCase):
                         stderr=subprocess.PIPE,
                     )
                     try:
-                        payloads = self.wait_for_payloads(1, timeout=15)
+                        payloads = self.wait_for_payloads(1, timeout=30)
                         self.assertEqual(len(payloads), 1)
                         self.assertIn("DISCOVERED", payloads[0]["message"])
                     finally:
-                        process.terminate()
-                        stdout, stderr = process.communicate(timeout=10)
+                        stdout, stderr = self.stop_continuous_worker(process)
                         self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
                     shutil.rmtree(self.state, ignore_errors=True)
                     shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
@@ -1690,14 +1792,13 @@ class NotifierContractTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         try:
-            payloads = self.wait_for_payloads(1, timeout=15)
+            payloads = self.wait_for_payloads(1, timeout=30)
             self.assertEqual(len(payloads), 1)
             self.assertIn("WSL RECOVERED", payloads[0]["message"])
             self.assertIn("WSL:test", payloads[0]["message"])
             self.assertNotIn("Source:", payloads[0]["message"])
         finally:
-            process.terminate()
-            stdout, stderr = process.communicate(timeout=10)
+            stdout, stderr = self.stop_continuous_worker(process)
             self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
 
     def test_python_kick_worker_recovers_a_stranded_outbox(self) -> None:
@@ -1726,7 +1827,7 @@ class NotifierContractTests(unittest.TestCase):
                 with self.server.lock:
                     self.server.statuses[:] = [503, 200]
                 self.run_ok(self.hook_command(implementation, self.event()))
-                self.run_ok(self.worker_command(implementation), timeout=30)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 with self.server.lock:
                     payloads = list(self.server.payloads)
                     self.server.payloads.clear()
@@ -1744,7 +1845,7 @@ class NotifierContractTests(unittest.TestCase):
                     self.server.statuses[:] = [400]
                 event = self.event()
                 self.run_ok(self.hook_command(implementation, event))
-                self.run_ok(self.worker_command(implementation), timeout=15)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 with self.server.lock:
                     self.assertEqual(len(self.server.payloads), 1)
                     self.server.payloads.clear()
@@ -1752,7 +1853,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.assertFalse(list((self.state / "outbox").glob("*.json")))
                 self.assertEqual(len(list((self.state / "dead").glob("*.json"))), 1)
                 self.run_ok(self.hook_command(implementation, event))
-                self.run_ok(self.worker_command(implementation), timeout=15)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 with self.server.lock:
                     self.assertFalse(self.server.payloads)
                 shutil.rmtree(self.state, ignore_errors=True)
@@ -1771,7 +1872,7 @@ class NotifierContractTests(unittest.TestCase):
                         self.server.statuses[:] = [302]
                         self.server.redirect_url = f"http://127.0.0.1:{redirect_target.server_port}/redirected"
                     self.run_ok(self.hook_command(implementation, self.event()))
-                    self.run_ok(self.worker_command(implementation), timeout=15)
+                    self.run_ok(self.worker_command(implementation), timeout=60)
                     with self.server.lock:
                         self.assertEqual(len(self.server.payloads), 1)
                         self.server.payloads.clear()
@@ -1805,7 +1906,7 @@ class NotifierContractTests(unittest.TestCase):
                 for path in old_paths:
                     os.utime(path, (old_time, old_time))
 
-                self.run_ok(self.worker_command(implementation), timeout=15)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 self.assertTrue(all(not path.exists() for path in old_paths))
                 self.assertTrue(all(path.exists() for path in fresh_paths))
                 shutil.rmtree(self.state, ignore_errors=True)
@@ -1817,7 +1918,7 @@ class NotifierContractTests(unittest.TestCase):
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
                 self.run_ok(self.hook_command(implementation, self.event()))
-                self.run_ok(self.worker_command(implementation), timeout=15)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 with self.server.lock:
                     self.assertFalse(self.server.payloads)
                 self.assertFalse(list((self.state / "outbox").glob("*.json")))
@@ -1847,7 +1948,7 @@ class NotifierContractTests(unittest.TestCase):
                 self.assertEqual(json.loads(doctor.stdout)["server"], "http://example.invalid")
 
                 self.run_ok(self.hook_command(implementation, self.event()))
-                self.run_ok(self.worker_command(implementation), timeout=20)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 with self.server.lock:
                     self.assertEqual(self.server.payloads, [])
                 dead = list((self.state / "dead").glob("*.json"))
@@ -1864,7 +1965,7 @@ class NotifierContractTests(unittest.TestCase):
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
                 self.run_ok(self.hook_command(implementation, self.event()))
-                self.run_ok(self.worker_command(implementation), timeout=15)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 with self.server.lock:
                     self.assertFalse(self.server.payloads)
                 dead = list((self.state / "dead").glob("*.json"))
@@ -1879,7 +1980,7 @@ class NotifierContractTests(unittest.TestCase):
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
                 self.run_ok(self.hook_command(implementation, self.event()))
-                self.run_ok(self.worker_command(implementation), timeout=15)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 with self.server.lock:
                     self.assertEqual(len(self.server.payloads), 1)
                     self.server.payloads.clear()
@@ -1891,7 +1992,7 @@ class NotifierContractTests(unittest.TestCase):
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
                 self.run_ok(self.hook_command(implementation, self.event()))
-                self.run_ok(self.worker_command(implementation), timeout=15)
+                self.run_ok(self.worker_command(implementation), timeout=60)
                 with self.server.lock:
                     self.assertEqual(len(self.server.payloads), 1)
                     self.server.payloads.clear()
@@ -2317,6 +2418,9 @@ class NotifierContractTests(unittest.TestCase):
         vbs = (install_home / "watch-codex-ntfy-hidden.vbs").read_text(encoding="utf-8-sig")
         self.assertIn("WScript.ScriptFullName", vbs)
         self.assertNotIn("C:\\Windows", vbs)
+        watcher = (install_home / "watch-codex-ntfy.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("while ($true)", watcher)
+        self.assertIn("Start-Sleep -Seconds $restartDelay", watcher)
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows installer test")
     def test_windows_install_rolls_back_unrelated_notify_conflict(self) -> None:

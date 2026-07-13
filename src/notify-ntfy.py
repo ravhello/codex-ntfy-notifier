@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import ctypes
 import datetime as dt
 import hashlib
 import json
@@ -144,6 +145,11 @@ class Runtime:
         self.watch = self.state_root / "watch"
         self.mutation_locks = self.state_root / "mutation-locks"
         self.lock_path = self.state_root / "worker.lock"
+        self.delivery_lock_path = self.state_root / "delivery.lock"
+        self.worker_health_path = self.state_root / "worker-health.json"
+        self.delivery_health_path = self.state_root / "delivery-health.json"
+        self.scan_lock_path = self.state_root / "watch-scan.lock"
+        self.scan_health_path = self.state_root / "watch-health.json"
         self.log_path = self.state_root / "notify.log"
         self.last_watch_discovery_ms = 0
         self.watch_discovery_cache: dict[str, Path] = {}
@@ -1438,7 +1444,11 @@ def scan_rollout_file(
     now_ms: int,
     *,
     force_replay: bool = False,
+    parent_pid: int = 0,
+    parent_token: str = "",
 ) -> int:
+    if not scan_parent_is_alive(runtime, parent_pid, parent_token):
+        return 0
     state_id = hashlib.sha256(str(path).encode("utf-8")).hexdigest()
     state_path = runtime.watch / f"{state_id}.json"
     state: dict[str, Any] = {}
@@ -1466,6 +1476,8 @@ def scan_rollout_file(
         return 0
     newline = data.rfind(b"\n")
     if newline < 0:
+        if not scan_parent_is_alive(runtime, parent_pid, parent_token):
+            return 0
         atomic_write_json(
             state_path,
             {"schema": 1, "rollout_path": str(path), "offset": offset, "seen_unix_ms": now_ms},
@@ -1534,6 +1546,8 @@ def scan_rollout_file(
             record["rollout_identity"] = str(path)
             record["completion_end_offset"] = line_end_offset
             record["completion_timestamp"] = str(envelope.get("timestamp", ""))
+            if not scan_parent_is_alive(runtime, parent_pid, parent_token):
+                return 0
             if config["suppress_subagents"] and classification == "subagent":
                 write_suppressed_receipt(runtime, record, "subagent")
             elif config["idle_detection_mode"] == "off":
@@ -1545,6 +1559,8 @@ def scan_rollout_file(
         # A transient failure while reading session_meta must not turn a
         # persisted completion into a permanently skipped cursor range.
         runtime.log(f"watcher retained cursor: session identity unavailable path_hash={state_id[:12]}")
+        return 0
+    if not scan_parent_is_alive(runtime, parent_pid, parent_token):
         return 0
     atomic_write_json(
         state_path,
@@ -1559,9 +1575,18 @@ def scan_rollout_file(
     return queued
 
 
-def scan_rollouts(runtime: Runtime, config: dict[str, Any], now_ms: int) -> int:
+def scan_rollouts(
+    runtime: Runtime,
+    config: dict[str, Any],
+    now_ms: int,
+    *,
+    parent_pid: int = 0,
+    parent_token: str = "",
+) -> int:
     queued = 0
     for path in recent_rollouts(runtime, config, now_ms):
+        if not scan_parent_is_alive(runtime, parent_pid, parent_token):
+            return queued
         key = str(path)
         queued += scan_rollout_file(
             runtime,
@@ -1569,6 +1594,8 @@ def scan_rollouts(runtime: Runtime, config: dict[str, Any], now_ms: int) -> int:
             path,
             now_ms,
             force_replay=key in runtime.watch_force_replay_paths,
+            parent_pid=parent_pid,
+            parent_token=parent_token,
         )
         cursor = runtime.watch / f"{hashlib.sha256(key.encode('utf-8')).hexdigest()}.json"
         if cursor.exists():
@@ -1770,47 +1797,287 @@ def validate_record(record: Any, expected_key: str) -> dict[str, Any]:
     return record
 
 
+def _try_lock(handle: Any) -> bool:
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
+def _unlock(handle: Any) -> None:
+    with contextlib.suppress(OSError):
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        else:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def scan_parent_is_alive(runtime: Runtime, pid: int, token: str) -> bool:
+    if pid <= 0 and not token:
+        return True
+    if pid <= 0 or not process_is_alive(pid):
+        return False
+    try:
+        health = read_json(runtime.worker_health_path)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(health, dict) and int(health.get("pid", 0) or 0) == pid and str(health.get("token", "")) == token
+
+
+def write_scan_health(
+    runtime: Runtime,
+    *,
+    status: str,
+    started_at: str,
+    completed_at: str = "",
+    duration_ms: int = 0,
+    observed: int = 0,
+    error: str = "",
+) -> None:
+    try:
+        atomic_write_json(
+            runtime.scan_health_path,
+            {
+                "schema": 1,
+                "status": status,
+                "pid": os.getpid(),
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "duration_ms": duration_ms,
+                "observed": observed,
+                "error": error,
+            },
+        )
+    except OSError as exc:
+        runtime.log(f"rollout scan health error: {sanitize(exc, 240)}")
+
+
+def scan_worker(runtime: Runtime, *, continuous: bool, parent_pid: int, parent_token: str) -> int:
+    runtime.ensure()
+    lock_handle = runtime.scan_lock_path.open("a+b")
+    if not _try_lock(lock_handle):
+        lock_handle.close()
+        return 0
+    try:
+        while True:
+            if not scan_parent_is_alive(runtime, parent_pid, parent_token):
+                return 0
+            started = utc_now()
+            started_at = started.isoformat()
+            write_scan_health(runtime, status="running", started_at=started_at)
+            runtime.log(f"rollout scan started pid={os.getpid()}")
+            try:
+                try:
+                    test_delay_ms = max(0, int(os.environ.get("CODEX_NTFY_TEST_SCAN_DELAY_MS", "0")))
+                except ValueError:
+                    test_delay_ms = 0
+                if test_delay_ms:
+                    time.sleep(test_delay_ms / 1000)
+                config = load_config(runtime)
+                observed = scan_rollouts(
+                    runtime,
+                    config,
+                    unix_ms(),
+                    parent_pid=parent_pid,
+                    parent_token=parent_token,
+                )
+                completed = utc_now()
+                duration_ms = max(0, int((completed - started).total_seconds() * 1000))
+                write_scan_health(
+                    runtime,
+                    status="completed",
+                    started_at=started_at,
+                    completed_at=completed.isoformat(),
+                    duration_ms=duration_ms,
+                    observed=observed,
+                )
+                runtime.log(f"rollout scan completed observed={observed} duration_ms={duration_ms}")
+            except Exception as exc:
+                completed = utc_now()
+                duration_ms = max(0, int((completed - started).total_seconds() * 1000))
+                error = sanitize(exc, 300)
+                write_scan_health(
+                    runtime,
+                    status="failed",
+                    started_at=started_at,
+                    completed_at=completed.isoformat(),
+                    duration_ms=duration_ms,
+                    error=error,
+                )
+                runtime.log(f"rollout watcher error: {error}")
+                return 1
+            if not continuous:
+                return 0
+            sleep_until = time.monotonic() + max(0.1, float(config["watch_scan_seconds"]))
+            while time.monotonic() < sleep_until:
+                if not scan_parent_is_alive(runtime, parent_pid, parent_token):
+                    return 0
+                time.sleep(min(0.5, max(0.01, sleep_until - time.monotonic())))
+    finally:
+        _unlock(lock_handle)
+        lock_handle.close()
+
+
+def start_scan_worker(parent_token: str) -> subprocess.Popen[bytes]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--scan-rollouts",
+        "--scan-parent-pid",
+        str(os.getpid()),
+        "--scan-parent-token",
+        parent_token,
+    ]
+    if os.environ.get("CODEX_NTFY_SCAN_ONCE") != "1":
+        command.append("--continuous")
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.Popen(command, **kwargs)
+
+
+def start_delivery_worker(parent_token: str, poll_seconds: float) -> subprocess.Popen[bytes]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--continuous",
+        "--delivery-only",
+        "--poll-seconds",
+        str(poll_seconds),
+    ]
+    env = os.environ.copy()
+    env["CODEX_NTFY_PARENT_PID"] = str(os.getpid())
+    env["CODEX_NTFY_PARENT_TOKEN"] = parent_token
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+        "env": env,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.Popen(command, **kwargs)
+
+
 def worker(
     runtime: Runtime,
     *,
     continuous: bool,
+    delivery_only: bool,
     poll_seconds: float,
     retry_base_seconds: float,
 ) -> int:
     runtime.ensure()
-    lock_handle = runtime.lock_path.open("a+b")
-    lock_acquired = False
+    lock_handle = (runtime.delivery_lock_path if delivery_only else runtime.lock_path).open("a+b")
+    lock_acquired = _try_lock(lock_handle)
+    scan_process: subprocess.Popen[bytes] | None = None
+    delivery_process: subprocess.Popen[bytes] | None = None
+    if not lock_acquired:
+        lock_handle.close()
+        return 0
+    worker_token = str(os.environ.get("CODEX_NTFY_PARENT_TOKEN", "")) if delivery_only else uuid.uuid4().hex
     try:
-        try:
-            if fcntl is not None:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            else:
-                lock_handle.seek(0, os.SEEK_END)
-                if lock_handle.tell() == 0:
-                    lock_handle.write(b"\0")
-                    lock_handle.flush()
-                lock_handle.seek(0)
-                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
-            lock_acquired = True
-        except (BlockingIOError, OSError):
-            return 0
+        if not delivery_only:
+            atomic_write_json(
+                runtime.worker_health_path,
+                {"schema": 1, "pid": os.getpid(), "token": worker_token, "started_at": utc_now().isoformat()},
+            )
+        else:
+            atomic_write_json(
+                runtime.delivery_health_path,
+                {
+                    "schema": 1,
+                    "pid": os.getpid(),
+                    "parent_pid": int(os.environ.get("CODEX_NTFY_PARENT_PID", "0") or 0),
+                    "token": worker_token,
+                    "started_at": utc_now().isoformat(),
+                },
+            )
+        if continuous and not delivery_only:
+            delivery_process = start_delivery_worker(worker_token, poll_seconds)
         cleaned = False
         next_watch_scan_ms = 0
-        runtime.log(f"worker started continuous={continuous}")
+        runtime.log(f"worker started continuous={continuous} delivery_only={delivery_only}")
         while True:
+            if delivery_only and not scan_parent_is_alive(
+                runtime,
+                int(os.environ.get("CODEX_NTFY_PARENT_PID", "0") or 0),
+                worker_token,
+            ):
+                return 0
             config = load_config(runtime)
-            if not cleaned:
+            if not cleaned and not delivery_only:
                 clean_runtime_state(runtime, config["sent_retention_days"], config["dead_retention_days"])
                 cleaned = True
             now = unix_ms()
-            if continuous and config.get("watch_rollouts", True) and now >= next_watch_scan_ms:
-                discovered = scan_rollouts(runtime, config, now)
-                if discovered:
-                    runtime.log(f"rollout watcher observed completions={discovered}")
+            if not delivery_only and continuous and delivery_process is not None and delivery_process.poll() is not None:
+                runtime.log(f"delivery worker exited code={delivery_process.returncode}")
+                delivery_process = start_delivery_worker(worker_token, poll_seconds)
+            if not delivery_only and continuous and delivery_process is None:
+                delivery_process = start_delivery_worker(worker_token, poll_seconds)
+            if not config.get("watch_rollouts", True) and scan_process is not None:
+                if scan_process.poll() is None:
+                    with contextlib.suppress(OSError):
+                        scan_process.terminate()
+                scan_process = None
+            if scan_process is not None and scan_process.poll() is not None:
+                if scan_process.returncode:
+                    runtime.log(f"rollout scan process exited code={scan_process.returncode}")
+                scan_process = None
                 next_watch_scan_ms = now + int(max(0.5, float(config["watch_scan_seconds"])) * 1000)
-            coalesce_thread_records(runtime, config)
-            next_due = process_pending(runtime, config, now)
-            for path in sorted(runtime.outbox.glob("*.json"), key=lambda item: (item.stat().st_mtime_ns, item.name)):
+            if not delivery_only and continuous and config.get("watch_rollouts", True) and scan_process is None and now >= next_watch_scan_ms:
+                try:
+                    scan_process = start_scan_worker(worker_token)
+                except OSError as exc:
+                    runtime.log(f"failed to start rollout scan: {sanitize(exc, 300)}")
+                    next_watch_scan_ms = now + int(max(0.5, float(config["watch_scan_seconds"])) * 1000)
+            if not delivery_only:
+                coalesce_thread_records(runtime, config)
+                next_due = process_pending(runtime, config, now)
+            else:
+                next_due = None
+            outbox_paths = (
+                sorted(runtime.outbox.glob("*.json"), key=lambda item: (item.stat().st_mtime_ns, item.name))
+                if delivery_only or not continuous
+                else []
+            )
+            for path in outbox_paths:
                 try:
                     record = validate_record(read_json(path), path.stem)
                 except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -1908,14 +2175,25 @@ def worker(
                 sleep_for = min(sleep_for, max(0.1, (next_due - unix_ms()) / 1000))
             time.sleep(sleep_for)
     finally:
-        if lock_acquired:
+        if delivery_process is not None and delivery_process.poll() is None:
             with contextlib.suppress(OSError):
-                if fcntl is not None:
-                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-                else:
-                    lock_handle.seek(0)
-                    msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+                delivery_process.terminate()
+        if scan_process is not None and scan_process.poll() is None:
+            with contextlib.suppress(OSError):
+                scan_process.terminate()
+        if lock_acquired:
+            _unlock(lock_handle)
         lock_handle.close()
+        if not delivery_only:
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                health = read_json(runtime.worker_health_path)
+                if isinstance(health, dict) and str(health.get("token", "")) == worker_token:
+                    runtime.worker_health_path.unlink(missing_ok=True)
+        else:
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                health = read_json(runtime.delivery_health_path)
+                if isinstance(health, dict) and str(health.get("token", "")) == worker_token:
+                    runtime.delivery_health_path.unlink(missing_ok=True)
         runtime.log("worker stopped")
 
 
@@ -1936,6 +2214,15 @@ def start_worker(args: argparse.Namespace, runtime: Runtime) -> None:
 def doctor(runtime: Runtime) -> int:
     runtime.ensure()
     config = load_config(runtime)
+    outbox_files = list(runtime.outbox.glob("*.json"))
+    oldest_queued_seconds = 0.0
+    if outbox_files:
+        oldest_queued_seconds = round(max(0.0, time.time() - min(path.stat().st_mtime for path in outbox_files)), 1)
+    scan_health: dict[str, Any] = {}
+    with contextlib.suppress(OSError, json.JSONDecodeError, TypeError):
+        value = read_json(runtime.scan_health_path)
+        if isinstance(value, dict):
+            scan_health = value
     print(
         json.dumps(
             {
@@ -1956,7 +2243,13 @@ def doctor(runtime: Runtime) -> int:
                 ),
                 "state_dir": str(runtime.state_root),
                 "pending_idle": sum(1 for _ in runtime.pending.glob("*.json")),
-                "queued": sum(1 for _ in runtime.outbox.glob("*.json")),
+                "queued": len(outbox_files),
+                "oldest_queued_seconds": oldest_queued_seconds,
+                "watch_scan_status": str(scan_health.get("status", "unknown")),
+                "watch_scan_started_at": str(scan_health.get("started_at", "")),
+                "watch_scan_completed_at": str(scan_health.get("completed_at", "")),
+                "watch_scan_duration_ms": int(scan_health.get("duration_ms", 0) or 0),
+                "watch_scan_observed": int(scan_health.get("observed", 0) or 0),
                 "sent_receipts": sum(1 for _ in runtime.sent.glob("*.json")),
                 "suppressed": sum(1 for _ in runtime.suppressed.glob("*.json")),
                 "dead_letters": sum(1 for _ in runtime.dead.glob("*.json")),
@@ -1983,6 +2276,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--kick-worker", action="store_true", help="Start an on-demand worker only when the outbox is nonempty")
     parser.add_argument("--continuous", action="store_true")
+    parser.add_argument("--delivery-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--scan-rollouts", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--scan-parent-pid", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--scan-parent-token", default="", help=argparse.SUPPRESS)
     parser.add_argument("--no-spawn", action="store_true")
     parser.add_argument("--doctor", action="store_true")
     parser.add_argument("--classify", action="store_true", help="Classify one hook payload without queueing or network access")
@@ -1999,6 +2296,13 @@ def main(argv: list[str] | None = None) -> int:
         runtime.ensure()
         if args.doctor:
             return doctor(runtime)
+        if args.scan_rollouts:
+            return scan_worker(
+                runtime,
+                continuous=args.continuous,
+                parent_pid=args.scan_parent_pid,
+                parent_token=args.scan_parent_token,
+            )
         if args.kick_worker:
             if any(runtime.pending.glob("*.json")) or any(runtime.outbox.glob("*.json")):
                 start_worker(args, runtime)
@@ -2008,6 +2312,7 @@ def main(argv: list[str] | None = None) -> int:
             return worker(
                 runtime,
                 continuous=args.continuous,
+                delivery_only=args.delivery_only,
                 poll_seconds=args.poll_seconds,
                 retry_base_seconds=args.retry_base_seconds,
             )
@@ -2041,12 +2346,16 @@ def main(argv: list[str] | None = None) -> int:
                 print("{}")
             return 0
         thread_id = str(obj_value(event, "thread-id", "thread_id", default=""))
-        detected_classification = event_classification(
-            runtime,
-            event,
-            thread_id,
-            str(runtime.codex_home),
-            str(runtime.sqlite_home),
+        detected_classification = (
+            "root"
+            if args.test
+            else event_classification(
+                runtime,
+                event,
+                thread_id,
+                str(runtime.codex_home),
+                str(runtime.sqlite_home),
+            )
         )
         classification = (
             "subagent"
