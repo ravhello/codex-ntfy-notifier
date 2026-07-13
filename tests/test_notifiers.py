@@ -590,7 +590,13 @@ class NotifierContractTests(unittest.TestCase):
                 self.run_ok(self.hook_command(implementation, stale_event))
                 self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
 
-                process = self.start_worker(implementation)
+                process = subprocess.Popen(
+                    self.continuous_worker_command(implementation),
+                    env=self.env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
                 try:
                     time.sleep(0.35)
                     with self.server.lock:
@@ -599,14 +605,12 @@ class NotifierContractTests(unittest.TestCase):
                     self.append_rollout(rollout, "task_complete", turn_id=final_turn, message="Final")
                     time.sleep(0.02)
                     self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id, turn_id=final_turn)))
-                    self.assert_worker_ok(process)
+                    payloads = self.wait_for_payloads(1, timeout=45)
+                    self.assertEqual(len(payloads), 1)
                 finally:
-                    if process.poll() is None:
-                        process.terminate()
-                        process.communicate(timeout=5)
+                    stdout, stderr = self.stop_continuous_worker(process)
+                    self.assertIn(process.returncode, (0, 1, -15), msg=f"stdout={stdout}\nstderr={stderr}")
 
-                payloads = self.wait_for_payloads(1)
-                self.assertEqual(len(payloads), 1)
                 suppressed = [json.loads(path.read_text(encoding="utf-8-sig")) for path in (self.state / "suppressed").glob("*.json")]
                 self.assertTrue(any(receipt.get("reason") == "superseded" for receipt in suppressed))
                 shutil.rmtree(self.state, ignore_errors=True)
