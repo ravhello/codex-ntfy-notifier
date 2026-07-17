@@ -3793,7 +3793,13 @@ Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $env:FAKE_CLAU
         for managed_event, handler in managed:
             self.assertEqual(handler["command"], str(WINDOWS_POWERSHELL))
             self.assertIn("-ReadStdin", handler["args"])
-            self.assertIn(str(install_home / "notify-ntfy.ps1"), handler["args"])
+            file_index = handler["args"].index("-File")
+            self.assertTrue(
+                os.path.samefile(
+                    handler["args"][file_index + 1],
+                    install_home / "notify-ntfy.ps1",
+                )
+            )
             self.assertEqual(handler["args"][-2:], ["-Origin", "Claude Code"])
             self.assertEqual(handler["async"], managed_event == "Notification")
             self.assertEqual(handler["timeout"], 30)
