@@ -1,17 +1,22 @@
 ---
 layout: default
 title: Codex ntfy Notifier
-description: Idle-only, durable ntfy notifications for local OpenAI Codex tasks across the app, VS Code, CLI, WSL, Linux, and Remote SSH.
+description: Idle-only, durable ntfy notifications for local OpenAI Codex tasks and opt-in Claude Code on Windows.
 ---
 
 ![Codex ntfy Notifier](assets/hero.svg)
 
-# Know when Codex is actually idle
+# Know when your coding task is actually idle
 
 Codex ntfy Notifier sends an ntfy push after local lifecycle evidence
 indicates that a root Codex task has no more work. Intermediate turn signals are
 held behind an idle gate, while a durable outbox retries transient delivery
 failures.
+
+Version 2.5 also connects local Claude Code on Windows—including Claude
+Desktop's Code tab—through managed lifecycle hooks and a transcript-backed
+`/goal` finality gate, while reusing the same durable queue. A manual goal clear
+is discarded rather than announced as a completion.
 
 [View the repository](https://github.com/ravhello/codex-ntfy-notifier) ·
 [Install the latest release](https://github.com/ravhello/codex-ntfy-notifier/releases/latest) ·
@@ -20,6 +25,7 @@ failures.
 ## Built for real Codex setups
 
 - Codex app, VS Code extension, and CLI
+- opt-in Claude Code on Windows (Desktop Code tab, CLI, and VS Code)
 - Windows, WSL2, native Linux, and Remote SSH hosts
 - concurrent tasks, automatic continuations, active goals, and delegated agents
 - temporary network failures, with a persistent outbox and capped retry backoff
@@ -39,6 +45,9 @@ git clone https://github.com/ravhello/codex-ntfy-notifier.git
 cd codex-ntfy-notifier
 .\install.ps1 -WslDistro Ubuntu
 ```
+
+Add `-EnableClaudeCode` to that command to merge the Claude handlers without
+replacing existing user hooks.
 
 Native Linux:
 
@@ -69,4 +78,4 @@ thread-and-turn identities.
 [Contributing](https://github.com/ravhello/codex-ntfy-notifier/blob/main/CONTRIBUTING.md)
 
 > This is an unofficial community project. It is not affiliated with or
-> endorsed by OpenAI or ntfy.
+> endorsed by OpenAI, Anthropic, or ntfy.

@@ -6,20 +6,20 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![Windows PowerShell 5.1](https://img.shields.io/badge/Windows%20PowerShell-5.1-5391FE.svg)](https://learn.microsoft.com/powershell/)
 
-One compact ntfy push when a local OpenAI Codex root task is verifiably idle—not for intermediate turns. Works with the Codex app, VS Code extension, CLI, WSL, and Remote SSH hosts.
+One compact ntfy push when a local OpenAI Codex root task is verifiably idle—not for intermediate turns. It also supports Claude Code on Windows, including the Code tab in Claude Desktop, through opt-in native lifecycle hooks.
 
 ![Codex ntfy Notifier waits for locally verifiable idle before sending one compact completion notification](docs/assets/hero.svg)
 
 [Italiano](README.it.md) · [Architecture](docs/architecture.md) · [Privacy and security](docs/security-and-privacy.md) · [Support](SUPPORT.md) · [Alternatives](docs/alternatives.md)
 
 > [!IMPORTANT]
-> This is an unofficial community project. It is not affiliated with or endorsed by OpenAI or ntfy.
+> This is an unofficial community project. It is not affiliated with or endorsed by OpenAI, Anthropic, or ntfy.
 
 ## What makes it different
 
 - **Idle-aware:** the root task must be locally verifiable as idle; intermediate turns, active goals, and running subagents keep the notification pending.
 - **Durable delivery:** an atomic outbox, stable deduplication, and retry with backoff provide at-least-once delivery after idle confirmation.
-- **Multi-environment:** the same classifier supports Codex app, VS Code, CLI, Windows, WSL, native Linux, and host-local Remote SSH installs.
+- **Multi-environment:** Codex app, VS Code, CLI, Windows, WSL, native Linux, host-local Remote SSH installs, and opt-in Claude Code on Windows share one durable delivery engine.
 - **Fast isolated recovery:** on Windows, the persistent local scanner follows recent Codex SQLite entries instead of repeatedly walking the full session archive, while UNC/WSL recovery runs separately and cannot block local delivery. Remote SSH installs keep their worker and queue on the remote host.
 - **Privacy by default:** prompts and final messages are excluded; task titles, message excerpts, and full paths each require an explicit opt-in.
 
@@ -41,6 +41,14 @@ cd codex-ntfy-notifier
 
 Use `.\install.ps1 -NoWsl` for Windows only. Reload Codex and any open VS Code windows after installation.
 
+To also connect Claude Code on Windows (Claude Desktop Code tab, CLI, and VS Code), add the explicit opt-in:
+
+```powershell
+.\install.ps1 -WslDistro Ubuntu -EnableClaudeCode
+```
+
+The installer atomically merges ordered synchronous main-agent `Stop`/`StopFailure` and `UserPromptSubmit`, plus optional asynchronous `Notification` accelerators (`idle_prompt` and `agent_completed`), into `~/.claude/settings.json`. It preserves unrelated Claude hooks and backs the original file up with the Codex installation snapshot. Claude Code 2.1.198 or newer is required for the complete managed lifecycle set. The installer checks the newest executable found for each detected surface separately—`PATH`, Claude Desktop, VS Code, VS Code Insiders, and Cursor—and stops if any detected surface is older than that minimum.
+
 ### 1b. Install on native Linux
 
 ```sh
@@ -55,6 +63,8 @@ unset CODEX_NTFY_TOPIC
 ### 2. Review the hook
 
 In every installed Codex environment, run `/hooks`, inspect the managed `Stop` command, and approve it. The installer never modifies the Codex trust store.
+
+For Claude Code, `/hooks` is a read-only configuration browser: verify four managed event types and five handlers (`Notification` has separate `idle_prompt` and `agent_completed` handlers). Claude normally reloads `settings.json` automatically.
 
 ### 3. Run the doctor
 
@@ -90,7 +100,7 @@ python3 ~/.codex/notify-ntfy.py --test
 
 Codex may emit several turn-completion signals while one task is still progressing: an automatic continuation can start immediately, a goal can remain active, or a delegated subagent can still be working. Publishing every signal produces noisy “finished” notifications that are not actually final.
 
-Version 2.4 introduced the logical **idle epoch** used by 2.4.3:
+Version 2.4 introduced the logical **idle epoch** retained by 2.5:
 
 - the modern Codex `Stop` hook contributes a candidate; it never publishes directly;
 - the legacy `agent-turn-complete` notification remains a compatibility signal;
@@ -101,6 +111,8 @@ Version 2.4 introduced the logical **idle epoch** used by 2.4.3:
 - the idle gate confirms the same turn completed, no later turn is open, any goal is no longer active, descendants are no longer running, and the rollout stayed quiet for a short settling window; on Windows, a native streaming lifecycle summary avoids replaying a large rollout line by line in PowerShell;
 - pending candidates for one root thread are coalesced, and a completion followed by a later open task is suppressed as an obsolete predecessor; an already promoted outbox epoch remains immutable;
 - `strict` mode never fails open: incomplete evidence is retried during `idle_probe_grace_seconds`, then an unverifiable candidate is suppressed locally instead of becoming a false “done” alert.
+
+Version 2.5 adds a provider-specific Claude path on Windows. Claude `Stop` is accepted only for the main agent when both authoritative work registries are present and empty; `session_id + prompt_id` provides stable deduplication, and `StopFailure` covers turns ended by an API error. `Stop`, `StopFailure`, and `UserPromptSubmit` are ordered synchronously so repeated same-prompt goal stops cannot finish out of order; their initial reverse scan is capped at 1 MiB and any full reconciliation runs in the worker. `UserPromptSubmit` snapshots the previous session-level goal marker and cancels stale candidates before a new prompt can finish. The gate then mirrors Claude's own resume rule from the newest local `attachment.goal_status`: active/not-met markers hold the candidate, a newer achieved/failed marker releases it, and a newer manual-clear sentinel discards it without a notification. `idle_prompt`/`agent_completed` with the same non-empty `prompt_id` are optional asynchronous fallbacks, never required for correctness, so delayed or uncorrelated VS Code idle events cannot release the wrong candidate. The notification body still uses Claude's supplied final message.
 
 After the idle gate, the existing durable delivery engine takes over:
 
@@ -122,23 +134,24 @@ Visible title: ✅ <conversation-or-project>
 Body:  [final message ·] [project ·] origin · #thread8
 ```
 
-The visible title is exactly one completion/status emoji supplied by ntfy plus the local conversation title, or the project directory when task-title sharing is disabled or unavailable. The JSON `title` contains only that text value. It is resolved by exact thread ID from the read-only Codex state database, then from the local session index as a compatibility fallback. The single default `white_check_mark` tag supplies the emoji; the notifier does not add `Codex`, `done`, a model name, a status label, or another decorative emoji. If `include_thread_title: true` opts into an available local task title and that title differs from the project, the project moves into the body so the location is not duplicated or lost.
+The visible title is exactly one completion/status emoji supplied by ntfy plus the local conversation title, or the project directory when title sharing is disabled or unavailable. The JSON `title` contains only that text value. Codex titles come from its read-only state database or local session index; Claude titles come from bounded `ai-title`/`custom-title` transcript metadata. The single default `white_check_mark` tag supplies the emoji; the notifier does not add `Codex`, `Claude`, `done`, a model name, a status label, or another decorative emoji.
 
 With the default `markdown: false`, the body is one line and its context has no labels such as `Project:`, `Source:`, or `Thread:`. With the privacy default `include_message: false`, it contains only the necessary project (when not already in the title), origin, and `#` plus the first eight thread-ID characters. With `include_message: true`, a redacted final-message excerpt is prepended; `max_message_chars` defaults to 180. The complete ntfy `message` is hard-capped at 3,500 UTF-8 bytes regardless of that character setting. An explicit Markdown opt-in can preserve lines in the optional excerpt.
 
-Notification taps do nothing extra by default. Setting `include_task_link: true` adds the authenticated HTTPS task URL `https://chatgpt.com/codex/tasks/<thread-id>` as [ntfy's `click` target](https://docs.ntfy.sh/publish/#click-action) without changing the visible title or body. On a supported phone, that URL can open the task in the ChatGPT mobile app; otherwise it has a browser fallback. The phone must use the same ChatGPT account and workspace, and local tasks require [Remote](https://learn.chatgpt.com/docs/remote-connections) access to the host. The separate `include_task_link_action` option adds one visible [**Open task** `view` action](https://docs.ntfy.sh/publish/#open-websiteapp) and remains off by default.
+Notification taps do nothing extra by default. For Codex only, setting `include_task_link: true` adds the authenticated HTTPS task URL `https://chatgpt.com/codex/tasks/<thread-id>` as [ntfy's `click` target](https://docs.ntfy.sh/publish/#click-action). Claude notifications deliberately omit that ChatGPT URL; Claude does not document a deep link for reopening an existing local Code session.
 
 Fresh installs use one ntfy tag, `white_check_mark`. Apart from the emoji rendered from that tag, the templates add no decorative emoji to title or body. Markdown is off, and default priority 3 is represented by omitting `priority` from the outgoing JSON. Custom non-default priorities are still sent explicitly.
 
 ## When to use it
 
-Use this project when your priority is one durable phone/desktop push after a local Codex task has no more work, including concurrent tasks and temporary network outages. An opt-in task link can open that exact task from the notification; if you want native sounds, a notification center, or one notifier for many different coding agents, another project may be a better fit. See [Alternatives and adjacent projects](docs/alternatives.md).
+Use this project when your priority is one durable phone/desktop push after a local Codex or Windows Claude Code task has no more work, including concurrent sessions and temporary network outages. See [Alternatives and adjacent projects](docs/alternatives.md) for different transports and agents.
 
 ## Supported environments
 
 | Environment | Completion signals | Durable worker | Installer |
 | --- | --- | --- | --- |
 | Windows 10/11 | modern `Stop` + legacy `notify` + rollout watcher | Task Scheduler | `install.ps1` |
+| Claude Code on Windows | main-agent `Stop`/`StopFailure`, ordered prompt start, transcript goal gate; active work and `/goal` loops fail closed | same Windows worker | `install.ps1 -EnableClaudeCode` |
 | WSL2 | local signals, Windows bridge, registered rollout root, native fallback | Windows worker / Python fallback | `install.ps1` |
 | Native Linux | modern `Stop` + legacy `notify` + rollout watcher | systemd user service or on-demand | `install-linux.sh` |
 | Remote SSH, Windows | remote signals and rollout state | remote Task Scheduler | `install-remote-windows.ps1` |
@@ -148,7 +161,7 @@ The same idle semantics apply to local tasks started from the Codex app, VS Code
 
 Pure cloud tasks that never mirror lifecycle state into the local `CODEX_HOME` are not guaranteed. This project does not attach to private UI status streams.
 
-The legacy signal uses Codex [advanced notification configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications). The preferred lifecycle signal uses [Codex Hooks](https://learn.chatgpt.com/docs/hooks).
+The legacy signal uses Codex [advanced notification configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications). The preferred lifecycle signal uses [Codex Hooks](https://learn.chatgpt.com/docs/hooks). Claude hook fields and ordering follow the official [Claude Code hooks reference](https://code.claude.com/docs/en/hooks). The local `attachment.goal_status` record is a Claude transcript implementation detail used defensively for `/goal` continuity; it is not advertised as a hook payload field.
 
 ## Windows and WSL installation details
 
@@ -160,7 +173,8 @@ The Windows/WSL quick start above prompts for the topic with hidden input on a f
 4. installs the durable Windows worker as `CodexNtfyWatcher`; Task Scheduler launches its hidden VBS supervisor directly, avoiding two cold PowerShell launcher starts before the notifier can become ready;
 5. preserves or installs the root-level legacy `notify` command;
 6. registers the managed modern `hooks.Stop` command without replacing unrelated hook handlers;
-7. installs the WSL classifier, bridge, and native fallback, then registers that distribution's Codex/SQLite roots with the Windows recovery watcher.
+7. when `-EnableClaudeCode` is present, atomically merges ordered synchronous `Stop`/`StopFailure`/`UserPromptSubmit` and optional asynchronous `Notification` handlers into the user Claude settings and includes that file in rollback;
+8. installs the WSL classifier, bridge, and native fallback, then registers that distribution's Codex/SQLite roots with the Windows recovery watcher.
 
 For Windows without WSL:
 
@@ -301,13 +315,15 @@ By default, the ntfy title contains only the project name; the single configured
 
 `include_message` is checked again when an outbox record is sent. Turning it off prevents final-message content in already queued records from leaving the host, but it does not erase the local record, backups, dead letters, a request already in flight, or a notification already accepted by ntfy.
 
-Idle detection reads local Codex lifecycle metadata and read-only SQLite status fields. It queries goal **status**, not the goal objective. The rollout watcher persists path, offset, timestamps, and thread identity—not user prompt bodies. The notifier still needs local read access to Codex rollout files to identify lifecycle markers.
+Idle detection reads local Codex lifecycle metadata and read-only SQLite status fields. It queries goal **status**, not the goal objective. The rollout watcher persists path, offset, timestamps, and thread identity—not user prompt bodies. The notifier still needs local read access to Codex rollout files to identify lifecycle markers. With Claude enabled, a memory-bounded reverse scan finds only the newest relevant `goal_status` lifecycle attachment and stores its state plus opaque marker; it does not extract, store, log, or send the goal condition/reason.
 
 Read [Security and privacy](docs/security-and-privacy.md) before enabling message content or copying credentials to remote hosts. Never attach raw config, rollout, database, state, backup, or log files to a public issue.
 
 ## Known limitations
 
 - Modern hooks require explicit user review through `/hooks`. The installer never edits the trust store.
+- Claude support currently targets local Claude Code on Windows. The ordinary Claude Chat tab does not expose Claude Code hooks, user interrupts do not emit `Stop`, and hosted work without a local hook is outside the observation boundary.
+- Claude `/goal` finality relies on a memory-bounded reverse scan of Claude's local transcript `attachment.goal_status` records without loading the full transcript. That is an upstream local format and may require an adapter update if Claude changes it; missing or malformed active-goal evidence fails closed instead of sending an intermediate alert.
 - `strict` mode suppresses a candidate locally as `unverifiable` when matching rollout, root classification, or completion evidence is still missing after `idle_probe_grace_seconds`. This avoids a false final notification but can withhold a true one after an upstream format or storage change.
 - `balanced` can notify after `idle_probe_grace_seconds` when evidence stays incomplete, so it has a higher false-positive risk.
 - Rollout and local Codex database schemas are upstream implementation details and may require adapter updates.

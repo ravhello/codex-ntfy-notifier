@@ -1,6 +1,6 @@
 # Uninstall and rollback
 
-These procedures apply to version 2.4.3. They are intentionally explicit because `~/.codex` also belongs to Codex; never remove that whole directory.
+These procedures apply to version 2.5.0. They are intentionally explicit because `~/.codex` belongs to Codex and `~/.claude/settings.json` may contain unrelated Claude configuration; never remove either whole directory.
 
 An **uninstall** removes only this project’s managed `notify` command, `notify-ntfy` hook handlers, scripts, and worker while preserving unrelated Codex settings and hooks. A **rollback** restores the timestamped snapshot taken immediately before a particular installation or upgrade. Decide which outcome is wanted before deleting anything.
 
@@ -160,6 +160,84 @@ Select-String -Path "$HOME\.codex\hooks.json" -Pattern 'notify-ntfy' -ErrorActio
 
 Do not delete all of `hooks.json` and do not edit Codex’s hook trust store. A retained approval does not execute anything without a registered hook command; removing trust entries is outside this uninstall.
 
+#### Remove the optional Claude Code handlers
+
+Skip this block if the notifier was not installed with `-EnableClaudeCode`. If installation used a custom `-CodexHome` or `-ClaudeHome`, set the same absolute directories below instead of the defaults. The managed set can appear under `Stop`, `StopFailure`, `UserPromptSubmit`, and `Notification`. This cleanup removes only handlers carrying the managed `-ClaudeHook` marker and the exact installed script path; all other Claude settings and hooks remain:
+
+```powershell
+$CodexHome = [IO.Path]::GetFullPath((Join-Path $HOME '.codex')) # replace with the installed -CodexHome when customized
+$ManagedScript = [IO.Path]::GetFullPath((Join-Path $CodexHome 'notify-ntfy.ps1'))
+$ClaudeHome = [IO.Path]::GetFullPath((Join-Path $HOME '.claude')) # replace with the installed -ClaudeHome when customized
+$SettingsPath = Join-Path $ClaudeHome 'settings.json'
+if (Test-Path -LiteralPath $SettingsPath -PathType Leaf) {
+  $Document = Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json
+  $HooksProperty = $Document.PSObject.Properties['hooks']
+  $Changed = $false
+  if ($null -ne $HooksProperty -and
+      $null -ne $HooksProperty.Value -and
+      $HooksProperty.Value -is [System.Management.Automation.PSCustomObject]) {
+    $Events = $HooksProperty.Value
+    foreach ($EventProperty in @($Events.PSObject.Properties)) {
+      if ($EventProperty.Value -isnot [array]) { continue }
+      $KeptGroups = New-Object 'System.Collections.Generic.List[object]'
+      $RemovedFromEvent = $false
+      foreach ($Group in @($EventProperty.Value)) {
+        if ($null -eq $Group -or $Group -isnot [System.Management.Automation.PSCustomObject]) {
+          $KeptGroups.Add($Group)
+          continue
+        }
+        $HandlersProperty = $Group.PSObject.Properties['hooks']
+        if ($null -eq $HandlersProperty -or $HandlersProperty.Value -isnot [array]) {
+          $KeptGroups.Add($Group)
+          continue
+        }
+        $OriginalHandlers = @($HandlersProperty.Value)
+        $KeptHandlers = @($OriginalHandlers | Where-Object {
+          $Managed = $false
+          if ($null -ne $_ -and $_ -is [System.Management.Automation.PSCustomObject]) {
+            $Args = @($_.args | ForEach-Object { [string]$_ })
+            $FileIndex = [Array]::IndexOf([string[]]$Args, '-File')
+            if (($Args -contains '-ClaudeHook') -and $FileIndex -ge 0 -and $FileIndex + 1 -lt $Args.Count) {
+              try {
+                $Managed = [string]::Equals(
+                  [IO.Path]::GetFullPath($Args[$FileIndex + 1]),
+                  $ManagedScript,
+                  [StringComparison]::OrdinalIgnoreCase
+                )
+              } catch { $Managed = $false }
+            }
+          }
+          -not $Managed
+        })
+        if ($KeptHandlers.Count -ne $OriginalHandlers.Count) { $RemovedFromEvent = $true }
+        if ($KeptHandlers.Count -gt 0) {
+          $HandlersProperty.Value = @($KeptHandlers)
+          $KeptGroups.Add($Group)
+        } elseif ($OriginalHandlers.Count -eq 0) {
+          $KeptGroups.Add($Group)
+        }
+      }
+      if ($RemovedFromEvent) {
+        $Changed = $true
+        if ($KeptGroups.Count -gt 0) {
+          $EventProperty.Value = @($KeptGroups.ToArray())
+        } else {
+          $Events.PSObject.Properties.Remove($EventProperty.Name)
+        }
+      }
+    }
+  }
+  if ($Changed) {
+    $PrivateBackup = "$SettingsPath.pre-ntfy-uninstall-$(Get-Date -Format yyyyMMdd-HHmmss)"
+    Copy-Item -LiteralPath $SettingsPath -Destination $PrivateBackup
+    $Utf8NoBom = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($SettingsPath, (($Document | ConvertTo-Json -Depth 32) + [Environment]::NewLine), $Utf8NoBom)
+  }
+}
+```
+
+Verify locally with `Select-String -LiteralPath $SettingsPath -Pattern ([regex]::Escape($ManagedScript))`. An empty result confirms removal of this installation. Do not delete the whole Claude settings file.
+
 ### 3. Remove managed files
 
 First assert that the path is the standard Codex home, then remove only named project files:
@@ -191,18 +269,19 @@ Remove-Item -LiteralPath (Join-Path $CodexHome 'ntfy-state') -Recurse -Force -Er
 Remove-Item -LiteralPath (Join-Path $CodexHome 'ntfy-backups') -Recurse -Force -ErrorAction SilentlyContinue
 ```
 
-### 4. Reload Codex
+### 4. Reload affected coding-agent surfaces
 
-Reload the Codex app/CLI and every local VS Code window. A process that already read `config.toml` or `hooks.json` can continue invoking a deleted script until it restarts.
+Reload the Codex app/CLI and every local VS Code window. If Claude handlers were removed, also reload Claude Desktop's Code tab, standalone Claude Code CLI processes, and editor windows using Claude Code. A process that already read Codex hook files or Claude `settings.json` can continue invoking a deleted script until it reloads the configuration or restarts.
 
 ## Roll back Windows to a selected backup
 
-Local Windows backups can include the managed scripts, private config, `config.toml`, `hooks.json`, and an exported `CodexNtfyWatcher.xml` when that task existed before the installer run.
+Local Windows backups can include the managed scripts, private config, `config.toml`, `hooks.json`, the pre-install `claude-settings.json` when Claude support was enabled, and an exported `CodexNtfyWatcher.xml` when that task existed before the installer run. Restore the Claude snapshot only when it will not overwrite unrelated changes made after installation; otherwise use the selective cleanup above. If installation used a custom `-ClaudeHome`, assign that same absolute directory in the rollback block.
 
 Stop the current worker as above. Assign a timestamp explicitly, validate that it is directly under the backup root, and restore the files it contains:
 
 ```powershell
 $CodexHome = [IO.Path]::GetFullPath((Join-Path $HOME '.codex'))
+$ClaudeHome = [IO.Path]::GetFullPath((Join-Path $HOME '.claude')) # replace with the installed -ClaudeHome when customized
 $BackupRoot = [IO.Path]::GetFullPath((Join-Path $CodexHome 'ntfy-backups'))
 $Backup = [IO.Path]::GetFullPath((Join-Path $BackupRoot 'YYYYMMDD-HHMMSS-fff')) # choose explicitly
 if ([IO.Path]::GetDirectoryName($Backup) -ne $BackupRoot -or -not (Test-Path -LiteralPath $Backup -PathType Container)) {
@@ -233,6 +312,17 @@ if (Test-Path -LiteralPath $SavedToml -PathType Leaf) {
   Write-Warning 'No config.toml in this backup; remove the managed notify line manually.'
 }
 
+$SavedClaudeSettings = Join-Path $Backup 'claude-settings.json'
+if (Test-Path -LiteralPath $SavedClaudeSettings -PathType Leaf) {
+  New-Item -ItemType Directory -Path $ClaudeHome -Force | Out-Null
+  $ClaudeSettings = Join-Path $ClaudeHome 'settings.json'
+  $ClaudeStage = "$ClaudeSettings.rollback"
+  Copy-Item -LiteralPath $SavedClaudeSettings -Destination $ClaudeStage -Force
+  Move-Item -LiteralPath $ClaudeStage -Destination $ClaudeSettings -Force
+} else {
+  Write-Warning 'No pre-install Claude settings snapshot in this backup; use the selective Claude handler cleanup above if needed.'
+}
+
 Unregister-ScheduledTask -TaskName CodexNtfyWatcher -Confirm:$false -ErrorAction SilentlyContinue
 $SavedTask = Join-Path $Backup 'CodexNtfyWatcher.xml'
 if (Test-Path -LiteralPath $SavedTask -PathType Leaf) {
@@ -242,9 +332,9 @@ if (Test-Path -LiteralPath $SavedTask -PathType Leaf) {
 }
 ```
 
-This full rollback restores or removes `hooks.json` exactly as captured. Do not use it when later unrelated hooks must survive; use the selective handler cleanup instead.
+This full rollback restores or removes Codex `hooks.json` exactly as captured and restores Claude `settings.json` only when the selected backup contains its pre-install snapshot. Do not restore either whole file when later unrelated hook/settings changes must survive; use the selective handler cleanup instead.
 
-Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.4.3 uses record schema 1 and retains the `pending/` and `watch/` state introduced in 2.4.0; compatibility with an arbitrary older build is not guaranteed.
+Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.5.0 uses record schema 1 and retains the `pending/` and `watch/` state introduced in 2.4.0; compatibility with an arbitrary older build is not guaranteed.
 
 Remote Windows backups use the same scheduled-task XML snapshot. The installer refuses to overwrite a task named `CodexNtfyWatcher` unless its action belongs to this project, and an installation failure restores the prior definition and running state automatically.
 

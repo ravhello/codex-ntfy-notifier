@@ -24,7 +24,7 @@ tail -n 40 "$HOME/.codex/ntfy-state/notify.log"
 
 The doctor output does not print the topic or credentials. Check:
 
-- `version` is `2.4.3` or a newer compatible release;
+- `version` is `2.5.0` or a newer compatible release;
 - `topic_configured` is `true`;
 - `idle_detection_mode` is `strict` when intermediate notifications must never be sent;
 - `goal_aware` and `watch_rollouts` are `true`;
@@ -43,7 +43,7 @@ The explicit test bypasses idle detection and sends a real notification:
 python3 "$HOME/.codex/notify-ntfy.py" --test
 ```
 
-Use `-Test`/`--test` only when publishing to the configured topic is acceptable. A successful test proves delivery, not hook or idle detection. The version 2.4.3 Windows/WSL installer removes only local queue/receipt records explicitly marked as synthetic tests during upgrade; it cannot retract a notification already accepted by ntfy.
+Use `-Test`/`--test` only when publishing to the configured topic is acceptable. A successful test proves delivery, not hook or idle detection. The Windows/WSL installer removes only local queue/receipt records explicitly marked as synthetic tests during upgrade; it cannot retract a notification already accepted by ntfy.
 
 ## Understand pending versus queued
 
@@ -74,6 +74,22 @@ python3 -c 'import json, pathlib; p=pathlib.Path.home()/".codex"/"hooks.json"; p
 ```
 
 Then open Codex in that same environment, run `/hooks`, inspect the managed command containing `notify-ntfy`, and approve it. Repeat for each WSL distribution or Remote SSH host on which the notifier was installed.
+
+### Claude Code on Windows
+
+Claude support is opt-in. Rerun the Windows installer with `-EnableClaudeCode`, then use `/hooks` inside Claude Code and verify managed groups for `Stop`, `StopFailure`, `UserPromptSubmit`, and `Notification`:
+
+```powershell
+.\install.ps1 -NoWsl -EnableClaudeCode
+$settings = Get-Content "$HOME\.claude\settings.json" -Raw | ConvertFrom-Json
+$settings.hooks.PSObject.Properties |
+  Where-Object { $_.Name -in @('Stop','StopFailure','UserPromptSubmit','Notification') } |
+  Select-Object Name,Value
+```
+
+The installer preserves unrelated Claude hooks. `Stop`, `StopFailure`, and `UserPromptSubmit` must show `async: false`; this preserves same-prompt lifecycle order and establishes the next prompt epoch before a fast `Stop`. Only the two managed `Notification` handlers are asynchronous. If `disableAllHooks` is `true`, Claude will not execute them. Claude Code 2.1.198 or newer is required for the complete hook set, including stable prompt identity and the `agent_completed` accelerator. The installer validates the newest executable for each detected `PATH`, Claude Desktop, VS Code, VS Code Insiders, and Cursor surface separately; one detected surface below the minimum blocks installation instead of being hidden by a newer one. The ordinary Claude Chat tab is not Claude Code and does not emit these lifecycle hooks.
+
+For a `Stop`, both `background_tasks` and `session_crons` must be present and empty. A missing registry, a non-empty registry, `SubagentStop`, or an `agent_id` is intentionally ignored. For `/goal`, the newest transcript `attachment.goal_status` must prove a transition from active to achieved/failed; active/not-met remains pending, while manual clear is discarded without a notification. `idle_prompt` and `agent_completed` are optional fallbacks only when their non-empty `prompt_id` matches the candidate. `StopFailure` is handled separately because API errors replace `Stop`.
 
 Reload app/CLI processes and VS Code windows that were already running during installation. If `Stop` remains untrusted, the legacy notification and rollout watcher can still detect completions, but the modern candidate is absent.
 
@@ -120,7 +136,7 @@ Get-Content "$HOME\.codex\ntfy-state\watch-health.json" -Raw | ConvertFrom-Json 
 Get-Content "$HOME\.codex\ntfy-state\remote-watch-health.json" -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json | Select-Object status, last_completed_at, duration_ms
 ```
 
-The task should execute `wscript.exe` with `watch-codex-ntfy-hidden.vbs`; that VBS supervises `notify-ntfy.ps1` directly and avoids two cold PowerShell launcher starts. Reinstall 2.4.3 if the action still points to the old PowerShell wrapper. A slow or timed-out remote health record should not delay a healthy local scan or an already queued delivery. Maintenance waits at least 60 seconds and starts only after delivery and the applicable scanners report readiness, so cleanup should not be the startup bottleneck.
+The task should execute `wscript.exe` with `watch-codex-ntfy-hidden.vbs`; that VBS supervises `notify-ntfy.ps1` directly and avoids two cold PowerShell launcher starts. Reinstall the current release if the action still points to the old PowerShell wrapper. A slow or timed-out remote health record should not delay a healthy local scan or an already queued delivery. Maintenance waits at least 60 seconds and starts only after delivery and the applicable scanners report readiness, so cleanup should not be the startup bottleneck.
 
 ## A candidate remains pending
 
@@ -131,6 +147,8 @@ Inspect the sanitized log first. Common idle reasons are:
 | `settling` | The rollout has not been quiet for `idle_grace_seconds`. | Wait briefly. |
 | `turn-active` | A later `task_started` has no matching completion yet. | Let Codex finish or abort that turn. |
 | `goal-active` | The root goal is still `active`. | Let the goal reach a non-running status. |
+| `claude-goal-active` | Claude `/goal` still has a newest active/not-met marker. | Let the same goal reach achieved/failed, or clear it intentionally. |
+| `claude-goal-awaiting-finality` | Claude goal evidence is missing/malformed and no matching prompt idle fallback has arrived. | Verify the transcript path, Claude version, and managed prompt/Notification hooks. |
 | `subagents-active` | At least one descendant rollout still looks active. | Let the descendant finish; check stale-child policy if it crashed. |
 | `probe-incomplete` | Matching local rollout evidence is missing or unreadable. | Verify the real Codex/session paths and upstream state format. |
 
@@ -166,9 +184,9 @@ Lowering that timeout can notify while a genuinely long-running child is still a
 
 Confirm all of the following:
 
-- doctor reports version 2.4.3+ and `idle_detection_mode: "strict"`;
+- doctor reports version 2.5.0+ and `idle_detection_mode: "strict"`;
 - the alert comes from this installation/topic rather than an older custom hook or another notifier;
-- old managed notifier handlers are not still registered under `UserPromptSubmit`, `SubagentStop`, or another hook event;
+- no duplicate/legacy managed notifier handlers remain under `UserPromptExpansion`, `SubagentStop`, or unexpected hook groups; the single managed `UserPromptSubmit` is intentional;
 - only one intended `notify-ntfy` `Stop` group exists per environment;
 - every worker was restarted after upgrade;
 - `suppress_subagents` and `suppress_technical_turns` are `true`;

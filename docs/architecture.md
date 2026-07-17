@@ -1,12 +1,12 @@
 # Architecture
 
-This document describes the completion-detection and delivery model implemented by version 2.4.3. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI or ntfy component.
+This document describes the completion-detection and delivery model implemented by version 2.5.0. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI, Anthropic, or ntfy component.
 
 ## Design goal
 
 The notifier has one user-facing rule:
 
-> Send one notification when a root Codex task has no more work, not whenever an intermediate turn emits a completion-shaped event.
+> Send one notification when a root coding-agent task has no more work, not whenever an intermediate turn emits a completion-shaped event.
 
 Codex can complete a turn and immediately start another, keep a goal active, or leave a delegated descendant running. Therefore a hook callback is treated as evidence to evaluate, not proof that the whole task is idle.
 
@@ -27,6 +27,7 @@ The design favors:
 | --- | --- |
 | Codex modern `Stop` hook | Supplies an explicit session-stop candidate on standard input. Local rollout/database evidence still determines whether that session is a root or descendant. It is never sent directly. |
 | Codex legacy root-level `notify` | Supplies `agent-turn-complete` as a compatibility/fallback candidate. |
+| Claude Code `Stop` / `StopFailure` hooks (Windows, opt-in) | Supply authoritative main-agent completion/error candidates. `Stop` is accepted only with empty background-task and session-cron registries. |
 | Incremental rollout watcher | Discovers recent local `task_complete` or `turn_aborted` records that hooks missed. On Windows, the persistent local scanner is seeded by Codex's read-only SQLite thread index; UNC/WSL roots use a separate bounded scanner. |
 | `notify-ntfy.ps1` / `notify-ntfy.py` | Normalizes signals, classifies roots/subagents, maintains pending probes, applies the idle gate, and delivers the outbox. |
 | Windows scheduled task `CodexNtfyWatcher` | Launches the hidden VBS supervisor directly. The VBS starts and restarts the notifier worker without the former two-hop cold PowerShell launcher chain. |
@@ -35,28 +36,30 @@ The design favors:
 | `ntfy-config.json` | Stores the private destination, credentials, idle policy, delivery policy, and privacy options. |
 | `ntfy-state/` | Stores idle candidates, rollout cursors, network-ready events, receipts, dead letters, locks, and the bounded log. |
 
-The modern hook format and review model are documented in [Codex Hooks](https://learn.chatgpt.com/docs/hooks). The legacy external notification is documented in [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications).
+The modern Codex hook format and review model are documented in [Codex Hooks](https://learn.chatgpt.com/docs/hooks). The legacy external notification is documented in [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications). Claude fields and lifecycle semantics come from the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
 
 ## Signal ingestion
 
-Three sources feed the same record schema:
+Four sources feed the same record schema:
 
 1. **Modern `Stop`.** The installer registers a managed `hooks.Stop` handler. The notifier reads its JSON from standard input, returns an empty JSON object as the hook result, classifies the session from local Codex state, and stores only an accepted root candidate. It intentionally ignores an event explicitly named `SubagentStop`; current Codex versions can also report descendant sessions through `Stop`, so the classifier remains mandatory.
 2. **Legacy `notify`.** The existing root-level notification remains installed as a compatibility path. Its `agent-turn-complete` payload is normalized to the same candidate schema.
 3. **Rollout watcher.** A continuous worker tails rollout JSONL files under its own `CODEX_HOME` and any explicitly registered roots using a persisted byte offset. On Windows, the persistent local scanner queries Codex's read-only SQLite thread index for active and recently resumed rollout paths, then supplements those results with hot current-day files. It does not enumerate historical cursor files or recursively walk `sessions/` and `archived_sessions/` on every continuous scan; the expensive full archive walk is reserved for an explicit manual `ScanScope=All` run. UNC/WSL roots run in a separate one-shot scanner with independent cursor handling and a `watch_remote_timeout_seconds` limit, so a suspended distro or slow share cannot block local recovery or delivery. The watcher consumes only complete newline-terminated records, leaves an incomplete trailing line for the next scan, and does not rewrite a cursor when file size and modification time are unchanged. A local `task_complete` or `turn_aborted` can therefore reconstruct a candidate when a hook process was never launched. The Windows installer registers the selected WSL Codex and SQLite roots without globally guessing a newest session.
+4. **Claude Code hooks on Windows.** With `-EnableClaudeCode`, exec-form handlers read `Stop`, `StopFailure`, `UserPromptSubmit`, and selected `Notification` JSON from standard input. Main-agent `Stop` requires `session_id`, `prompt_id`, and present, empty `background_tasks` plus `session_crons`; missing or active registries fail closed without a receipt so the same prompt can later become final. `Stop`, `StopFailure`, and `UserPromptSubmit` are deliberately synchronous: this preserves host lifecycle order, prevents repeated same-prompt stops from overwriting a newer result out of order, increments the session epoch before a new prompt, and removes older pending candidates before Claude can reach a fast `Stop`. Their prompt-path transcript scans are capped at 1 MiB; only the `idle_prompt`/`agent_completed` notification accelerators are asynchronous. `StopFailure` is terminal by definition. Claude candidates bypass Codex SQLite/rollout classification, reuse the shared pending/outbox worker, and use the supplied `last_assistant_message` for the notification body.
 
 The watcher initializes an old rollout at its current end; it only replays a newly discovered rollout when the file was modified within `watch_initial_replay_seconds`. This avoids turning historical sessions into fresh notifications after installation.
 
 Receipt retention and legacy lock cleanup run in a separate maintenance process no earlier than 60 seconds after startup and only after delivery plus the applicable local and remote scanners have reported ready, completed, timed out, or failed. Maintenance holds its own lock and cannot delay worker readiness or a completion notification.
 
-All sources share the same deterministic key when Codex provides both thread and turn IDs. Consequently, the recovery paths normally converge on one local record.
+Codex recovery sources share the same deterministic key when both thread and turn IDs are present. Claude uses a provider-isolated key from `session_id + prompt_id`, so simultaneous Claude sessions and Codex tasks cannot collide.
 
 ## State machine
 
 ```text
-Stop hook ──────────────┐
+Codex Stop hook ────────┐
 legacy notify ──────────┼──> normalize/classify ──> pending/
-rollout watcher ────────┘                              |
+rollout watcher ────────┤                              |
+Claude lifecycle hooks ─┘                              |
                                                        v
                                              coalesce by root thread
                                                        |
@@ -90,6 +93,8 @@ For the default `strict` mode, a root candidate becomes network-ready only after
 The gate takes a second fresh snapshot while the candidate is still in `pending/`, immediately before the atomic promotion. Promotion closes that logical idle epoch: an `outbox/` record is a durable delivery and is never coalesced with a later user request or moved back to pending. Network retries preserve that boundary.
 
 The notifier reads Codex SQLite databases read-only and enables query-only mode. Goal awareness selects only the `status` column; it does not query the goal objective. If the goal database is unavailable, a goal status persisted in the rollout can still be used. Missing goal information alone is not interpreted as an active goal.
+
+Claude uses a separate transcript gate. At `UserPromptSubmit`, the newest session-level `attachment.goal_status` marker in the bounded tail becomes the prompt baseline. The synchronous `Stop` performs the same bounded initial reverse read; if that is insufficient, the detached worker performs the memory-bounded full reconciliation. `met:false` is active and remains pending; a newer `met:true` is achieved; `failed:true` is terminal-blocked; and `met:true,sentinel:true` is a manual clear that removes the candidate without a sent/suppressed receipt. Historical terminal markers equal to the prompt baseline are ignored, so they cannot label or cancel later ordinary turns. If a candidate was anchored to an active marker, only a different terminal marker proves finality. Missing, oversized, or malformed lifecycle evidence fails closed; prompt-correlated `idle_prompt`/`agent_completed` can be used only as an optional fallback for recoverable unknown state and are never required before a transcript-proven terminal result.
 
 Active descendants are bounded by `subagent_orphan_seconds`. The timeout prevents a crashed or abandoned child rollout from blocking its root forever; it is a liveness tradeoff rather than proof that the child succeeded.
 
@@ -126,6 +131,8 @@ The same key names pending, outbox, sent, or suppressed state. A repeated signal
 If either ID is absent, the notifier creates a random weak identity. Deterministic local deduplication is then impossible, and `weak_identity` records that limitation.
 
 Every delivery attempt for one record reuses `codex-<first-32-hex-characters-of-key>` as its ntfy `sequence_id`. This reduces duplicate presentation after an ambiguous timeout on ntfy implementations that honor sequence updates, but it is not a distributed transaction.
+
+Claude strong identities hash `codex-ntfy/v1 | claude | session-id | prompt-id` and use the parallel `claude-<first-32-hex-characters-of-key>` sequence namespace. A repeated stop for the same prompt atomically refreshes the still-pending record and its revision instead of creating another notification. Promotion compares that revision under the same mutation lock, so a worker holding an older snapshot cannot send the previous message. A cleared goal is removed revision-safely without a terminal receipt, allowing later prompts to use their own keys normally.
 
 ## Delivery guarantee
 
@@ -165,7 +172,7 @@ The full ntfy `message` is truncated on a valid Unicode boundary to at most 3,50
 
 Fresh configuration uses `tags: ["white_check_mark"]`; the templates add no duplicate emoji to title or body. Priority 3 is ntfy's default and is omitted from the outgoing JSON. The worker serializes `priority` only for a non-default value and serializes `markdown: true` only when Markdown was explicitly enabled and an optional message is present.
 
-Task navigation is assembled at send time from the durable record's full thread ID. With `include_task_link: true`, a canonical UUID becomes `https://chatgpt.com/codex/tasks/<thread-id>` in the JSON `click` member. An absent or non-canonical ID omits navigation without failing delivery. `include_task_link_action: true` additionally emits one `view` action with the same URL; keeping it false avoids a duplicate visible control. Both Python and PowerShell use the HTTPS route so mobile can hand it to ChatGPT while browsers retain a fallback; the desktop-only `codex://threads/<thread-id>` compatibility scheme is not used. OpenAI's live [iOS app-site association](https://chatgpt.com/.well-known/apple-app-site-association) includes `/codex/tasks/*`, while its [Android Digital Asset Links](https://chatgpt.com/.well-known/assetlinks.json) delegates ChatGPT URLs to the mobile app.
+Task navigation is assembled at send time only for Codex records. With `include_task_link: true`, a canonical UUID becomes `https://chatgpt.com/codex/tasks/<thread-id>` in the JSON `click` member. An absent or non-canonical ID omits navigation without failing delivery. `include_task_link_action: true` additionally emits one `view` action with the same URL. Claude records omit both fields because no documented existing-session Claude Code deep link maps safely from the local session ID.
 
 The send-time `include_message` check is a privacy gate for durable state. A record captured while the option was true can still contain final-message text locally, but changing it to false prevents that text from entering later network attempts, including retries of an outbox record. This does not erase the record or backups and cannot recall a request already in flight or accepted by ntfy.
 
@@ -239,7 +246,7 @@ Legacy `notify` and the rollout watcher are independent fallback sources, so an 
 
 ## Upstream boundaries
 
-The project depends on local state emitted by Codex:
+The project depends on local state emitted by Codex and, when explicitly enabled, Claude Code:
 
 - modern hook availability and semantics are controlled by Codex;
 - legacy notifications currently expose `agent-turn-complete` rather than a first-class “entire chat is permanently idle” event;
@@ -247,6 +254,9 @@ The project depends on local state emitted by Codex:
 - an exceptionally large legacy Windows payload can fail before this notifier is launched;
 - pure cloud tasks that do not mirror lifecycle state locally cannot be observed;
 - rollout recovery requires a continuous worker and is scoped to its own plus explicitly registered Codex homes;
+- Claude hook availability and fields are controlled by Claude Code, and each detected Windows surface must meet the installer's minimum supported version;
+- Claude `/goal` finality depends on the upstream local `attachment.goal_status` transcript format, which can change;
+- hosted Claude work that does not execute a local hook cannot be observed;
 - ntfy retention, access control, sequence behavior, and client display are controlled by the chosen server and client.
 
-The notifier is not an audit log, task scheduler, or proof that a model result was correct. It reports the best locally verifiable end of work for a root Codex task.
+The notifier is not an audit log, task scheduler, or proof that a model result was correct. It reports the best locally verifiable end of work for a supported root coding-agent task.

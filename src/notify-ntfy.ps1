@@ -9,6 +9,7 @@ param(
   [string]$SessionClassification = '',
   [switch]$ReadStdin,
   [switch]$HookEvent,
+  [switch]$ClaudeHook,
   [switch]$BridgeFallback,
   [switch]$Worker,
   [switch]$Continuous,
@@ -31,7 +32,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.4.3'
+$ScriptVersion = '2.5.0'
 $MaxNtfyMessageBytes = 3500
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
@@ -59,6 +60,7 @@ $SentDir = Join-Path $StateRoot 'sent'
 $SuppressedDir = Join-Path $StateRoot 'suppressed'
 $DeadDir = Join-Path $StateRoot 'dead'
 $MutationLocksDir = Join-Path $StateRoot 'mutation-locks'
+$ClaudeSessionsDir = Join-Path $StateRoot 'claude-sessions'
 $WorkerLockPath = Join-Path $StateRoot 'worker.lock'
 $DeliveryLockPath = Join-Path $StateRoot 'delivery.lock'
 $WorkerHealthPath = Join-Path $StateRoot 'worker-health.json'
@@ -70,9 +72,12 @@ $RemoteScanHealthPath = Join-Path $StateRoot 'remote-watch-health.json'
 $MaintenanceLockPath = Join-Path $StateRoot 'maintenance.lock'
 $LogPath = Join-Path $StateRoot 'notify.log'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:ClaudeGoalStateCache = @{}
+$ClaudePromptBaselineMaxBytes = [int64](1024 * 1024)
+$ClaudeGoalMaxLineBytes = 1024 * 1024
 
 function Ensure-RuntimeDirectories {
-  foreach ($path in @($StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir, $DeadDir, $MutationLocksDir)) {
+  foreach ($path in @($StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir, $DeadDir, $MutationLocksDir, $ClaudeSessionsDir)) {
     if (-not (Test-Path -LiteralPath $path)) {
       New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
@@ -140,6 +145,22 @@ function Get-Sha256Hex {
   } finally {
     $sha.Dispose()
   }
+}
+
+function Get-StrongEventKey {
+  param(
+    [ValidateSet('codex', 'claude')]
+    [string]$Provider,
+    [string]$ThreadId,
+    [string]$TurnId
+  )
+
+  $identity = if ($Provider -eq 'codex') {
+    "codex-ntfy/v1|$ThreadId|$TurnId"
+  } else {
+    "codex-ntfy/v1|$Provider|$ThreadId|$TurnId"
+  }
+  return Get-Sha256Hex $identity
 }
 
 function ConvertTo-CompactJson {
@@ -571,7 +592,7 @@ function Get-EventClassification {
 }
 
 function Get-RawNotification {
-  if ($HookEvent -or $ReadStdin) {
+  if ($HookEvent -or $ClaudeHook -or $ReadStdin) {
     return [Console]::In.ReadToEnd()
   }
   if ($NotificationArgs.Count -gt 0) {
@@ -606,18 +627,28 @@ function New-EventRecord {
     [string]$EventClassification,
     [bool]$EventIncludeMessage,
     [string]$CandidateKind = 'legacy',
-    [string]$SourceEvent = 'agent-turn-complete'
+    [string]$SourceEvent = 'agent-turn-complete',
+    [ValidateSet('codex', 'claude')]
+    [string]$Provider = 'codex'
   )
 
   $threadId = [string](Get-FirstObjectValue $Event @('thread-id', 'thread_id'))
   $turnId = [string](Get-FirstObjectValue $Event @('turn-id', 'turn_id'))
   $weakIdentity = [string]::IsNullOrWhiteSpace($threadId) -or [string]::IsNullOrWhiteSpace($turnId)
   $identity = if ($weakIdentity) {
-    'codex-ntfy/v1|weak|' + [Guid]::NewGuid().ToString('N')
+    if ($Provider -eq 'codex') {
+      'codex-ntfy/v1|weak|' + [Guid]::NewGuid().ToString('N')
+    } else {
+      "codex-ntfy/v1|$Provider|weak|" + [Guid]::NewGuid().ToString('N')
+    }
   } else {
-    "codex-ntfy/v1|$threadId|$turnId"
+    if ($Provider -eq 'codex') { "codex-ntfy/v1|$threadId|$turnId" } else { "codex-ntfy/v1|$Provider|$threadId|$turnId" }
   }
-  $key = Get-Sha256Hex $identity
+  $key = if ($weakIdentity) {
+    Get-Sha256Hex $identity
+  } else {
+    Get-StrongEventKey -Provider $Provider -ThreadId $threadId -TurnId $turnId
+  }
   $now = [DateTimeOffset]::UtcNow
   $storedOrigin = Sanitize-NotificationText -Text $EventOrigin -MaxLength 100
   $storedEvent = [ordered]@{
@@ -631,7 +662,8 @@ function New-EventRecord {
   return [pscustomobject]@{
     schema = 1
     key = $key
-    sequence_id = 'codex-' + $key.Substring(0, 32)
+    sequence_id = $Provider + '-' + $key.Substring(0, 32)
+    provider = $Provider
     weak_identity = $weakIdentity
     thread_id = $threadId
     turn_id = $turnId
@@ -642,6 +674,11 @@ function New-EventRecord {
     candidate_kind = $CandidateKind
     source_event = $SourceEvent
     completion_event_type = [string](Get-FirstObjectValue $Event @('completion-event-type', 'completion_event_type'))
+    goal_status = [string](Get-FirstObjectValue $Event @('goal-status', 'goal_status'))
+    candidate_revision = [Guid]::NewGuid().ToString('N')
+    claude_session_epoch = [int64](Get-FirstObjectValue $Event @('claude-session-epoch', 'claude_session_epoch'))
+    claude_goal_state = [string](Get-FirstObjectValue $Event @('claude-goal-state', 'claude_goal_state'))
+    claude_goal_marker = [string](Get-FirstObjectValue $Event @('claude-goal-marker', 'claude_goal_marker'))
     candidate_rollout_path = Sanitize-NotificationText -Text ([string](Get-FirstObjectValue $Event @('transcript_path', 'transcript-path', 'rollout_path', 'rollout-path'))) -MaxLength 1200
     rollout_sequence = [int64](Get-FirstObjectValue $Event @('rollout-sequence', 'rollout_sequence'))
     created_at = $now.ToString('o')
@@ -655,6 +692,7 @@ function New-EventRecord {
 
 function Test-IsStopEvidence {
   param([object]$Record)
+  if ([string](Get-ObjectValue $Record 'provider' 'codex') -eq 'claude') { return $true }
   return [string](Get-ObjectValue $Record 'source_event' '') -eq 'Stop' -or
     [string](Get-ObjectValue $Record 'candidate_kind' '') -eq 'hook_stop'
 }
@@ -697,6 +735,21 @@ function Upgrade-PendingRecordFromStop {
   }
   $existing = Read-JsonFile -Path $Path
   Assert-QueuedRecord -Record $existing -ExpectedKey $IncomingRecord.key
+
+  # A /goal can emit several Stop events with the same prompt id. Keep the
+  # original active marker as the gate anchor while refreshing the candidate
+  # with the newest assistant message and a new revision. The transcript then
+  # proves the transition to achieved/failed/cleared without ever delivering
+  # an intermediate result.
+  if ([string](Get-ObjectValue $existing 'provider' '') -eq 'claude' -and
+      [string](Get-ObjectValue $IncomingRecord 'provider' '') -eq 'claude' -and
+      [string](Get-ObjectValue $existing 'candidate_kind' '') -eq 'claude_stop' -and
+      [string](Get-ObjectValue $IncomingRecord 'candidate_kind' '') -eq 'claude_stop' -and
+      [string](Get-ObjectValue $existing 'claude_goal_state' '') -eq 'active') {
+    Set-RecordValue -Record $IncomingRecord -Name 'claude_goal_state' -Value 'active'
+    Set-RecordValue -Record $IncomingRecord -Name 'claude_goal_marker' -Value ([string](Get-ObjectValue $existing 'claude_goal_marker' ''))
+    Set-RecordValue -Record $IncomingRecord -Name 'goal_status' -Value ([string](Get-ObjectValue $existing 'goal_status' ''))
+  }
 
   $existingRollout = [string](Get-ObjectValue $existing 'candidate_rollout_path' '')
   if ([string]::IsNullOrWhiteSpace([string](Get-ObjectValue $IncomingRecord 'candidate_rollout_path' '')) -and
@@ -866,10 +919,203 @@ function Add-CandidateEvent {
     [object]$Config
   )
 
-  if ($Config.idleDetectionMode -eq 'off') {
+  $provider = [string](Get-ObjectValue $Record 'provider' 'codex')
+  $kind = [string](Get-ObjectValue $Record 'candidate_kind' '')
+  if ($Config.idleDetectionMode -eq 'off' -and
+      -not ($provider -eq 'claude' -and $kind -ne 'claude_stop_failure')) {
     return Add-OutboxEvent -Record $Record
   }
   return Add-PendingEvent -Record $Record
+}
+
+function Remove-ClaudePendingCandidate {
+  param(
+    [string]$SessionId,
+    [string]$PromptId
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or [string]::IsNullOrWhiteSpace($PromptId)) { return }
+  $key = Get-StrongEventKey -Provider 'claude' -ThreadId $SessionId -TurnId $PromptId
+  [void](Invoke-WithRecordMutationLock -Key $key -Action {
+      param($lockedKey)
+      $path = Join-Path $PendingDir ($lockedKey + '.json')
+      if (-not (Test-Path -LiteralPath $path)) { return }
+      try {
+        $record = Read-JsonFile -Path $path
+        if ([string](Get-ObjectValue $record 'provider' '') -eq 'claude') {
+          Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+          Write-RuntimeLog "cancelled Claude candidate with active work key=$($lockedKey.Substring(0, 12))"
+        }
+      } catch {
+        Write-RuntimeLog "could not cancel Claude candidate key=$($lockedKey.Substring(0, 12))"
+      }
+    } -Arguments @($key))
+}
+
+function Get-ClaudeSessionStateInfo {
+  param([string]$SessionId)
+
+  if ([string]::IsNullOrWhiteSpace($SessionId)) { return $null }
+  $key = Get-Sha256Hex ("codex-ntfy/v1|claude-session|$SessionId")
+  return [pscustomobject]@{
+    key = $key
+    path = Join-Path $ClaudeSessionsDir ($key + '.json')
+    lock_path = Join-Path $ClaudeSessionsDir ($key + '.lock')
+  }
+}
+
+function Invoke-WithClaudeSessionLock {
+  param(
+    [object]$Info,
+    [scriptblock]$Action,
+    [object[]]$Arguments = @()
+  )
+
+  Ensure-RuntimeDirectories
+  if ($null -eq $Info -or [string]::IsNullOrWhiteSpace([string]$Info.lock_path)) {
+    throw 'invalid Claude session lock information'
+  }
+  $lockStream = $null
+  for ($attempt = 0; $attempt -lt 200 -and $null -eq $lockStream; $attempt++) {
+    try {
+      $lockStream = [IO.File]::Open([string]$Info.lock_path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch [IO.IOException] {
+      if ($attempt -ge 199) { throw }
+      Start-Sleep -Milliseconds 10
+    }
+  }
+  try {
+    return (& $Action @Arguments)
+  } finally {
+    if ($null -ne $lockStream) { $lockStream.Dispose() }
+  }
+}
+
+function Read-ClaudeSessionState {
+  param([string]$SessionId)
+
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info -or -not (Test-Path -LiteralPath $info.path)) { return $null }
+  try {
+    $state = Read-JsonFile -Path $info.path
+    if ([string](Get-ObjectValue $state 'session_id' '') -ne $SessionId) { return $null }
+    return $state
+  } catch {
+    return $null
+  }
+}
+
+function Set-ClaudeSessionBusy {
+  param(
+    [string]$SessionId,
+    [string]$PromptId,
+    [string]$TranscriptPath
+  )
+
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return [int64]0 }
+  # Take the session lock before reading the baseline. This is the linearization
+  # point between a new prompt and a worker promoting the previous prompt.
+  $epoch = Invoke-WithClaudeSessionLock -Info $info -Action {
+    param($lockedPath, $lockedSessionId, $lockedPromptId, $lockedTranscriptPath, $baselineMaxBytes)
+    $baseline = Get-ClaudeGoalTranscriptState -TranscriptPath $lockedTranscriptPath -MaxBytes ([int64]$baselineMaxBytes)
+    $baselineCaptured = -not [string]::IsNullOrWhiteSpace($lockedTranscriptPath) -and
+      (Test-Path -LiteralPath $lockedTranscriptPath -PathType Leaf) -and
+      [string]$baseline.state -notin @('unknown', 'unverifiable')
+    $previous = $null
+    try { $previous = Read-JsonFile -Path $lockedPath } catch { $previous = $null }
+    $nextEpoch = [int64](Get-ObjectValue $previous 'epoch' 0) + 1
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    Write-JsonAtomic -Path $lockedPath -Value ([ordered]@{
+        schema = 1
+        session_id = $lockedSessionId
+        epoch = $nextEpoch
+        state = 'busy'
+        prompt_id = $lockedPromptId
+        transcript_path = $lockedTranscriptPath
+        busy_unix_ms = $now
+        idle_unix_ms = 0
+        notification_type = ''
+        goal_baseline_state = [string]$baseline.state
+        goal_baseline_marker = [string]$baseline.marker
+        goal_baseline_captured = [bool]$baselineCaptured
+      })
+    return $nextEpoch
+  } -Arguments @($info.path, $SessionId, $PromptId, $TranscriptPath, $ClaudePromptBaselineMaxBytes)
+
+  # A follow-up prompt means the session is no longer idle. Remove every older
+  # unconfirmed Claude candidate for this session; no terminal receipt is left,
+  # so the same prompt can be armed again by a later Stop.
+  $files = @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+  foreach ($file in $files) {
+    $candidate = $null
+    try { $candidate = Read-JsonFile -Path $file.FullName } catch { continue }
+    if ([string](Get-ObjectValue $candidate 'provider' '') -ne 'claude' -or
+        [string](Get-ObjectValue $candidate 'thread_id' '') -ne $SessionId) { continue }
+    [void](Invoke-WithRecordMutationLock -Key ([string]$candidate.key) -Action {
+        param($lockedPath, $lockedSessionId)
+        if (-not (Test-Path -LiteralPath $lockedPath)) { return }
+        try {
+          $current = Read-JsonFile -Path $lockedPath
+          if ([string](Get-ObjectValue $current 'provider' '') -eq 'claude' -and
+              [string](Get-ObjectValue $current 'thread_id' '') -eq $lockedSessionId) {
+            Remove-Item -LiteralPath $lockedPath -Force -ErrorAction SilentlyContinue
+          }
+        } catch { }
+      } -Arguments @($file.FullName, $SessionId))
+  }
+  Write-RuntimeLog "Claude session marked busy; cancelled stale candidates session=$($SessionId.Substring(0, [Math]::Min(8, $SessionId.Length)))"
+  return [int64]$epoch
+}
+
+function Set-ClaudeSessionIdle {
+  param(
+    [string]$SessionId,
+    [string]$PromptId,
+    [string]$TranscriptPath,
+    [string]$NotificationType
+  )
+
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $false }
+  $updated = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedPromptId, $lockedTranscriptPath, $lockedNotificationType)
+      $previous = $null
+      try { $previous = Read-JsonFile -Path $lockedPath } catch { $previous = $null }
+      $previousPrompt = [string](Get-ObjectValue $previous 'prompt_id' '')
+      if (-not [string]::IsNullOrWhiteSpace($previousPrompt) -and
+          -not [string]::IsNullOrWhiteSpace($lockedPromptId) -and
+          $previousPrompt -ne $lockedPromptId) {
+        return $false
+      }
+      $epoch = [int64](Get-ObjectValue $previous 'epoch' 0)
+      if ($epoch -le 0) { $epoch = 1 }
+      $busyAt = [int64](Get-ObjectValue $previous 'busy_unix_ms' 0)
+      $baselineState = [string](Get-ObjectValue $previous 'goal_baseline_state' 'none')
+      $baselineMarker = [string](Get-ObjectValue $previous 'goal_baseline_marker' '')
+      $baselineCaptured = [bool](Get-ObjectValue $previous 'goal_baseline_captured' $false)
+      Write-JsonAtomic -Path $lockedPath -Value ([ordered]@{
+          schema = 1
+          session_id = $lockedSessionId
+          epoch = $epoch
+          state = 'idle'
+          prompt_id = $lockedPromptId
+          transcript_path = $lockedTranscriptPath
+          busy_unix_ms = $busyAt
+          idle_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          notification_type = $lockedNotificationType
+          goal_baseline_state = $baselineState
+          goal_baseline_marker = $baselineMarker
+          goal_baseline_captured = $baselineCaptured
+        })
+      return $true
+    } -Arguments @($info.path, $SessionId, $PromptId, $TranscriptPath, $NotificationType)
+  if ([bool]$updated) {
+    Write-RuntimeLog "Claude session confirmed idle type=$(Sanitize-NotificationText -Text $NotificationType -MaxLength 40) session=$($SessionId.Substring(0, [Math]::Min(8, $SessionId.Length)))"
+  } else {
+    Write-RuntimeLog "ignored stale Claude idle notification session=$($SessionId.Substring(0, [Math]::Min(8, $SessionId.Length)))"
+  }
+  return [bool]$updated
 }
 
 function Get-DefaultOrigin {
@@ -883,6 +1129,345 @@ function Get-DefaultOrigin {
     return $env:COMPUTERNAME
   }
   return 'Windows'
+}
+
+function Get-Utf8HeadLinesFast {
+  param(
+    [string]$Path,
+    [int]$MaxLines
+  )
+
+  if ($MaxLines -le 0) { return @() }
+  $stream = $null
+  $reader = $null
+  try {
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    $reader = New-Object System.IO.StreamReader($stream, $Utf8NoBom, $true, 65536, $false)
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    while ($lines.Count -lt $MaxLines -and -not $reader.EndOfStream) {
+      $lines.Add([string]$reader.ReadLine())
+    }
+    return @($lines.ToArray())
+  } finally {
+    if ($null -ne $reader) { $reader.Dispose() } elseif ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
+function Get-Utf8TailLinesFast {
+  param(
+    [string]$Path,
+    [int]$MaxLines
+  )
+
+  if ($MaxLines -le 0) { return @() }
+  $stream = $null
+  try {
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    $reversed = New-Object 'System.Collections.Generic.List[string]'
+    $buffer = New-Object byte[] 65536
+    $position = [int64]$stream.Length
+    $carry = ''
+    while ($position -gt 0 -and $reversed.Count -lt $MaxLines) {
+      $count = [int][Math]::Min($buffer.Length, $position)
+      $position -= $count
+      [void]$stream.Seek($position, [IO.SeekOrigin]::Begin)
+      $read = $stream.Read($buffer, 0, $count)
+      if ($read -le 0) { break }
+      $combined = $Utf8NoBom.GetString($buffer, 0, $read) + $carry
+      $parts = $combined.Split([char]10)
+      $carry = [string]$parts[0]
+      for ($index = $parts.Length - 1; $index -ge 1 -and $reversed.Count -lt $MaxLines; $index--) {
+        $reversed.Add(([string]$parts[$index]).TrimEnd([char]13))
+      }
+    }
+    if ($position -eq 0 -and $reversed.Count -lt $MaxLines -and -not [string]::IsNullOrEmpty($carry)) {
+      $reversed.Add($carry.TrimEnd([char]13))
+    }
+    $result = $reversed.ToArray()
+    [Array]::Reverse($result)
+    return @($result)
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
+function Get-ClaudeThreadTitle {
+  param(
+    [string]$TranscriptPath,
+    [string]$SessionId
+  )
+
+  if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or [string]::IsNullOrWhiteSpace($SessionId)) { return '' }
+  try {
+    $resolved = [IO.Path]::GetFullPath($TranscriptPath)
+    if ([IO.Path]::GetExtension($resolved) -ne '.jsonl' -or
+        -not [string]::Equals([IO.Path]::GetFileNameWithoutExtension($resolved), $SessionId, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+      return ''
+    }
+    # Claude writes generated/manual titles as compact metadata records. Read a
+    # bounded prefix plus tail so long sessions do not delay notifications.
+    $lines = @()
+    $lines += @(Get-Utf8HeadLinesFast -Path $resolved -MaxLines 500)
+    $lines += @(Get-Utf8TailLinesFast -Path $resolved -MaxLines 2000)
+    $aiTitle = ''
+    $customTitle = ''
+    foreach ($line in $lines) {
+      if ($line -notmatch '"type"\s*:\s*"(?:ai-title|custom-title)"') { continue }
+      try {
+        $metadata = $line | ConvertFrom-Json -ErrorAction Stop
+        $metadataSession = [string](Get-FirstObjectValue $metadata @('sessionId', 'session_id'))
+        if (-not [string]::IsNullOrWhiteSpace($metadataSession) -and
+            -not [string]::Equals($metadataSession, $SessionId, [StringComparison]::OrdinalIgnoreCase)) {
+          continue
+        }
+        if ([string](Get-ObjectValue $metadata 'type' '') -eq 'custom-title') {
+          $customTitle = [string](Get-FirstObjectValue $metadata @('customTitle', 'custom_title'))
+        } elseif ([string](Get-ObjectValue $metadata 'type' '') -eq 'ai-title') {
+          $aiTitle = [string](Get-FirstObjectValue $metadata @('aiTitle', 'ai_title'))
+        }
+      } catch {
+        continue
+      }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($customTitle)) { return $customTitle }
+    return $aiTitle
+  } catch {
+    return ''
+  }
+}
+
+function ConvertFrom-ClaudeGoalStatusLine {
+  param([string]$Line)
+
+  if ([string]::IsNullOrWhiteSpace($Line) -or $Line -notmatch '"goal_status"') { return $null }
+  $marker = Get-Sha256Hex $Line
+  try {
+    $entry = $Line | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    return [pscustomobject]@{ state = 'unknown'; marker = $marker; marker_unix_ms = [int64]0 }
+  }
+  if ([string](Get-ObjectValue $entry 'type' '') -ne 'attachment') { return $null }
+  $attachment = Get-ObjectValue $entry 'attachment'
+  if ($null -eq $attachment -or [string](Get-ObjectValue $attachment 'type' '') -ne 'goal_status') { return $null }
+
+  $uuid = ([string](Get-ObjectValue $entry 'uuid' '')).Trim()
+  if (-not [string]::IsNullOrWhiteSpace($uuid)) { $marker = $uuid }
+  $markerUnixMs = [int64]0
+  $timestamp = [string](Get-FirstObjectValue $entry @('timestamp', 'created_at', 'createdAt'))
+  if (-not [string]::IsNullOrWhiteSpace($timestamp)) {
+    $parsedTimestamp = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($timestamp, [ref]$parsedTimestamp)) {
+      $markerUnixMs = $parsedTimestamp.ToUniversalTime().ToUnixTimeMilliseconds()
+    }
+  }
+
+  $metProperty = $attachment.PSObject.Properties['met']
+  if ($null -eq $metProperty -or $metProperty.Value -isnot [bool]) {
+    return [pscustomobject]@{ state = 'unknown'; marker = $marker; marker_unix_ms = $markerUnixMs }
+  }
+  $failed = $false
+  $failedProperty = $attachment.PSObject.Properties['failed']
+  if ($null -ne $failedProperty) {
+    if ($failedProperty.Value -isnot [bool]) {
+      return [pscustomobject]@{ state = 'unknown'; marker = $marker; marker_unix_ms = $markerUnixMs }
+    }
+    $failed = [bool]$failedProperty.Value
+  }
+  $sentinel = $false
+  $sentinelProperty = $attachment.PSObject.Properties['sentinel']
+  if ($null -ne $sentinelProperty) {
+    if ($sentinelProperty.Value -isnot [bool]) {
+      return [pscustomobject]@{ state = 'unknown'; marker = $marker; marker_unix_ms = $markerUnixMs }
+    }
+    $sentinel = [bool]$sentinelProperty.Value
+  }
+
+  $state = if ($failed) {
+    'failed'
+  } elseif ([bool]$metProperty.Value -and $sentinel) {
+    'cleared'
+  } elseif ([bool]$metProperty.Value) {
+    'achieved'
+  } else {
+    'active'
+  }
+  return [pscustomobject]@{ state = $state; marker = $marker; marker_unix_ms = $markerUnixMs }
+}
+
+function Get-ClaudeGoalTranscriptState {
+  param(
+    [string]$TranscriptPath,
+    [int64]$MaxBytes = 0,
+    [int]$MaxLineBytes = $ClaudeGoalMaxLineBytes
+  )
+
+  $empty = [pscustomobject]@{ state = 'none'; marker = ''; marker_unix_ms = [int64]0 }
+  $unknown = [pscustomobject]@{ state = 'unknown'; marker = ''; marker_unix_ms = [int64]0 }
+  $hardUnknown = [pscustomobject]@{ state = 'unverifiable'; marker = 'oversize-goal-record'; marker_unix_ms = [int64]0 }
+  if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or
+      -not (Test-Path -LiteralPath $TranscriptPath -PathType Leaf)) { return $empty }
+  if ($MaxBytes -lt 0) { $MaxBytes = 0 }
+  if ($MaxLineBytes -le 0) { $MaxLineBytes = $ClaudeGoalMaxLineBytes }
+  $resolved = [IO.Path]::GetFullPath($TranscriptPath)
+  for ($scanAttempt = 0; $scanAttempt -lt 2; $scanAttempt++) {
+    try {
+      $before = Get-Item -LiteralPath $resolved -ErrorAction Stop
+      $cacheKey = $resolved.ToLowerInvariant() + '|' + $MaxBytes + '|' + $MaxLineBytes
+      $cached = if ($script:ClaudeGoalStateCache.ContainsKey($cacheKey)) { $script:ClaudeGoalStateCache[$cacheKey] } else { $null }
+      if ($null -ne $cached -and [int64]$cached.length -eq [int64]$before.Length -and
+          [int64]$cached.last_write_ticks -eq [int64]$before.LastWriteTimeUtc.Ticks) {
+        return $cached.result
+      }
+
+      $stream = $null
+      $result = $empty
+      try {
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $buffer = New-Object byte[] 65536
+        $position = [int64]$stream.Length
+        $scanFloor = if ($MaxBytes -gt 0) { [Math]::Max([int64]0, $position - $MaxBytes) } else { [int64]0 }
+        $limited = $scanFloor -gt 0
+        $goalToken = '"goal_status"'
+        $goalTokenOverlapLength = $goalToken.Length - 1
+        $carry = ''
+        $lineOversize = $false
+        $oversizeBoundary = ''
+        $found = $false
+        while ($position -gt $scanFloor -and -not $found) {
+          $count = [int][Math]::Min($buffer.Length, $position - $scanFloor)
+          $position -= $count
+          [void]$stream.Seek($position, [IO.SeekOrigin]::Begin)
+          $read = $stream.Read($buffer, 0, $count)
+          if ($read -le 0) { break }
+          $chunkText = $Utf8NoBom.GetString($buffer, 0, $read)
+          $parts = $chunkText.Split([char]10)
+          if ($parts.Length -eq 1) {
+            $piece = [string]$parts[0]
+            if ($lineOversize) {
+              $probe = $piece + $oversizeBoundary
+              if ($probe.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+                $result = $hardUnknown
+                $found = $true
+              } else {
+                $oversizeBoundary = $probe.Substring(0, [Math]::Min($goalTokenOverlapLength, $probe.Length))
+              }
+            } else {
+              $candidate = $piece + $carry
+              if ($Utf8NoBom.GetByteCount($candidate) -gt $MaxLineBytes) {
+                if ($candidate.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+                  $result = $hardUnknown
+                  $found = $true
+                } else {
+                  $lineOversize = $true
+                  $oversizeBoundary = $candidate.Substring(0, [Math]::Min($goalTokenOverlapLength, $candidate.Length))
+                  $carry = ''
+                }
+              } else {
+                $carry = $candidate
+              }
+            }
+            continue
+          }
+
+          # Complete the line that began in later chunks. Oversize records are
+          # skipped only after every byte has been checked for the lifecycle
+          # token, including a token split across chunk boundaries.
+          $trailingPiece = [string]$parts[$parts.Length - 1]
+          if ($lineOversize) {
+            $probe = $trailingPiece + $oversizeBoundary
+            if ($probe.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+              $result = $hardUnknown
+              $found = $true
+            }
+          } else {
+            $line = ($trailingPiece + $carry).TrimEnd([char]13)
+            if ($line.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+              $parsed = if ($Utf8NoBom.GetByteCount($line) -gt $MaxLineBytes) {
+                $hardUnknown
+              } else {
+                ConvertFrom-ClaudeGoalStatusLine -Line $line
+              }
+              if ($null -ne $parsed) {
+                $result = $parsed
+                $found = $true
+              }
+            }
+          }
+          $carry = ''
+          $lineOversize = $false
+          $oversizeBoundary = ''
+          if ($found) { break }
+
+          # Every middle element is a complete line wholly contained in this
+          # chunk. Visit newest to oldest so the first parsed marker wins.
+          for ($partIndex = $parts.Length - 2; $partIndex -ge 1 -and -not $found; $partIndex--) {
+            $line = ([string]$parts[$partIndex]).TrimEnd([char]13)
+            if ($line.IndexOf($goalToken, [StringComparison]::Ordinal) -lt 0) { continue }
+            $parsed = if ($Utf8NoBom.GetByteCount($line) -gt $MaxLineBytes) {
+              $hardUnknown
+            } else {
+              ConvertFrom-ClaudeGoalStatusLine -Line $line
+            }
+            if ($null -ne $parsed) {
+              $result = $parsed
+              $found = $true
+              break
+            }
+          }
+          if ($found) { break }
+
+          $carry = [string]$parts[0]
+          if ($Utf8NoBom.GetByteCount($carry) -gt $MaxLineBytes) {
+            if ($carry.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+              $result = $hardUnknown
+              $found = $true
+            } else {
+              $lineOversize = $true
+              $oversizeBoundary = $carry.Substring(0, [Math]::Min($goalTokenOverlapLength, $carry.Length))
+              $carry = ''
+            }
+          }
+        }
+        if (-not $found -and $position -eq 0) {
+          # At the beginning of the file an oversize record without the token is
+          # known irrelevant and can be skipped safely. A token-bearing one was
+          # converted to unknown while streaming above.
+          $line = $carry.TrimEnd([char]13)
+          if (-not $lineOversize -and $line.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+            $parsed = ConvertFrom-ClaudeGoalStatusLine -Line $line
+            if ($null -ne $parsed) { $result = $parsed }
+          }
+        } elseif (-not $found -and $limited -and $position -le $scanFloor) {
+          # The bounded synchronous prompt hook did not see enough transcript to
+          # prove there is no older active goal. Unknown is the safe result.
+          $result = $unknown
+        }
+      } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+      }
+
+      $after = Get-Item -LiteralPath $resolved -ErrorAction Stop
+      if ([int64]$before.Length -eq [int64]$after.Length -and
+          [int64]$before.LastWriteTimeUtc.Ticks -eq [int64]$after.LastWriteTimeUtc.Ticks) {
+        if ($script:ClaudeGoalStateCache.Count -ge 64) { $script:ClaudeGoalStateCache.Clear() }
+        $script:ClaudeGoalStateCache[$cacheKey] = [pscustomobject]@{
+          length = [int64]$after.Length
+          last_write_ticks = [int64]$after.LastWriteTimeUtc.Ticks
+          result = $result
+        }
+        return $result
+      }
+    } catch {
+      if ($scanAttempt -ge 1) {
+        return $unknown
+      }
+    }
+  }
+  return $unknown
 }
 
 function Get-CompletionLabel {
@@ -929,7 +1514,13 @@ function New-NtfyPayload {
   $displayName = $project
   $hasDistinctThreadTitle = $false
   if ($Config.includeThreadTitle) {
-    $threadTitle = Sanitize-NotificationText -Text (Get-ThreadTitle -ThreadId $Record.thread_id -SessionHome $sessionHome -SqliteHome $sessionSqliteHome) -MaxLength 60
+    $provider = [string](Get-ObjectValue $Record 'provider' 'codex')
+    $threadTitleValue = if ($provider -eq 'claude') {
+      Get-ClaudeThreadTitle -TranscriptPath ([string](Get-ObjectValue $Record 'candidate_rollout_path' '')) -SessionId ([string]$Record.thread_id)
+    } else {
+      Get-ThreadTitle -ThreadId $Record.thread_id -SessionHome $sessionHome -SqliteHome $sessionSqliteHome
+    }
+    $threadTitle = Sanitize-NotificationText -Text $threadTitleValue -MaxLength 60
     if (-not [string]::IsNullOrWhiteSpace($threadTitle)) {
       $displayName = $threadTitle
       $hasDistinctThreadTitle = -not [string]::Equals($threadTitle, $project, [StringComparison]::OrdinalIgnoreCase)
@@ -990,7 +1581,7 @@ function New-NtfyPayload {
     message = $body
     sequence_id = $Record.sequence_id
   }
-  if ($Config.includeTaskLink) {
+  if ($Config.includeTaskLink -and [string](Get-ObjectValue $Record 'provider' 'codex') -eq 'codex') {
     $taskUrl = Get-CodexTaskUrl -ThreadId $Record.thread_id
     if (-not [string]::IsNullOrWhiteSpace($taskUrl)) {
       $payload['click'] = $taskUrl
@@ -1004,7 +1595,14 @@ function New-NtfyPayload {
       }
     }
   }
-  if (@($Config.tags).Count -gt 0) { $payload['tags'] = @($Config.tags) }
+  if ([string](Get-ObjectValue $Record 'completion_event_type' '') -eq 'turn_aborted' -or
+      [string](Get-ObjectValue $Record 'goal_status' '') -eq 'blocked') {
+    # One compact error glyph keeps failed turns distinguishable even when the
+    # user has disabled assistant-message previews for privacy.
+    $payload['tags'] = @('warning')
+  } elseif (@($Config.tags).Count -gt 0) {
+    $payload['tags'] = @($Config.tags)
+  }
   if ([int]$Config.priority -ne 3) { $payload['priority'] = [int]$Config.priority }
   if ($Config.markdown -and -not [string]::IsNullOrWhiteSpace($summary)) { $payload['markdown'] = $true }
   return $payload
@@ -1267,6 +1865,9 @@ function Clean-RuntimeState {
   $deadCutoff = [DateTime]::UtcNow.AddDays(-[Math]::Max(1, $DeadRetentionDays))
   Get-ChildItem -LiteralPath $DeadDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTimeUtc -lt $deadCutoff } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+  Get-ChildItem -LiteralPath $ClaudeSessionsDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTimeUtc -lt $cutoff } |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
   # Versions before 2.4.3 left one zero-byte lock per completion in the state
@@ -2251,6 +2852,133 @@ function Test-RecordIdleGate {
   )
 
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  if ([string](Get-ObjectValue $Record 'provider' 'codex') -eq 'claude') {
+    $candidateKind = [string](Get-ObjectValue $Record 'candidate_kind' '')
+    $recordGoalState = ([string](Get-ObjectValue $Record 'claude_goal_state' '')).Trim().ToLowerInvariant()
+    $recordGoalMarker = [string](Get-ObjectValue $Record 'claude_goal_marker' '')
+    $needsIdleFallback = $recordGoalState -eq 'unknown'
+    $sessionState = $null
+    if ($candidateKind -ne 'claude_stop_failure') {
+      if ($recordGoalState -eq 'unverifiable') {
+        return New-GateResult -State 'unverifiable' -Reason 'claude-goal-record-oversize' -RetryAtUnixMs $now
+      }
+      if ($recordGoalState -eq 'cleared') {
+        return New-GateResult -State 'cancelled' -Reason 'claude-goal-cleared' -RetryAtUnixMs $now
+      }
+      if ($recordGoalState -eq 'failed') {
+        Set-RecordValue -Record $Record -Name 'goal_status' -Value 'blocked'
+      } elseif ($recordGoalState -eq 'achieved') {
+        Set-RecordValue -Record $Record -Name 'goal_status' -Value 'complete'
+      } elseif ($recordGoalState -eq 'active') {
+        $latestGoal = Get-ClaudeGoalTranscriptState -TranscriptPath ([string](Get-ObjectValue $Record 'candidate_rollout_path' ''))
+        $latestState = [string]$latestGoal.state
+        $latestMarker = [string]$latestGoal.marker
+        if ($latestState -eq 'unverifiable') {
+          return New-GateResult -State 'unverifiable' -Reason 'claude-goal-record-oversize' -RetryAtUnixMs $now
+        }
+        if ($latestState -eq 'active') {
+          return New-GateResult -State 'busy' -Reason 'claude-goal-active' -RetryAtUnixMs ($now + 500)
+        }
+        $terminalTransition = $latestState -in @('achieved', 'failed', 'cleared') -and
+          -not [string]::IsNullOrWhiteSpace($recordGoalMarker) -and
+          -not [string]::IsNullOrWhiteSpace($latestMarker) -and
+          $latestMarker -ne $recordGoalMarker
+        if ($terminalTransition) {
+          if ($latestState -eq 'cleared') {
+            return New-GateResult -State 'cancelled' -Reason 'claude-goal-cleared' -RetryAtUnixMs $now
+          }
+          Set-RecordValue -Record $Record -Name 'goal_status' -Value $(if ($latestState -eq 'failed') { 'blocked' } else { 'complete' })
+        } else {
+          # No terminal marker newer than the active marker is proof that the
+          # /goal loop has ended. A host idle event is only a fallback for a
+          # missing/temporarily unreadable transcript, never a prerequisite.
+          $needsIdleFallback = $true
+        }
+      } elseif ($recordGoalState -eq 'unknown') {
+        # A transcript can change while the async Stop process is reading it.
+        # Reconcile on every poll so a transient partial line never makes a
+        # candidate depend permanently on the optional Notification hook.
+        $latestGoal = Get-ClaudeGoalTranscriptState -TranscriptPath ([string](Get-ObjectValue $Record 'candidate_rollout_path' ''))
+        $latestState = [string]$latestGoal.state
+        $latestMarker = [string]$latestGoal.marker
+        if ($latestState -eq 'unverifiable') {
+          return New-GateResult -State 'unverifiable' -Reason 'claude-goal-record-oversize' -RetryAtUnixMs $now
+        }
+        if ($latestState -eq 'active') {
+          Set-RecordValue -Record $Record -Name 'claude_goal_state' -Value 'active'
+          Set-RecordValue -Record $Record -Name 'claude_goal_marker' -Value $latestMarker
+          return New-GateResult -State 'busy' -Reason 'claude-goal-active' -RetryAtUnixMs ($now + 500)
+        }
+        if ($latestState -eq 'none') {
+          $needsIdleFallback = $false
+        } elseif ($latestState -in @('achieved', 'failed', 'cleared')) {
+          $sessionState = Read-ClaudeSessionState -SessionId ([string](Get-ObjectValue $Record 'thread_id' ''))
+          $recordEpoch = [int64](Get-ObjectValue $Record 'claude_session_epoch' 0)
+          $stateEpoch = [int64](Get-ObjectValue $sessionState 'epoch' 0)
+          $baselineCaptured = [bool](Get-ObjectValue $sessionState 'goal_baseline_captured' $false)
+          $baselineMarker = [string](Get-ObjectValue $sessionState 'goal_baseline_marker' '')
+          $isCurrentTerminal = $recordEpoch -gt 0 -and $stateEpoch -eq $recordEpoch -and
+            $baselineCaptured -and -not [string]::IsNullOrWhiteSpace($latestMarker) -and
+            $latestMarker -ne $baselineMarker
+          if ($isCurrentTerminal) {
+            if ($latestState -eq 'cleared') {
+              return New-GateResult -State 'cancelled' -Reason 'claude-goal-cleared' -RetryAtUnixMs $now
+            }
+            Set-RecordValue -Record $Record -Name 'goal_status' -Value $(if ($latestState -eq 'failed') { 'blocked' } else { 'complete' })
+          }
+          # A terminal marker equal to the prompt baseline is historical. Both
+          # historical and newly proven terminal states are non-running.
+          $needsIdleFallback = $false
+        }
+      }
+    }
+
+    if ($candidateKind -ne 'claude_stop_failure' -and $needsIdleFallback) {
+      if ($null -eq $sessionState) {
+        $sessionState = Read-ClaudeSessionState -SessionId ([string](Get-ObjectValue $Record 'thread_id' ''))
+      }
+      $idleConfirmed = $null -ne $sessionState -and [string](Get-ObjectValue $sessionState 'state' '') -eq 'idle'
+      $recordEpoch = [int64](Get-ObjectValue $Record 'claude_session_epoch' 0)
+      $stateEpoch = [int64](Get-ObjectValue $sessionState 'epoch' 0)
+      if ($recordEpoch -gt 0 -and $stateEpoch -gt 0 -and $recordEpoch -ne $stateEpoch) { $idleConfirmed = $false }
+      $statePrompt = [string](Get-ObjectValue $sessionState 'prompt_id' '')
+      $recordPrompt = [string](Get-ObjectValue $Record 'turn_id' '')
+      if ([string]::IsNullOrWhiteSpace($statePrompt) -or
+          [string]::IsNullOrWhiteSpace($recordPrompt) -or
+          $statePrompt -ne $recordPrompt) { $idleConfirmed = $false }
+      $stateTranscript = [string](Get-ObjectValue $sessionState 'transcript_path' '')
+      $recordTranscript = [string](Get-ObjectValue $Record 'candidate_rollout_path' '')
+      if (-not [string]::IsNullOrWhiteSpace($stateTranscript) -and
+          -not [string]::IsNullOrWhiteSpace($recordTranscript) -and
+          -not [string]::Equals($stateTranscript, $recordTranscript, [StringComparison]::OrdinalIgnoreCase)) {
+        $idleConfirmed = $false
+      }
+      $idleAt = [int64](Get-ObjectValue $sessionState 'idle_unix_ms' 0)
+      $createdAt = [int64](Get-ObjectValue $Record 'created_unix_ms' $now)
+      if ($idleAt -le 0 -or $idleAt -lt ($createdAt - 30000)) { $idleConfirmed = $false }
+      if (-not $idleConfirmed) {
+        return New-GateResult -State 'busy' -Reason 'claude-goal-awaiting-finality' -RetryAtUnixMs ($now + 500)
+      }
+    }
+    $createdAt = [int64](Get-ObjectValue $Record 'created_unix_ms' $now)
+    $quietAt = $createdAt + [int64]([Math]::Max(0, $Config.idleGraceSeconds) * 1000)
+    $transcriptPath = [string](Get-ObjectValue $Record 'candidate_rollout_path' '')
+    if (-not [string]::IsNullOrWhiteSpace($transcriptPath)) {
+      try {
+        $transcript = Get-Item -LiteralPath $transcriptPath -ErrorAction Stop
+        $transcriptQuietAt = [DateTimeOffset]$transcript.LastWriteTimeUtc
+        $transcriptQuietAt = $transcriptQuietAt.ToUnixTimeMilliseconds() + [int64]([Math]::Max(0, $Config.idleGraceSeconds) * 1000)
+        if ($transcriptQuietAt -gt $quietAt) { $quietAt = $transcriptQuietAt }
+      } catch {
+        # Stop.last_assistant_message is authoritative; a missing/lagging
+        # transcript must not suppress an otherwise verifiable completion.
+      }
+    }
+    if ($now -lt $quietAt) {
+      return New-GateResult -State 'busy' -Reason 'claude-not-quiet' -RetryAtUnixMs $quietAt
+    }
+    return New-GateResult -State 'ready' -Reason 'claude-idle' -RetryAtUnixMs $now
+  }
   if ($Config.idleDetectionMode -eq 'off') {
     return New-GateResult -State 'ready' -Reason 'idle-detection-off' -RetryAtUnixMs $now
   }
@@ -2992,7 +3720,7 @@ function Assert-QueuedRecord {
     throw 'queue item has an invalid key'
   }
   $sequenceId = [string](Get-ObjectValue $Record 'sequence_id' '')
-  if ($sequenceId -notmatch '^codex-[0-9a-f]{32}$') {
+  if ($sequenceId -notmatch '^(?:codex|claude)-[0-9a-f]{32}$') {
     throw 'queue item has an invalid sequence ID'
   }
   $event = Get-ObjectValue $Record 'event'
@@ -3073,7 +3801,7 @@ function Resolve-QueueReceiptConflict {
   } -Arguments @($Path, $Record)
 }
 
-function Commit-PendingRecord {
+function Invoke-PendingRecordCommit {
   param(
     [string]$Path,
     [object]$Record,
@@ -3086,6 +3814,13 @@ function Commit-PendingRecord {
     }
     $canonical = Read-JsonFile -Path $lockedPath
     Assert-QueuedRecord -Record $canonical -ExpectedKey $incomingRecord.key
+    $canonicalRevision = [string](Get-ObjectValue $canonical 'candidate_revision' '')
+    $incomingRevision = [string](Get-ObjectValue $incomingRecord 'candidate_revision' '')
+    if (-not [string]::IsNullOrWhiteSpace($canonicalRevision) -and
+        -not [string]::IsNullOrWhiteSpace($incomingRevision) -and
+        $canonicalRevision -ne $incomingRevision) {
+      return [pscustomobject]@{ status = 'stale-snapshot' }
+    }
     $canonicalIsStop = Test-IsStopEvidence -Record $canonical
     $incomingIsStop = Test-IsStopEvidence -Record $incomingRecord
     if ($canonicalIsStop -and -not $incomingIsStop) {
@@ -3093,7 +3828,7 @@ function Commit-PendingRecord {
     }
     $writeRecord = if ($canonicalIsStop) { $canonical } else { $incomingRecord }
     if ($canonicalIsStop) {
-      foreach ($name in @('next_attempt_unix_ms', 'gate_reason', 'goal_status', 'completion_event_type', 'active_descendants', 'descendant_unknown_since', 'candidate_rollout_path', 'rollout_sequence')) {
+      foreach ($name in @('next_attempt_unix_ms', 'gate_reason', 'goal_status', 'completion_event_type', 'active_descendants', 'descendant_unknown_since', 'candidate_rollout_path', 'rollout_sequence', 'claude_goal_state', 'claude_goal_marker')) {
         $property = $incomingRecord.PSObject.Properties[$name]
         if ($null -ne $property) { Set-RecordValue -Record $writeRecord -Name $name -Value $property.Value }
       }
@@ -3112,6 +3847,93 @@ function Commit-PendingRecord {
     [void](Move-QueueRecord -SourcePath $lockedPath -DestinationDirectory $OutboxDir -Record $writeRecord)
     return [pscustomobject]@{ status = 'promoted' }
   } -Arguments @($Path, $Record, [bool]$Promote)
+}
+
+function Get-ClaudeSessionCommitDisposition {
+  param(
+    [object]$Record,
+    [object]$SessionState
+  )
+
+  $recordEpoch = [int64](Get-ObjectValue $Record 'claude_session_epoch' 0)
+  if ($null -eq $SessionState) {
+    if ($recordEpoch -gt 0) { return 'unverifiable' }
+    return 'current'
+  }
+  $recordSession = [string](Get-ObjectValue $Record 'thread_id' '')
+  if ([string](Get-ObjectValue $SessionState 'session_id' '') -ne $recordSession) { return 'unverifiable' }
+  $stateEpoch = [int64](Get-ObjectValue $SessionState 'epoch' 0)
+  if ($recordEpoch -gt 0) {
+    if ($stateEpoch -le 0) { return 'unverifiable' }
+    if ($stateEpoch -ne $recordEpoch) { return 'stale' }
+  } elseif ($stateEpoch -gt 0 -and [string](Get-ObjectValue $SessionState 'state' '') -eq 'busy') {
+    return 'stale'
+  }
+  $recordPrompt = [string](Get-ObjectValue $Record 'turn_id' '')
+  $statePrompt = [string](Get-ObjectValue $SessionState 'prompt_id' '')
+  if (-not [string]::IsNullOrWhiteSpace($recordPrompt) -and
+      -not [string]::IsNullOrWhiteSpace($statePrompt) -and
+      $recordPrompt -ne $statePrompt) {
+    return 'stale'
+  }
+  return 'current'
+}
+
+function Commit-PendingRecord {
+  param(
+    [string]$Path,
+    [object]$Record,
+    [switch]$Promote
+  )
+
+  if ([string](Get-ObjectValue $Record 'provider' 'codex') -ne 'claude') {
+    return Invoke-PendingRecordCommit -Path $Path -Record $Record -Promote:$Promote
+  }
+  $sessionInfo = Get-ClaudeSessionStateInfo -SessionId ([string](Get-ObjectValue $Record 'thread_id' ''))
+  if ($null -eq $sessionInfo) { return [pscustomobject]@{ status = 'session-unverifiable' } }
+  return Invoke-WithClaudeSessionLock -Info $sessionInfo -Action {
+    param($lockedInfo, $lockedPath, $lockedRecord, $shouldPromote)
+    $sessionState = $null
+    if (Test-Path -LiteralPath $lockedInfo.path -PathType Leaf) {
+      try { $sessionState = Read-JsonFile -Path $lockedInfo.path } catch { $sessionState = $null }
+    }
+    $disposition = Get-ClaudeSessionCommitDisposition -Record $lockedRecord -SessionState $sessionState
+    if ($disposition -eq 'unverifiable') {
+      return [pscustomobject]@{ status = 'session-unverifiable' }
+    }
+    if ($disposition -eq 'stale') {
+      $discard = Discard-PendingRecord -Path $lockedPath -Record $lockedRecord
+      if ($discard.status -in @('discarded', 'missing')) {
+        return [pscustomobject]@{ status = 'stale-session' }
+      }
+      return $discard
+    }
+    return Invoke-PendingRecordCommit -Path $lockedPath -Record $lockedRecord -Promote:$shouldPromote
+  } -Arguments @($sessionInfo, $Path, $Record, [bool]$Promote)
+}
+
+function Discard-PendingRecord {
+  param(
+    [string]$Path,
+    [object]$Record
+  )
+  return Invoke-WithRecordMutationLock -Key ([string]$Record.key) -Action {
+    param($lockedPath, $incomingRecord)
+    if (-not (Test-Path -LiteralPath $lockedPath)) {
+      return [pscustomobject]@{ status = 'missing' }
+    }
+    $canonical = Read-JsonFile -Path $lockedPath
+    Assert-QueuedRecord -Record $canonical -ExpectedKey $incomingRecord.key
+    $canonicalRevision = [string](Get-ObjectValue $canonical 'candidate_revision' '')
+    $incomingRevision = [string](Get-ObjectValue $incomingRecord 'candidate_revision' '')
+    if (-not [string]::IsNullOrWhiteSpace($canonicalRevision) -and
+        -not [string]::IsNullOrWhiteSpace($incomingRevision) -and
+        $canonicalRevision -ne $incomingRevision) {
+      return [pscustomobject]@{ status = 'stale-snapshot' }
+    }
+    Remove-Item -LiteralPath $lockedPath -Force -ErrorAction Stop
+    return [pscustomobject]@{ status = 'discarded' }
+  } -Arguments @($Path, $Record)
 }
 
 function Test-UuidV7TurnId {
@@ -3245,12 +4067,25 @@ function Process-PendingCandidates {
         $promote = $false
         break
       }
+      if ($gate.state -eq 'cancelled') {
+        $discard = Discard-PendingRecord -Path $file.FullName -Record $record
+        if ($discard.status -eq 'discarded') {
+          Write-RuntimeLog "discarded cancelled Claude goal key=$($record.key.Substring(0, 12))"
+        } elseif ($discard.status -eq 'stale-snapshot') {
+          $nextDue = $now
+        }
+        $promote = $false
+        break
+      }
       if ($gate.state -ne 'ready') {
         Set-RecordValue -Record $record -Name 'next_attempt_unix_ms' -Value ([int64]$gate.retryAtUnixMs)
         Set-RecordValue -Record $record -Name 'gate_reason' -Value $gate.reason
         $commit = Commit-PendingRecord -Path $file.FullName -Record $record
         if ($null -eq $nextDue -or [int64]$gate.retryAtUnixMs -lt $nextDue) { $nextDue = [int64]$gate.retryAtUnixMs }
-        if ($commit.status -eq 'stop-won') { $nextDue = $now }
+        if ($commit.status -in @('stop-won', 'stale-snapshot')) { $nextDue = $now }
+        if ($commit.status -eq 'stale-session') {
+          Write-RuntimeLog "discarded stale Claude candidate after prompt epoch changed key=$($record.key.Substring(0, 12))"
+        }
         $promote = $false
         break
       }
@@ -3259,11 +4094,24 @@ function Process-PendingCandidates {
 
     Set-RecordValue -Record $record -Name 'next_attempt_unix_ms' -Value $now
     Set-RecordValue -Record $record -Name 'gate_reason' -Value $gate.reason
+    $testPromoteDelayMs = 0
+    if ([int]::TryParse([string]$env:CODEX_NTFY_TEST_BEFORE_PROMOTE_MS, [ref]$testPromoteDelayMs) -and $testPromoteDelayMs -gt 0) {
+      $testMarker = [string]$env:CODEX_NTFY_TEST_BEFORE_PROMOTE_MARKER
+      if (-not [string]::IsNullOrWhiteSpace($testMarker)) {
+        [System.IO.File]::WriteAllText($testMarker, [string]$record.candidate_revision, $Utf8NoBom)
+      }
+      Start-Sleep -Milliseconds ([Math]::Min(10000, $testPromoteDelayMs))
+    }
     $commit = Commit-PendingRecord -Path $file.FullName -Record $record -Promote
     if ($commit.status -in @('promoted', 'already-promoted')) {
       Write-RuntimeLog "idle candidate promoted key=$($record.key.Substring(0, 12)) reason=$($gate.reason)"
-    } elseif ($commit.status -eq 'stop-won') {
+    } elseif ($commit.status -in @('stop-won', 'stale-snapshot')) {
       if ($null -eq $nextDue -or $now -lt $nextDue) { $nextDue = $now }
+    } elseif ($commit.status -eq 'session-unverifiable') {
+      $sessionRetryAt = $now + 500
+      if ($null -eq $nextDue -or $sessionRetryAt -lt $nextDue) { $nextDue = $sessionRetryAt }
+    } elseif ($commit.status -eq 'stale-session') {
+      Write-RuntimeLog "discarded stale Claude candidate before promotion key=$($record.key.Substring(0, 12))"
     }
   }
   return [pscustomobject]@{ nextDueUnixMs = $nextDue }
@@ -3969,11 +4817,139 @@ try {
   }
   $event = ConvertTo-NotificationEvent -Raw $raw
   if ($null -eq $event) {
-    if ($HookEvent) { Write-Output '{}' }
+    if ($HookEvent -or $ClaudeHook) { Write-Output '{}' }
     exit 0
   }
   $candidateKind = 'legacy'
-  if ($HookEvent) {
+  $provider = 'codex'
+  $sourceEvent = 'agent-turn-complete'
+  if ($ClaudeHook) {
+    $hookInput = $event
+    $hookName = [string](Get-FirstObjectValue $hookInput @('hook_event_name', 'hook-event-name', 'hookEventName', 'event_name', 'eventName', 'type'))
+    $sessionId = [string](Get-FirstObjectValue $hookInput @('session_id', 'session-id', 'sessionId'))
+    $promptId = [string](Get-FirstObjectValue $hookInput @('prompt_id', 'prompt-id', 'promptId'))
+    $agentId = [string](Get-FirstObjectValue $hookInput @('agent_id', 'agent-id', 'agentId'))
+    $transcriptPath = [string](Get-FirstObjectValue $hookInput @('transcript_path', 'transcript-path', 'transcriptPath'))
+    if ($hookName -eq 'UserPromptSubmit') {
+      if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
+        [void](Set-ClaudeSessionBusy -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath)
+      } else {
+        Write-RuntimeLog 'ignored Claude UserPromptSubmit without session_id'
+      }
+      Write-Output '{}'
+      exit 0
+    }
+    if ($hookName -eq 'Notification') {
+      $notificationType = [string](Get-FirstObjectValue $hookInput @('notification_type', 'notification-type', 'notificationType'))
+      if ($notificationType -in @('idle_prompt', 'agent_completed') -and
+          -not [string]::IsNullOrWhiteSpace($sessionId) -and
+          -not [string]::IsNullOrWhiteSpace($promptId)) {
+        [void](Set-ClaudeSessionIdle -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath -NotificationType $notificationType)
+        Start-DetachedWorker
+      } else {
+        Write-RuntimeLog "ignored unsupported or uncorrelated Claude notification type=$(Sanitize-NotificationText -Text $notificationType -MaxLength 80)"
+      }
+      Write-Output '{}'
+      exit 0
+    }
+    if ($hookName -eq 'SubagentStop' -or -not [string]::IsNullOrWhiteSpace($agentId)) {
+      Write-RuntimeLog 'ignored Claude subagent completion'
+      Write-Output '{}'
+      exit 0
+    }
+    if ($hookName -notin @('Stop', 'StopFailure')) {
+      Write-RuntimeLog "ignored unsupported Claude hook event type=$(Sanitize-NotificationText -Text $hookName -MaxLength 80)"
+      Write-Output '{}'
+      exit 0
+    }
+    if ([string]::IsNullOrWhiteSpace($sessionId)) {
+      Write-RuntimeLog 'ignored unverifiable Claude completion without session_id'
+      Write-Output '{}'
+      exit 0
+    }
+    $sessionState = Read-ClaudeSessionState -SessionId $sessionId
+    if ([string]::IsNullOrWhiteSpace($promptId)) {
+      # Async hooks without prompt identity cannot be correlated safely after a
+      # follow-up prompt. Fail closed instead of manufacturing a weak key.
+      Write-RuntimeLog 'ignored unverifiable Claude completion without prompt_id'
+      Write-Output '{}'
+      exit 0
+    }
+    $activePromptId = [string](Get-ObjectValue $sessionState 'prompt_id' '')
+    if (-not [string]::IsNullOrWhiteSpace($activePromptId) -and $activePromptId -ne $promptId) {
+      Write-RuntimeLog 'ignored stale Claude completion for a superseded prompt'
+      Write-Output '{}'
+      exit 0
+    }
+    if ($hookName -eq 'Stop') {
+      $backgroundProperty = $hookInput.PSObject.Properties['background_tasks']
+      $cronsProperty = $hookInput.PSObject.Properties['session_crons']
+      if ($null -eq $backgroundProperty -or $null -eq $cronsProperty -or
+          $null -eq $backgroundProperty.Value -or $null -eq $cronsProperty.Value -or
+          $backgroundProperty.Value -isnot [System.Array] -or
+          $cronsProperty.Value -isnot [System.Array]) {
+        Write-RuntimeLog 'ignored unverifiable Claude Stop without work registries'
+        Write-Output '{}'
+        exit 0
+      }
+      if (@($backgroundProperty.Value).Count -gt 0 -or @($cronsProperty.Value).Count -gt 0) {
+        Remove-ClaudePendingCandidate -SessionId $sessionId -PromptId $promptId
+        Write-RuntimeLog 'ignored Claude Stop while background work remains active'
+        Write-Output '{}'
+        exit 0
+      }
+    }
+    $sessionEpoch = [int64](Get-ObjectValue $sessionState 'epoch' 0)
+    $goalInfo = if ($hookName -eq 'Stop') {
+      # Stop is synchronous so repeated lifecycle events retain host ordering.
+      # Keep that ordered path bounded; the detached worker performs the full
+      # reverse scan whenever this limited read returns unknown.
+      Get-ClaudeGoalTranscriptState -TranscriptPath $transcriptPath -MaxBytes $ClaudePromptBaselineMaxBytes
+    } else {
+      [pscustomobject]@{ state = 'none'; marker = ''; marker_unix_ms = [int64]0 }
+    }
+    $goalState = [string]$goalInfo.state
+    $goalMarker = [string]$goalInfo.marker
+    $goalMarkerUnixMs = [int64](Get-ObjectValue $goalInfo 'marker_unix_ms' 0)
+    $baselineCaptured = [bool](Get-ObjectValue $sessionState 'goal_baseline_captured' $false)
+    $baselineMarker = [string](Get-ObjectValue $sessionState 'goal_baseline_marker' '')
+    $sessionBusyUnixMs = [int64](Get-ObjectValue $sessionState 'busy_unix_ms' 0)
+    # Terminal markers are session-level and remain forever. They belong to the
+    # current prompt when they differ from a captured baseline. If the bounded
+    # prompt-start scan could not capture a baseline, only a marker timestamped
+    # before prompt start is safely historical; an ambiguous clear fails closed.
+    $terminalMarkerIsHistorical = $baselineCaptured -and $goalMarker -eq $baselineMarker
+    if (-not $baselineCaptured -and $goalMarkerUnixMs -gt 0 -and
+        $sessionBusyUnixMs -gt 0 -and $goalMarkerUnixMs -lt $sessionBusyUnixMs) {
+      $terminalMarkerIsHistorical = $true
+    }
+    # An active marker is always fail-closed so resumed /goal loops stay safe.
+    if ($goalState -in @('achieved', 'failed', 'cleared') -and $terminalMarkerIsHistorical) {
+      $goalState = 'none'
+      $goalMarker = ''
+    }
+    $lastMessage = [string](Get-FirstObjectValue $hookInput @('last_assistant_message', 'last-assistant-message', 'lastAgentMessage', 'last_agent_message', 'message'))
+    if ($hookName -eq 'StopFailure' -and [string]::IsNullOrWhiteSpace($lastMessage)) {
+      $errorName = Sanitize-NotificationText -Text ([string](Get-ObjectValue $hookInput 'error' 'unknown')) -MaxLength 80
+      $lastMessage = "Claude API error: $errorName"
+    }
+    $event = [pscustomobject][ordered]@{
+      type = 'agent-turn-complete'
+      'thread-id' = $sessionId
+      'turn-id' = $promptId
+      cwd = [string](Get-FirstObjectValue $hookInput @('cwd', 'working-directory', 'working_directory'))
+      'last-assistant-message' = $lastMessage
+      transcript_path = $transcriptPath
+      'claude-session-epoch' = $sessionEpoch
+      'claude-goal-state' = $goalState
+      'claude-goal-marker' = $goalMarker
+      'goal-status' = if ($goalState -eq 'failed') { 'blocked' } elseif ($goalState -eq 'achieved') { 'complete' } else { '' }
+      'completion-event-type' = if ($hookName -eq 'StopFailure') { 'turn_aborted' } else { 'task_complete' }
+    }
+    $provider = 'claude'
+    $candidateKind = if ($hookName -eq 'StopFailure') { 'claude_stop_failure' } else { 'claude_stop' }
+    $sourceEvent = $hookName
+  } elseif ($HookEvent) {
     $hookName = [string](Get-FirstObjectValue $event @('hook_event_name', 'hook-event-name', 'hookEventName', 'event_name', 'eventName', 'type'))
     if ($hookName -eq 'SubagentStop') {
       Write-RuntimeLog 'ignored SubagentStop hook event'
@@ -4000,10 +4976,11 @@ try {
       'parent-thread-id' = [string](Get-FirstObjectValue $hookInput @('parent-thread-id', 'parent_thread_id'))
     }
     $candidateKind = 'hook_stop'
+    $sourceEvent = 'Stop'
   }
   $eventType = [string](Get-ObjectValue $event 'type' 'agent-turn-complete')
   if ($eventType -ne 'agent-turn-complete') {
-    if ($HookEvent) { Write-Output '{}' }
+    if ($HookEvent -or $ClaudeHook) { Write-Output '{}' }
     exit 0
   }
 
@@ -4027,7 +5004,7 @@ try {
   } else {
     $eventSessionHome
   }
-  $detectedClassification = if ($Test) {
+  $detectedClassification = if ($Test -or $provider -eq 'claude') {
     'root'
   } else {
     Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $eventSessionHome
@@ -4039,19 +5016,18 @@ try {
   } else {
     $detectedClassification
   }
-  $sourceEvent = if ($HookEvent) { 'Stop' } else { 'agent-turn-complete' }
-  $record = New-EventRecord -Event $event -EventOrigin (Get-DefaultOrigin) -EventSessionHome $eventSessionHome -EventSqliteHome $eventSqliteHome -EventClassification $eventClassification -EventIncludeMessage $config.includeMessage -CandidateKind $candidateKind -SourceEvent $sourceEvent
+  $record = New-EventRecord -Event $event -EventOrigin (Get-DefaultOrigin) -EventSessionHome $eventSessionHome -EventSqliteHome $eventSqliteHome -EventClassification $eventClassification -EventIncludeMessage $config.includeMessage -CandidateKind $candidateKind -SourceEvent $sourceEvent -Provider $provider
   if ($config.suppressSubagents -and $eventClassification -eq 'subagent') {
     Move-ToSuppressed -Path (Join-Path $OutboxDir ($record.key + '.json')) -Record $record
     Write-RuntimeLog "suppressed subagent completion thread=$($threadId.Substring(0, [Math]::Min(8, $threadId.Length)))"
-    if ($HookEvent) { Write-Output '{}' }
+    if ($HookEvent -or $ClaudeHook) { Write-Output '{}' }
     exit 0
   }
 
   $queued = if ($Test) { Add-OutboxEvent -Record $record } else { Add-CandidateEvent -Record $record -Config $config }
   Start-DetachedWorker
 
-  if ($HookEvent) {
+  if ($HookEvent -or $ClaudeHook) {
     Write-Output '{}'
     exit 0
   }
@@ -4072,7 +5048,7 @@ try {
   exit 0
 } catch {
   Write-RuntimeLog "hook error: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 500)"
-  if ($HookEvent) {
+  if ($HookEvent -or $ClaudeHook) {
     if ($BridgeFallback) { exit 1 }
     Write-Output '{}'
     exit 0

@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-07-17
+
+### Added
+
+- Added opt-in Claude Code support on Windows for Claude Desktop's Code tab, the CLI, and VS Code through managed `Stop`, `StopFailure`, ordered `UserPromptSubmit`, and optional `Notification` hooks.
+- Added stable Claude deduplication with `session_id + prompt_id`, provider-isolated sequence IDs, bounded local Claude title lookup, and multi-session coverage.
+- Added a transcript-backed `/goal` gate that follows Claude's newest `attachment.goal_status`: active loops wait, achieved/failed goals release, and manual clear discards without notifying.
+
+### Changed
+
+- Claude main-agent stops notify only when both authoritative `background_tasks` and `session_crons` registries are present and empty. Missing registries, subagent stops, and stops with active work fail closed without creating terminal receipts.
+- `Stop`, `StopFailure`, and `UserPromptSubmit` run synchronously to preserve Claude's lifecycle order. Their initial transcript reads are bounded, while `idle_prompt` and `agent_completed` remain asynchronous accelerators rather than correctness requirements.
+- ChatGPT task links are now explicitly limited to Codex records; Claude notifications never generate a misleading Codex task URL.
+- The Windows installer can merge Claude handlers with `-EnableClaudeCode`, preserves unrelated settings/hooks, writes atomically, remains idempotent, restores the original Claude settings file if installation later fails, and validates the newest binary for each detected Claude surface separately.
+- Claude prompt-start baseline reads are capped at 1 MiB; the reverse transcript scanner skips proven non-goal oversized records in bounded memory and fails closed on oversized lifecycle records.
+
+### Fixed
+
+- Claude Code on Windows no longer appears configured while silently producing no notification: the installer and runtime now provide the missing provider-specific lifecycle path instead of attempting to classify Claude payloads as Codex rollouts.
+- Prevented intermediate `/goal` stops, same-prompt async reordering, stale stops from superseded prompts, stale terminal markers, session-epoch promotion races, and manual goal clears (including after a transient baseline read) from producing misleading or poisoned notifications.
+
+### Security
+
+- Claude hooks use shell-free executable/argument form, an absolute PowerShell path, and no ntfy credential in `settings.json`. Transcript inspection extracts only lifecycle booleans plus an opaque marker, never the goal condition or reason.
+
 ## [2.4.3] - 2026-07-13
 
 ### Added
@@ -172,7 +197,8 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.4.3...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.0
 [2.4.3]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.3
 [2.4.2]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.2
 [2.4.1]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.1
