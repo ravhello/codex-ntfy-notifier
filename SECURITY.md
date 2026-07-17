@@ -2,14 +2,14 @@
 
 Durable Codex ntfy notifier processes private local metadata and may hold reusable ntfy credentials. Please report vulnerabilities privately and avoid exposing affected users while a fix is prepared.
 
-This is an unofficial community project. Security problems in OpenAI Codex, ntfy, Python, PowerShell, Windows, systemd, OpenSSH, VS Code, or an operating system should normally be reported to the relevant upstream project.
+This is an unofficial community project. Security problems in OpenAI Codex, Anthropic Claude Code, ntfy, Python, PowerShell, Windows, systemd, OpenSSH, VS Code, or an operating system should normally be reported to the relevant upstream project.
 
 ## Supported versions
 
 | Version | Security fixes |
 | --- | --- |
-| 2.4.x | Supported |
-| 2.3.x | Not supported; upgrade to 2.4.x |
+| 2.5.x | Supported |
+| 2.4.x and earlier | Not supported; upgrade to the latest release |
 | Earlier private/pre-public builds | Not supported; upgrade and rotate any embedded credentials |
 
 Only the latest patch release receives security updates. A report may lead to a new patch release rather than a backport.

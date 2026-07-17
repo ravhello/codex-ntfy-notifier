@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -332,6 +333,119 @@ class NotifierContractTests(unittest.TestCase):
             "--origin",
             origin,
         ]
+
+    def claude_hook_command(self, *, origin: str = "Claude Code") -> list[str]:
+        return [
+            str(WINDOWS_POWERSHELL),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(POWERSHELL_NOTIFIER),
+            "-NoSpawn",
+            "-ClaudeHook",
+            "-ReadStdin",
+            "-Origin",
+            origin,
+        ]
+
+    def claude_event(
+        self,
+        *,
+        session_id: str | None = None,
+        prompt_id: str | None = None,
+        transcript_path: Path | None = None,
+    ) -> dict:
+        return {
+            "hook_event_name": "Stop",
+            "session_id": session_id or str(uuid.uuid4()),
+            "prompt_id": prompt_id or str(uuid.uuid4()),
+            "transcript_path": str(transcript_path or self.temp / "missing-transcript.jsonl"),
+            "cwd": r"C:\work\perfect notifier",
+            "last_assistant_message": "Claude final response.",
+            "stop_hook_active": False,
+            "background_tasks": [],
+            "session_crons": [],
+        }
+
+    def claude_idle_event(
+        self,
+        event: dict,
+        *,
+        notification_type: str = "idle_prompt",
+        include_prompt_id: bool = False,
+    ) -> dict:
+        idle = {
+            "hook_event_name": "Notification",
+            "notification_type": notification_type,
+            "session_id": event["session_id"],
+            "transcript_path": event["transcript_path"],
+            "cwd": event.get("cwd", ""),
+            "message": "Claude is waiting for input",
+        }
+        if include_prompt_id and event.get("prompt_id"):
+            idle["prompt_id"] = event["prompt_id"]
+        return idle
+
+    def claude_prompt_event(self, event: dict, *, prompt_id: str | None = None) -> dict:
+        return {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": event["session_id"],
+            "prompt_id": prompt_id or event.get("prompt_id", ""),
+            "transcript_path": event["transcript_path"],
+            "cwd": event.get("cwd", ""),
+            "prompt": "Continue",
+        }
+
+    def append_claude_goal_status(
+        self,
+        transcript: Path,
+        *,
+        met: bool,
+        failed: bool | None = None,
+        sentinel: bool | None = None,
+        reason: str | None = None,
+    ) -> str:
+        marker = str(uuid.uuid4())
+        attachment: dict[str, object] = {"type": "goal_status", "met": met}
+        if failed is not None:
+            attachment["failed"] = failed
+        if sentinel is not None:
+            attachment["sentinel"] = sentinel
+        if reason is not None:
+            attachment["reason"] = reason
+        entry = {
+            "type": "attachment",
+            "uuid": marker,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "attachment": attachment,
+        }
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        return marker
+
+    def run_claude_hook(self, event: dict) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            self.claude_hook_command(),
+            input=json.dumps(event),
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, msg=f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertEqual(result.stdout.strip(), "{}")
+        return result
+
+    def state_debug(self) -> str:
+        files = {
+            name: [path.name for path in (self.state / name).glob("*.json")]
+            for name in ("pending", "outbox", "sent", "suppressed", "dead")
+        }
+        log_path = self.state / "notify.log"
+        log = log_path.read_text(encoding="utf-8-sig", errors="replace") if log_path.exists() else ""
+        return json.dumps(files) + "\n" + log[-4000:]
 
     def worker_command(self, implementation: str) -> list[str]:
         if implementation == "powershell":
@@ -1578,6 +1692,631 @@ class NotifierContractTests(unittest.TestCase):
                 shutil.rmtree(self.state, ignore_errors=True)
                 with self.server.lock:
                     self.server.payloads.clear()
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_final_stop_is_strong_deduplicated_and_has_no_codex_link(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            include_thread_title=True,
+            include_task_link=True,
+            include_task_link_action=True,
+        )
+        session_id = str(uuid.uuid4())
+        prompt_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "ai-title", "sessionId": session_id, "aiTitle": "Generated title"})
+            + "\n"
+            + json.dumps({"type": "custom-title", "sessionId": session_id, "customTitle": "Claude conversation"})
+            + "\n",
+            encoding="utf-8",
+        )
+        event = self.claude_event(session_id=session_id, prompt_id=prompt_id, transcript_path=transcript)
+        self.run_claude_hook(event)
+        self.run_claude_hook(event)
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1)
+        record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(record["provider"], "claude")
+        self.assertFalse(record["weak_identity"])
+        self.assertEqual(record["thread_id"], session_id)
+        self.assertEqual(record["turn_id"], prompt_id)
+        self.assertTrue(record["sequence_id"].startswith("claude-"))
+
+        self.run_ok(self.worker_command("powershell"))
+        self.assertEqual(len(self.wait_for_payloads(1)), 1, self.state_debug())
+        self.run_claude_hook(self.claude_idle_event(event, include_prompt_id=True))
+        self.run_ok(self.worker_command("powershell"))
+        self.run_claude_hook(event)
+        self.run_ok(self.worker_command("powershell"))
+        with self.server.lock:
+            payloads = list(self.server.payloads)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertEqual(payloads[0]["title"], "Claude conversation")
+        self.assertIn("Claude final response.", payloads[0]["message"])
+        self.assertNotIn("click", payloads[0])
+        self.assertNotIn("actions", payloads[0])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_same_prompt_refresh_wins_promotion_race(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        first = {**event, "last_assistant_message": "STALE candidate."}
+        self.run_claude_hook(first)
+
+        marker = self.temp / "before-promote.marker"
+        worker_env = {
+            **self.env,
+            "CODEX_NTFY_TEST_BEFORE_PROMOTE_MS": "2000",
+            "CODEX_NTFY_TEST_BEFORE_PROMOTE_MARKER": str(marker),
+        }
+        worker = subprocess.Popen(
+            self.worker_command("powershell"),
+            env=worker_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline and not marker.exists():
+            time.sleep(0.05)
+        self.assertTrue(marker.exists(), self.state_debug())
+
+        latest = {**event, "last_assistant_message": "Latest final result."}
+        self.run_claude_hook(latest)
+        self.assert_worker_ok(worker, timeout=45)
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertIn("Latest final result.", payloads[0]["message"])
+        self.assertNotIn("STALE candidate.", payloads[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_promotion_rechecks_session_epoch(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+        self.run_claude_hook(event)
+
+        marker = self.temp / "before-session-epoch-promote.marker"
+        worker_env = {
+            **self.env,
+            "CODEX_NTFY_TEST_BEFORE_PROMOTE_MS": "2000",
+            "CODEX_NTFY_TEST_BEFORE_PROMOTE_MARKER": str(marker),
+        }
+        worker = subprocess.Popen(
+            self.worker_command("powershell"),
+            env=worker_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline and not marker.exists():
+            time.sleep(0.05)
+        self.assertTrue(marker.exists(), self.state_debug())
+
+        # This is the atomic state transition performed at the start of a new
+        # prompt, isolated from its subsequent best-effort pending-file cleanup.
+        session_files = list((self.state / "claude-sessions").glob("*.json"))
+        self.assertEqual(len(session_files), 1, self.state_debug())
+        session_state = json.loads(session_files[0].read_text(encoding="utf-8-sig"))
+        session_state["epoch"] += 1
+        session_state["state"] = "busy"
+        session_state["prompt_id"] = str(uuid.uuid4())
+        session_state["busy_unix_ms"] = int(time.time() * 1000)
+        session_files[0].write_text(json.dumps(session_state), encoding="utf-8")
+
+        self.assert_worker_ok(worker, timeout=45)
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+            self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_large_transcript_scan_and_title_do_not_use_slow_tail_path(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            include_thread_title=True,
+        )
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        title = json.dumps(
+            {"type": "custom-title", "sessionId": session_id, "customTitle": "Large Claude session"},
+            separators=(",", ":"),
+        )
+        filler = json.dumps(
+            {"type": "progress", "payload": "x" * 180},
+            separators=(",", ":"),
+        ) + "\n"
+        filler_count = max(1, (12 * 1024 * 1024) // len(filler))
+        with transcript.open("w", encoding="utf-8") as stream:
+            stream.write(title + "\n")
+            for _ in range(filler_count):
+                stream.write(filler)
+
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        started = time.monotonic()
+        self.run_claude_hook(event)
+        self.run_ok(self.worker_command("powershell"), timeout=20)
+        elapsed = time.monotonic() - started
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(payloads[0]["title"], "Large Claude session")
+        self.assertLess(elapsed, 12.0, f"large Claude transcript path took {elapsed:.2f}s")
+        notifier_source = POWERSHELL_NOTIFIER.read_text(encoding="utf-8")
+        claude_source = notifier_source[
+            notifier_source.index("function Get-ClaudeThreadTitle") : notifier_source.index("function Get-CompletionLabel")
+        ]
+        self.assertNotIn(" -Tail ", claude_source)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_prompt_baseline_and_huge_line_scans_fail_closed(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        active_marker = self.append_claude_goal_status(transcript, met=False, sentinel=True)
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"type": "progress", "payload": "x" * (2 * 1024 * 1024)}))
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+
+        session_files = list((self.state / "claude-sessions").glob("*.json"))
+        self.assertEqual(len(session_files), 1, self.state_debug())
+        session_state = json.loads(session_files[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(session_state["goal_baseline_state"], "unknown")
+        self.assertFalse(session_state["goal_baseline_captured"])
+
+        # The synchronous Stop path stays byte-bounded and records unknown when
+        # the marker is outside its window. The detached worker then performs
+        # the unrestricted reverse scan and must recover the active anchor
+        # before any idle fallback can release the candidate.
+        self.run_claude_hook(event)
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(record["claude_goal_state"], "unknown")
+
+        worker = self.start_worker("powershell")
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                pending = list((self.state / "pending").glob("*.json"))
+                if pending:
+                    record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+                    if record.get("claude_goal_state") == "active":
+                        break
+                time.sleep(0.05)
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=10)
+        self.assertEqual(record["claude_goal_state"], "active")
+        self.assertEqual(record["claude_goal_marker"], active_marker)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_oversize_goal_token_record_cannot_be_released_by_idle(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        self.append_claude_goal_status(transcript, met=False, sentinel=True)
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write(
+                '{"type":"progress","goal_status":"not-a-lifecycle-record","payload":"'
+                + ("x" * (2 * 1024 * 1024))
+                + '"}'
+            )
+
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+        self.run_claude_hook(event)
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        # The 1 MiB synchronous window begins inside the oversized record, so it
+        # can prove only unknown. The worker's unrestricted bounded-memory scan
+        # sees the token and upgrades the disposition to unverifiable.
+        self.assertEqual(record["claude_goal_state"], "unknown")
+
+        # Even a perfectly correlated idle accelerator cannot turn an unparsed
+        # token-bearing record into evidence that the older active goal ended.
+        self.run_claude_hook(self.claude_idle_event(event, include_prompt_id=True))
+        self.run_ok(self.worker_command("powershell"))
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        self.assertEqual(len(list((self.state / "suppressed").glob("*.json"))), 1, self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_active_work_is_ignored_then_same_prompt_can_finish(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        prompt_id = str(uuid.uuid4())
+        event = self.claude_event(session_id=session_id, prompt_id=prompt_id)
+
+        busy = dict(event)
+        busy["background_tasks"] = [{"id": "task-1", "type": "shell", "status": "running"}]
+        self.run_claude_hook(busy)
+        scheduled = dict(event)
+        scheduled["session_crons"] = [{"id": "cron-1", "schedule": "* * * * *", "recurring": False}]
+        self.run_claude_hook(scheduled)
+        for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+            self.assertFalse(list((self.state / directory).glob("*.json")))
+
+        self.run_claude_hook(event)
+        self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
+        self.run_ok(self.worker_command("powershell"))
+        self.assertEqual(len(self.wait_for_payloads(1)), 1)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_repeated_goal_stops_wait_for_terminal_marker_and_use_latest_result(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+        self.append_claude_goal_status(transcript, met=False, sentinel=True)
+
+        intermediate = dict(event)
+        intermediate["last_assistant_message"] = "Intermediate goal result."
+        self.run_claude_hook(intermediate)
+        worker = self.start_worker("powershell")
+        try:
+            time.sleep(1.0)
+            with self.server.lock:
+                self.assertEqual(self.server.payloads, [], self.state_debug())
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=10)
+
+        self.append_claude_goal_status(transcript, met=False, reason="continue")
+        later_intermediate = dict(event)
+        later_intermediate["last_assistant_message"] = "Still working on the goal."
+        self.run_claude_hook(later_intermediate)
+        worker = self.start_worker("powershell")
+        try:
+            time.sleep(1.0)
+            with self.server.lock:
+                self.assertEqual(self.server.payloads, [], self.state_debug())
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=10)
+
+        self.append_claude_goal_status(transcript, met=True, reason="all checks pass")
+        final = dict(event)
+        final["last_assistant_message"] = "Goal is now complete."
+        self.run_claude_hook(final)
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertIn("Goal is now complete.", payloads[0]["message"])
+        self.assertNotIn("Intermediate goal result.", payloads[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_failed_goal_notifies_as_warning(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+        self.append_claude_goal_status(transcript, met=False, sentinel=True)
+        self.run_claude_hook({**event, "last_assistant_message": "Trying another route."})
+        self.append_claude_goal_status(transcript, met=False, failed=True, reason="impossible")
+        self.run_claude_hook({**event, "last_assistant_message": "The goal cannot be completed."})
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(payloads[0].get("tags"), ["warning"])
+        self.assertIn("cannot be completed", payloads[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_cleared_goal_is_discarded_and_does_not_poison_next_prompt(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        # /goal clear is a new prompt. UserPromptSubmit snapshots the still-active
+        # marker before Claude appends its terminal clear sentinel.
+        self.append_claude_goal_status(transcript, met=False, sentinel=True)
+        self.run_claude_hook(self.claude_prompt_event(event))
+        self.append_claude_goal_status(transcript, met=True, sentinel=True)
+        self.run_claude_hook({**event, "last_assistant_message": "Goal cleared."})
+        self.run_ok(self.worker_command("powershell"))
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+            self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+
+        next_event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(next_event))
+        self.run_claude_hook({**next_event, "last_assistant_message": "Ordinary turn complete."})
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(1)
+        self.assertIn("Ordinary turn complete.", payloads[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_clear_after_unknown_prompt_baseline_is_not_notified(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text(
+            '{"type":"attachment","attachment":{"type":"goal_status"',
+            encoding="utf-8",
+        )
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+
+        transcript.write_text("", encoding="utf-8")
+        self.append_claude_goal_status(transcript, met=True, sentinel=True)
+        self.run_claude_hook({**event, "last_assistant_message": "Goal cleared."})
+        self.run_ok(self.worker_command("powershell"))
+
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+            self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_historical_terminal_markers_do_not_label_later_ordinary_turns(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        cases = (
+            {"met": True, "reason": "done"},
+            {"met": False, "failed": True, "reason": "impossible"},
+            {"met": True, "sentinel": True},
+        )
+        for index, marker_kwargs in enumerate(cases):
+            with self.subTest(marker=marker_kwargs):
+                session_id = str(uuid.uuid4())
+                transcript = self.temp / f"{session_id}.jsonl"
+                transcript.write_text("", encoding="utf-8")
+                self.append_claude_goal_status(transcript, **marker_kwargs)
+                event = self.claude_event(session_id=session_id, transcript_path=transcript)
+                self.run_claude_hook(self.claude_prompt_event(event))
+                self.run_claude_hook({**event, "last_assistant_message": f"Ordinary result {index}."})
+                self.run_ok(self.worker_command("powershell"))
+                payloads = self.wait_for_payloads(1)
+                self.assertIn(f"Ordinary result {index}.", payloads[0]["message"])
+                self.assertNotEqual(payloads[0].get("tags"), ["warning"])
+                with self.server.lock:
+                    self.server.payloads.clear()
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_resumed_active_goal_fails_closed_without_prompt_state(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        self.append_claude_goal_status(transcript, met=False, sentinel=True)
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook({**event, "last_assistant_message": "Resumed intermediate result."})
+        worker = self.start_worker("powershell")
+        try:
+            time.sleep(1.0)
+            with self.server.lock:
+                self.assertEqual(self.server.payloads, [], self.state_debug())
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=10)
+
+        self.append_claude_goal_status(transcript, met=True, reason="resumed goal done")
+        self.run_claude_hook({**event, "last_assistant_message": "Resumed goal complete."})
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(1)
+        self.assertIn("Resumed goal complete.", payloads[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_idle_before_stop_and_new_prompt_cancellation_are_race_safe(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        first = self.claude_event()
+        self.run_claude_hook(self.claude_prompt_event(first))
+        self.run_claude_hook(self.claude_idle_event(first, include_prompt_id=True))
+        self.run_claude_hook(first)
+        self.run_ok(self.worker_command("powershell"))
+        self.assertEqual(len(self.wait_for_payloads(1)), 1, self.state_debug())
+
+        with self.server.lock:
+            self.server.payloads.clear()
+        second = self.claude_event(session_id=first["session_id"])
+        self.run_claude_hook(self.claude_prompt_event(second))
+        self.run_claude_hook(second)
+
+        third_prompt = str(uuid.uuid4())
+        self.run_claude_hook(self.claude_prompt_event(second, prompt_id=third_prompt))
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        # A late idle receipt for the previous prompt cannot resurrect a removed
+        # candidate or notify while the session is working on its follow-up.
+        self.run_claude_hook(self.claude_idle_event(second, include_prompt_id=True))
+        self.run_ok(self.worker_command("powershell"))
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_late_async_stop_after_new_prompt_is_ignored(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        first = self.claude_event()
+        self.run_claude_hook(self.claude_prompt_event(first))
+
+        next_prompt = self.claude_event(session_id=first["session_id"])
+        self.run_claude_hook(self.claude_prompt_event(next_prompt))
+        # The async process for the previous Stop can be scheduled only after
+        # UserPromptSubmit has already made the next prompt authoritative.
+        self.run_claude_hook(first)
+        self.run_ok(self.worker_command("powershell"))
+
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+            self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_idle_fallback_requires_matching_prompt_id(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "attachment",
+                    "uuid": str(uuid.uuid4()),
+                    "attachment": {"type": "goal_status", "met": "false"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+        self.run_claude_hook(event)
+        self.run_claude_hook(self.claude_idle_event(event, include_prompt_id=False))
+        worker = self.start_worker("powershell")
+        try:
+            time.sleep(1.0)
+            with self.server.lock:
+                self.assertEqual(self.server.payloads, [], self.state_debug())
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=10)
+
+        self.run_claude_hook(self.claude_idle_event(event, include_prompt_id=True))
+        self.run_ok(self.worker_command("powershell"))
+        self.assertEqual(len(self.wait_for_payloads(1)), 1, self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_transient_partial_transcript_recovers_without_idle_notification(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text('{"type":"progress","label":"goal_status"', encoding="utf-8")
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+        self.run_claude_hook({**event, "last_assistant_message": "Recovered final result."})
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write("}\n")
+
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(1)
+        self.assertIn("Recovered final result.", payloads[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_unknown_reconciles_to_persisted_active_anchor(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text('{"type":"attachment","attachment":{"type":"goal_status"', encoding="utf-8")
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+        self.run_claude_hook({**event, "last_assistant_message": "Intermediate result."})
+
+        transcript.write_text("", encoding="utf-8")
+        active_marker = self.append_claude_goal_status(transcript, met=False, sentinel=True)
+        worker = self.start_worker("powershell")
+        try:
+            deadline = time.time() + 10
+            record: dict = {}
+            while time.time() < deadline:
+                pending = list((self.state / "pending").glob("*.json"))
+                if pending:
+                    record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+                    if record.get("claude_goal_state") == "active":
+                        break
+                time.sleep(0.05)
+            self.assertEqual(record["claude_goal_state"], "active")
+            self.assertEqual(record["claude_goal_marker"], active_marker)
+            with self.server.lock:
+                self.assertEqual(self.server.payloads, [], self.state_debug())
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=10)
+
+        shutil.rmtree(self.state / "claude-sessions", ignore_errors=True)
+        self.append_claude_goal_status(transcript, met=True, sentinel=True)
+        self.run_ok(self.worker_command("powershell"))
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_unverifiable_and_subagent_stops_fail_closed(self) -> None:
+        cases: list[dict] = []
+        no_background = self.claude_event()
+        no_background.pop("background_tasks")
+        cases.append(no_background)
+        no_crons = self.claude_event()
+        no_crons.pop("session_crons")
+        cases.append(no_crons)
+        null_background = self.claude_event()
+        null_background["background_tasks"] = None
+        cases.append(null_background)
+        null_crons = self.claude_event()
+        null_crons["session_crons"] = None
+        cases.append(null_crons)
+        object_background = self.claude_event()
+        object_background["background_tasks"] = {"status": "unknown"}
+        cases.append(object_background)
+        string_crons = self.claude_event()
+        string_crons["session_crons"] = "none"
+        cases.append(string_crons)
+        no_prompt = self.claude_event()
+        no_prompt.pop("prompt_id")
+        cases.append(no_prompt)
+        subagent = self.claude_event()
+        subagent["hook_event_name"] = "SubagentStop"
+        subagent["agent_id"] = "agent-1"
+        cases.append(subagent)
+        defensive_subagent = self.claude_event()
+        defensive_subagent["agent_id"] = "agent-2"
+        cases.append(defensive_subagent)
+
+        for index, event in enumerate(cases):
+            with self.subTest(index=index):
+                self.run_claude_hook(event)
+        for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+            self.assertFalse(list((self.state / directory).glob("*.json")))
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_sessions_do_not_collide_and_stop_failure_is_terminal(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        shared_prompt = str(uuid.uuid4())
+        first = self.claude_event(session_id=str(uuid.uuid4()), prompt_id=shared_prompt)
+        second = self.claude_event(session_id=str(uuid.uuid4()), prompt_id=shared_prompt)
+        failure = self.claude_event(session_id=str(uuid.uuid4()), prompt_id=str(uuid.uuid4()))
+        failure["hook_event_name"] = "StopFailure"
+        failure.pop("background_tasks")
+        failure.pop("session_crons")
+        failure["error"] = "rate_limit"
+        failure["last_assistant_message"] = "API Error: Rate limit reached"
+
+        for event in (first, second, failure):
+            self.run_claude_hook(event)
+        self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 3)
+        self.run_claude_hook(self.claude_idle_event(first, include_prompt_id=True))
+        self.run_claude_hook(
+            self.claude_idle_event(second, notification_type="agent_completed", include_prompt_id=True)
+        )
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(3)
+        self.assertEqual(len(payloads), 3)
+        self.assertEqual(len({payload["sequence_id"] for payload in payloads}), 3)
+        self.assertTrue(any("Rate limit reached" in payload["message"] for payload in payloads))
+        failed_payload = next(payload for payload in payloads if "Rate limit reached" in payload["message"])
+        self.assertEqual(failed_payload["tags"], ["warning"])
 
     def test_modern_stop_for_a_descendant_is_suppressed(self) -> None:
         self.configure(
@@ -2855,6 +3594,254 @@ class NotifierContractTests(unittest.TestCase):
         watcher = (install_home / "watch-codex-ntfy.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("while ($true)", watcher)
         self.assertIn("Start-Sleep -Seconds $restartDelay", watcher)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows installer test")
+    def test_windows_installer_rejects_old_claude_surface_even_with_current_path(self) -> None:
+        install_home = self.temp / "claude-version-codex-home"
+        claude_home = self.temp / "claude-version-home"
+        fake_user = self.temp / "fake-user"
+        fake_appdata = self.temp / "fake-appdata"
+        fake_localappdata = self.temp / "fake-localappdata"
+        current_bin = self.temp / "current-claude-bin"
+        old_vscode_bin = (
+            fake_user
+            / ".vscode"
+            / "extensions"
+            / "anthropic.claude-code-version-test"
+            / "resources"
+            / "native-binary"
+        )
+        for directory in (
+            install_home,
+            claude_home,
+            fake_user,
+            fake_appdata,
+            fake_localappdata,
+            current_bin,
+            old_vscode_bin,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        seed_executable = self.temp / "fake-claude.exe"
+        compiler_script = r"""
+$source = @'
+using System;
+using System.IO;
+public static class FakeClaudeVersion {
+    public static void Main() {
+        string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "version.txt");
+        Console.WriteLine(File.ReadAllText(path).Trim() + " (Claude Code)");
+    }
+}
+'@
+Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $env:FAKE_CLAUDE_EXE -OutputType ConsoleApplication -ErrorAction Stop
+"""
+        compiled = subprocess.run(
+            [
+                str(WINDOWS_POWERSHELL),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                compiler_script,
+            ],
+            env={**os.environ, "FAKE_CLAUDE_EXE": str(seed_executable)},
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+
+        shutil.copy2(seed_executable, current_bin / "claude.exe")
+        (current_bin / "version.txt").write_text("2.1.209\n", encoding="utf-8")
+        shutil.copy2(seed_executable, old_vscode_bin / "claude.exe")
+        (old_vscode_bin / "version.txt").write_text("2.1.197\n", encoding="utf-8")
+        (install_home / "ntfy-config.json").write_text(
+            json.dumps({"server": "http://127.0.0.1:9", "topic": "unused-version-test"}),
+            encoding="utf-8",
+        )
+
+        env = {
+            **os.environ,
+            "USERPROFILE": str(fake_user),
+            "APPDATA": str(fake_appdata),
+            "LOCALAPPDATA": str(fake_localappdata),
+            "PATH": str(current_bin) + os.pathsep + os.environ.get("PATH", ""),
+        }
+        result = subprocess.run(
+            [
+                str(WINDOWS_POWERSHELL),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(INSTALLER),
+                "-CodexHome",
+                str(install_home),
+                "-NoWsl",
+                "-SkipScheduledTask",
+                "-EnableClaudeCode",
+                "-ClaudeHome",
+                str(claude_home),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=90,
+        )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertIn("VS Code 2.1.197", output)
+        self.assertIn("2.1.198", output)
+        self.assertNotIn("PATH 2.1.209", output)
+        self.assertFalse((claude_home / "settings.json").exists())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows installer test")
+    def test_windows_installer_merges_claude_hooks_idempotently(self) -> None:
+        install_home = self.temp / "claude-install-codex-home"
+        claude_home = self.temp / "claude-home"
+        install_home.mkdir()
+        claude_home.mkdir()
+        settings_path = claude_home / "settings.json"
+        existing = {
+            "model": "preserve-model",
+            "custom": {"preserve": True},
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash|PowerShell",
+                        "hooks": [{"type": "command", "command": "keep-guard"}],
+                    }
+                ],
+                "Stop": [{"hooks": [{"type": "command", "command": "keep-stop"}]}],
+                "UserPromptExpansion": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": str(WINDOWS_POWERSHELL),
+                                "args": [
+                                    "-File",
+                                    str(install_home / "notify-ntfy.ps1"),
+                                    "-ClaudeHook",
+                                ],
+                            }
+                        ]
+                    }
+                ],
+                "SessionEnd": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": str(WINDOWS_POWERSHELL),
+                                "args": ["-File", r"C:\old\notify-ntfy.ps1", "-ClaudeHook"],
+                            }
+                        ]
+                    }
+                ],
+            },
+        }
+        settings_path.write_text(json.dumps(existing), encoding="utf-8")
+        command = [
+            str(WINDOWS_POWERSHELL),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(INSTALLER),
+            "-CodexHome",
+            str(install_home),
+            "-NoWsl",
+            "-SkipScheduledTask",
+            "-EnableClaudeCode",
+            "-ClaudeHome",
+            str(claude_home),
+        ]
+        env = {**os.environ, "CODEX_NTFY_TOPIC": "claude-installer-test-topic"}
+        first = subprocess.run(command, env=env, text=True, capture_output=True, timeout=90)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+
+        installed = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(installed["model"], "preserve-model")
+        self.assertTrue(installed["custom"]["preserve"])
+        self.assertEqual(installed["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "keep-guard")
+        self.assertEqual(installed["hooks"]["Stop"][0]["hooks"][0]["command"], "keep-stop")
+        self.assertEqual(
+            installed["hooks"]["SessionEnd"][0]["hooks"][0]["args"],
+            ["-File", r"C:\old\notify-ntfy.ps1", "-ClaudeHook"],
+        )
+        managed: list[tuple[str, dict]] = []
+        for event_name in ("Stop", "StopFailure", "UserPromptSubmit", "Notification"):
+            for group in installed["hooks"].get(event_name, []):
+                for handler in group.get("hooks", []):
+                    args = [str(value) for value in handler.get("args", [])]
+                    if "-ClaudeHook" in args:
+                        managed.append((event_name, handler))
+        self.assertEqual(
+            [event for event, _handler in managed],
+            ["Stop", "StopFailure", "UserPromptSubmit", "Notification", "Notification"],
+        )
+        self.assertNotIn("UserPromptExpansion", installed["hooks"])
+        self.assertEqual(
+            [group["matcher"] for group in installed["hooks"]["Notification"][-2:]],
+            ["idle_prompt", "agent_completed"],
+        )
+        for managed_event, handler in managed:
+            self.assertEqual(handler["command"], str(WINDOWS_POWERSHELL))
+            self.assertIn("-ReadStdin", handler["args"])
+            self.assertIn(str(install_home / "notify-ntfy.ps1"), handler["args"])
+            self.assertEqual(handler["args"][-2:], ["-Origin", "Claude Code"])
+            self.assertEqual(handler["async"], managed_event == "Notification")
+            self.assertEqual(handler["timeout"], 30)
+
+        first_bytes = settings_path.read_bytes()
+        second = subprocess.run(command, env=env, text=True, capture_output=True, timeout=90)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(settings_path.read_bytes(), first_bytes)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows installer test")
+    def test_windows_installer_restores_claude_settings_after_late_failure(self) -> None:
+        install_home = self.temp / "claude-rollback-codex-home"
+        claude_home = self.temp / "claude-rollback-home"
+        install_home.mkdir()
+        claude_home.mkdir()
+        original_settings = json.dumps(
+            {"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "keep-me"}]}]}},
+            separators=(",", ":"),
+        )
+        settings_path = claude_home / "settings.json"
+        settings_path.write_text(original_settings, encoding="utf-8")
+        (install_home / "ntfy-config.json").write_text(
+            json.dumps({"server": "https://ntfy.sh", "topic": "test-topic", "tags": [42]}),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                str(WINDOWS_POWERSHELL),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(INSTALLER),
+                "-CodexHome",
+                str(install_home),
+                "-NoWsl",
+                "-SkipScheduledTask",
+                "-EnableClaudeCode",
+                "-ClaudeHome",
+                str(claude_home),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=90,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(settings_path.read_text(encoding="utf-8-sig"), original_settings)
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows installer test")
     def test_windows_install_rolls_back_unrelated_notify_conflict(self) -> None:

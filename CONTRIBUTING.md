@@ -1,8 +1,8 @@
 # Contributing
 
-Thank you for helping improve Codex ntfy Notifier. This is an unofficial community project and is not affiliated with OpenAI or ntfy.
+Thank you for helping improve Codex ntfy Notifier. This is an unofficial community project and is not affiliated with OpenAI, Anthropic, or ntfy.
 
-Contributions are welcome for idle detection, delivery reliability, platform compatibility, privacy, security, tests, and documentation. Keep changes focused on notifying when a root Codex task has no more work rather than turning the repository into a general notification framework.
+Contributions are welcome for idle detection, delivery reliability, platform compatibility, privacy, security, tests, and documentation. Keep changes focused on notifying when a supported root coding-agent task has no more work rather than turning the repository into a general notification framework.
 
 ## Contribute in 60 seconds
 

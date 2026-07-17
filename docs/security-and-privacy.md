@@ -1,6 +1,6 @@
 # Security and privacy
 
-Durable Codex ntfy notifier 2.4.3 is an unofficial local hook and worker that reads local Codex lifecycle metadata and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, Codex state, notifier state, and backups as private data.
+Durable Codex ntfy notifier 2.5.0 is an unofficial local hook and worker that reads local Codex lifecycle metadata—and, when explicitly enabled on Windows, Claude Code completion metadata—and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, local agent state, notifier state, and backups as private data.
 
 ## Privacy defaults
 
@@ -45,6 +45,8 @@ To distinguish a final root completion from an intermediate result, the notifier
 
 SQLite access is opened read-only and query-only. Goal awareness selects the goal **status**, not its objective. The notifier does not update Codex databases.
 
+With `-EnableClaudeCode`, the Windows hook receives Claude's `session_id`, `prompt_id`, work registries, final message, working directory, and transcript path. It uses the registries only to prove no background work remains. A memory-bounded reverse scan finds the newest local `attachment.goal_status` lifecycle record; only the boolean state and an opaque UUID/hash marker are retained. The pre-existing goal condition/reason is not extracted, stored, logged, or sent. A separate bounded head/tail lookup runs only when `include_thread_title: true` and looks for title metadata. The notifier does not parse the transcript for the final response because Claude supplies `last_assistant_message` directly.
+
 The rollout watcher reads newly appended complete JSONL lines in memory to find `task_complete` and `turn_aborted`. It persists a cursor containing the rollout path, byte offset, timestamp, and thread ID. It does not copy prompt lines into `watch/`.
 
 The local Codex rollout can itself contain prompts, assistant content, tool data, and paths. The notifier needs read access to that pre-existing file, but its own state intentionally stores neither Codex `input-messages` nor prompt bodies. Never attach rollout or database files to a public issue.
@@ -53,20 +55,20 @@ The local Codex rollout can itself contain prompts, assistant content, tool data
 
 By default, one ntfy publication can contain:
 
-- the final directory name of the Codex working directory in the title;
+- the final directory name of the working directory in the title;
 - the source host/origin label in a compact, label-free body;
-- `#` plus the first eight characters of the thread ID;
-- the single ntfy tag `white_check_mark` and a deterministic sequence ID.
+- `#` plus the first eight characters of the Codex thread ID or Claude session ID;
+- one ntfy tag—`white_check_mark` for a successful completion, or `warning` for an aborted/blocked result—and a deterministic sequence ID.
 
-The default JSON title is only `<project>`, while the single `white_check_mark` tag renders one completion emoji before it in ntfy. The one-line body is `<origin> · #<thread8>`. The templates add no notifier name, completion word, model name, status label, or text emoji. Markdown is disabled, and default ntfy priority 3 is represented by omitting the `priority` member from the outgoing JSON. These choices reduce visual and wire noise; they do not make the remaining metadata anonymous.
+The default JSON title is only `<project>`, while the single applicable tag renders one status emoji before it in ntfy. The one-line body is `<origin> · #<thread-or-session8>`. The templates add no notifier name, completion word, model name, status label, or text emoji. Markdown is disabled, and default ntfy priority 3 is represented by omitting the `priority` member from the outgoing JSON. These choices reduce visual and wire noise; they do not make the remaining metadata anonymous.
 
-`include_thread_title: true` opts into the locally indexed Codex task title when available. When that title differs from the project, the project moves into the body so the location is retained. A task title can summarize the user's request.
+`include_thread_title: true` opts into the locally indexed Codex task title or bounded Claude `ai-title`/`custom-title` transcript metadata when available. When that title differs from the project, the project moves into the body so the location is retained. A task title can summarize the user's request.
 
 `include_full_path: true` uses the sanitized working-directory path as the body's location context instead of a project-name context item. A full path can reveal usernames, clients, repository names, mounts, or organization structure.
 
 `include_message: true` adds a sanitized and truncated copy of the final assistant message ahead of the context. `max_message_chars` limits that excerpt to 180 characters by default. With the default `markdown: false`, whitespace is normalized and the whole body stays on one line. The complete ntfy `message` is also hard-capped at 3,500 UTF-8 bytes, even if `max_message_chars` is increased. Truncation and the byte cap limit size, not sensitivity.
 
-`include_task_link: true` adds `https://chatgpt.com/codex/tasks/<thread-id>` as the ntfy `click` target after validating a canonical UUID. This sends the full thread ID to the ntfy server and its subscribed clients instead of only the default eight-character prefix. The URL still requires the appropriate ChatGPT account, workspace, and Remote host access; it is not an authentication token and does not bypass authorization. `include_task_link_action: true` duplicates the same destination in one visible `view` action, so it is a separate opt-in and remains off by default.
+For Codex records only, `include_task_link: true` adds `https://chatgpt.com/codex/tasks/<thread-id>` as the ntfy `click` target after validating a canonical UUID. This sends the full thread ID to the ntfy server and its subscribed clients instead of only the default eight-character prefix. The URL still requires the appropriate ChatGPT account, workspace, and Remote host access; it is not an authentication token and does not bypass authorization. `include_task_link_action: true` duplicates the same destination in one visible `view` action, so it is a separate opt-in and remains off by default. Claude records never add this URL or send the full Claude session ID through a task link.
 
 A thread title or assistant response can summarize sensitive prompt context. “Raw prompts are not copied” is not equivalent to “no sensitive context can leave the host.”
 
@@ -83,6 +85,7 @@ The private configuration is `~/.codex/ntfy-config.json`. It can contain server 
 - full thread and turn IDs;
 - full local working directory, Codex home, SQLite home, and rollout path;
 - host/origin, classification, goal status, descendant count, and idle-gate metadata;
+- for Claude, session epoch, prompt-correlated idle state, and opaque goal baseline/current markers;
 - watcher paths, byte offsets, timestamps, and thread IDs;
 - retry timing, attempt count, and sanitized error text;
 - the final assistant message only for records created while `include_message` was enabled;
@@ -91,7 +94,7 @@ The private configuration is `~/.codex/ntfy-config.json`. It can contain server 
 
 The operational log records short event keys, gate reasons, origin labels, retry state, and sanitized errors. Redaction is best-effort; logs are not automatically safe to publish.
 
-Installers keep up to ten timestamped directories under `~/.codex/ntfy-backups`. A backup can contain credentials, `config.toml`, and hook registration. Rotation is by count, not age. Remote hosts own their own copies and backups.
+Installers keep up to ten timestamped directories under `~/.codex/ntfy-backups`. A backup can contain credentials, `config.toml`, hook registration, and—when Claude support is enabled—the complete pre-install Claude `settings.json`. Rotation is by count, not age. Remote hosts own their own copies and backups.
 
 `include_message` is enforced both when content is captured and again when the worker builds the network payload. If it is changed from `true` to `false`, final-message text already present in pending or outbox records is excluded at send time and does not leave the host through a later retry. The setting does not scrub that content from existing state, dead letters, logs, or backups.
 
@@ -100,6 +103,8 @@ For an urgent opt-out, stop the worker before editing the private config so it c
 ## Hook review and trust
 
 The installer writes a managed `Stop` handler to `~/.codex/hooks.json` and preserves unrelated hook groups and metadata. Codex requires the operator to review a new hook through `/hooks`.
+
+When explicitly enabled, the Windows installer also atomically merges ordered synchronous `Stop`/`StopFailure`/`UserPromptSubmit` and asynchronous `Notification` handlers for prompt-correlated `idle_prompt`/`agent_completed` into `~/.claude/settings.json`. Synchronous terminal hooks preserve same-prompt ordering; their initial transcript scan is capped at 1 MiB and full reconciliation runs in the worker. The installer uses executable-plus-argument form, preserves unrelated settings and hooks, stores no ntfy credential there, and includes the original file in the private rollback snapshot. Claude's `/hooks` view is read-only; direct settings changes are normally reloaded automatically.
 
 The installer deliberately does **not** edit Codex’s trust store or simulate approval. This keeps code execution consent with the user. Review the exact command in every Windows, WSL, Linux, or remote Codex environment before trusting it.
 

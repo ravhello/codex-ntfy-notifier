@@ -3,7 +3,9 @@ param(
   [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
   [string[]]$WslDistro = @('Ubuntu'),
   [switch]$NoWsl,
-  [switch]$SkipScheduledTask
+  [switch]$SkipScheduledTask,
+  [switch]$EnableClaudeCode,
+  [string]$ClaudeHome = (Join-Path $env:USERPROFILE '.claude')
 )
 
 Set-StrictMode -Version 2.0
@@ -12,6 +14,9 @@ $SourceRoot = Join-Path $PSScriptRoot 'src'
 $TaskName = 'CodexNtfyWatcher'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $CodexHome = [IO.Path]::GetFullPath($CodexHome)
+if ($EnableClaudeCode) {
+  $ClaudeHome = [IO.Path]::GetFullPath($ClaudeHome)
+}
 
 function Write-Status {
   param([string]$Message)
@@ -346,6 +351,58 @@ function Test-ManagedHookHandler {
   return $false
 }
 
+function Test-ManagedClaudeHookHandler {
+  param(
+    [object]$Handler,
+    [string]$ExpectedScriptPath
+  )
+
+  if ($null -eq $Handler -or $Handler -isnot [System.Management.Automation.PSCustomObject] -or
+      [string](Get-ObjectValue -Object $Handler -Name 'type' -Default '') -ne 'command') {
+    return $false
+  }
+  $command = [string](Get-ObjectValue -Object $Handler -Name 'command' -Default '')
+  $argsProperty = $Handler.PSObject.Properties['args']
+  if ($null -ne $argsProperty -and $argsProperty.Value -is [array]) {
+    $args = @($argsProperty.Value | ForEach-Object { [string]$_ })
+    $fileIndex = [Array]::IndexOf([string[]]$args, '-File')
+    if ($args -notcontains '-ClaudeHook' -or $fileIndex -lt 0 -or $fileIndex + 1 -ge $args.Count) {
+      return $false
+    }
+    try {
+      return [string]::Equals(
+          [System.IO.Path]::GetFullPath([string]$args[$fileIndex + 1]),
+          [System.IO.Path]::GetFullPath($ExpectedScriptPath),
+          [System.StringComparison]::OrdinalIgnoreCase
+        )
+    } catch {
+      return $false
+    }
+  }
+  try { $expectedFullPath = [System.IO.Path]::GetFullPath($ExpectedScriptPath) } catch { return $false }
+  $scriptIndex = $command.IndexOf($expectedFullPath, [System.StringComparison]::OrdinalIgnoreCase)
+  if ($scriptIndex -lt 0) { return $false }
+  $beforeOk = $scriptIndex -eq 0 -or [char]::IsWhiteSpace($command[$scriptIndex - 1]) -or
+    $command[$scriptIndex - 1] -in @([char]34, [char]39)
+  $afterIndex = $scriptIndex + $expectedFullPath.Length
+  $afterOk = $afterIndex -eq $command.Length -or [char]::IsWhiteSpace($command[$afterIndex]) -or
+    $command[$afterIndex] -in @([char]34, [char]39)
+  return $beforeOk -and $afterOk -and $command -match '(?i)(?:^|\s)-ClaudeHook(?:\s|$)'
+}
+
+function Get-ObjectValue {
+  param(
+    [object]$Object,
+    [string]$Name,
+    [object]$Default = $null
+  )
+
+  if ($null -eq $Object) { return $Default }
+  $property = $Object.PSObject.Properties[$Name]
+  if ($null -eq $property -or $null -eq $property.Value) { return $Default }
+  return $property.Value
+}
+
 function ConvertTo-PosixShellArgument {
   param([string]$Value)
 
@@ -450,6 +507,229 @@ function Ensure-StopHook {
   $rendered = ($document | ConvertTo-Json -Depth 32) + [Environment]::NewLine
   if ($rendered -ne $original) {
     Write-TextAtomic -Path $HooksPath -Content $rendered
+  }
+}
+
+function Ensure-ClaudeCodeHooks {
+  param(
+    [string]$SettingsPath,
+    [string]$PowerShellPath,
+    [string]$ScriptPath
+  )
+
+  $settingsAcl = if (Test-Path -LiteralPath $SettingsPath) {
+    try { Get-Acl -LiteralPath $SettingsPath } catch { $null }
+  } else { $null }
+  $original = if (Test-Path -LiteralPath $SettingsPath) {
+    [System.IO.File]::ReadAllText($SettingsPath)
+  } else { '' }
+  try {
+    $document = if ([string]::IsNullOrWhiteSpace($original)) {
+      [pscustomobject][ordered]@{}
+    } else {
+      $original | ConvertFrom-Json
+    }
+  } catch {
+    throw "Invalid JSON in ${SettingsPath}: $($_.Exception.Message)"
+  }
+  if ($null -eq $document -or $document -isnot [System.Management.Automation.PSCustomObject]) {
+    throw "$SettingsPath must contain a JSON object."
+  }
+
+  $hooksProperty = $document.PSObject.Properties['hooks']
+  if ($null -eq $hooksProperty) {
+    Add-Member -InputObject $document -MemberType NoteProperty -Name 'hooks' -Value ([pscustomobject][ordered]@{})
+    $hooksProperty = $document.PSObject.Properties['hooks']
+  } elseif ($null -eq $hooksProperty.Value -or $hooksProperty.Value -isnot [System.Management.Automation.PSCustomObject]) {
+    throw "hooks in $SettingsPath must contain a JSON object."
+  }
+  $hookEvents = $hooksProperty.Value
+
+  foreach ($eventProperty in @($hookEvents.PSObject.Properties)) {
+    if ($eventProperty.Value -isnot [array]) {
+      if ($eventProperty.Name -in @('Stop', 'StopFailure', 'UserPromptSubmit', 'UserPromptExpansion', 'Notification')) {
+        throw "hooks.$($eventProperty.Name) in $SettingsPath must contain a JSON array."
+      }
+      continue
+    }
+    $filteredGroups = New-Object 'System.Collections.Generic.List[object]'
+    $removedFromEvent = $false
+    foreach ($group in @($eventProperty.Value)) {
+      if ($null -eq $group -or $group -isnot [System.Management.Automation.PSCustomObject]) {
+        $filteredGroups.Add($group)
+        continue
+      }
+      $handlersProperty = $group.PSObject.Properties['hooks']
+      if ($null -eq $handlersProperty -or $handlersProperty.Value -isnot [array]) {
+        $filteredGroups.Add($group)
+        continue
+      }
+      $filteredHandlers = New-Object 'System.Collections.Generic.List[object]'
+      $removedFromGroup = $false
+      foreach ($handler in @($handlersProperty.Value)) {
+        if (Test-ManagedClaudeHookHandler -Handler $handler -ExpectedScriptPath $ScriptPath) {
+          $removedFromGroup = $true
+          $removedFromEvent = $true
+        } else {
+          $filteredHandlers.Add($handler)
+        }
+      }
+      if ($filteredHandlers.Count -gt 0) {
+        $handlersProperty.Value = @($filteredHandlers.ToArray())
+        $filteredGroups.Add($group)
+      } elseif (-not $removedFromGroup) {
+        $filteredGroups.Add($group)
+      }
+    }
+    if ($filteredGroups.Count -gt 0 -or -not $removedFromEvent) {
+      $eventProperty.Value = @($filteredGroups.ToArray())
+    } else {
+      $hookEvents.PSObject.Properties.Remove($eventProperty.Name)
+    }
+  }
+
+  foreach ($eventName in @('Stop', 'StopFailure', 'UserPromptSubmit', 'Notification')) {
+    $eventProperty = $hookEvents.PSObject.Properties[$eventName]
+    if ($null -eq $eventProperty) {
+      Add-Member -InputObject $hookEvents -MemberType NoteProperty -Name $eventName -Value @()
+      $eventProperty = $hookEvents.PSObject.Properties[$eventName]
+    } elseif ($eventProperty.Value -isnot [array]) {
+      throw "hooks.$eventName in $SettingsPath must contain a JSON array."
+    }
+    $handler = [pscustomobject][ordered]@{
+      type = 'command'
+      command = $PowerShellPath
+      args = @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $ScriptPath, '-ClaudeHook', '-ReadStdin', '-Origin', 'Claude Code'
+      )
+      timeout = 30
+      # Prompt and terminal hook ordering is part of the correctness contract.
+      # UserPromptSubmit must establish the epoch before Stop, and repeated Stop
+      # events for one prompt must reach the queue in lifecycle order. Only the
+      # optional Notification accelerators are safe to run asynchronously.
+      async = $eventName -eq 'Notification'
+    }
+    $managedGroups = if ($eventName -eq 'Notification') {
+      @(
+        [pscustomobject][ordered]@{ matcher = 'idle_prompt'; hooks = @($handler) },
+        [pscustomobject][ordered]@{ matcher = 'agent_completed'; hooks = @($handler) }
+      )
+    } else {
+      @([pscustomobject][ordered]@{ hooks = @($handler) })
+    }
+    $eventProperty.Value = @(@($eventProperty.Value) + @($managedGroups))
+  }
+
+  $rendered = ($document | ConvertTo-Json -Depth 32) + [Environment]::NewLine
+  if ($rendered -ne $original) {
+    Write-TextAtomic -Path $SettingsPath -Content $rendered
+    if ($null -ne $settingsAcl) {
+      try { Set-Acl -LiteralPath $SettingsPath -AclObject $settingsAcl } catch {
+        throw "Claude settings were updated, but their original ACL could not be restored: $($_.Exception.Message)"
+      }
+    }
+  }
+}
+
+function Get-InstalledClaudeCodeVersions {
+  $candidates = New-Object 'System.Collections.Generic.List[object]'
+  $command = Get-Command claude -ErrorAction SilentlyContinue
+  if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+    $candidates.Add([pscustomobject]@{ surface = 'PATH'; path = [string]$command.Source })
+  }
+  foreach ($location in @(
+      [pscustomobject]@{ surface = 'Claude Desktop'; root = (Join-Path $env:APPDATA 'Claude\claude-code') },
+      [pscustomobject]@{ surface = 'Claude Desktop (Store)'; root = (Join-Path $env:LOCALAPPDATA 'Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude-code') }
+    )) {
+    $root = $location.root
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+    Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+      Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
+      ForEach-Object {
+        $candidate = Join-Path $_.FullName 'claude.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+          $candidates.Add([pscustomobject]@{ surface = $location.surface; path = $candidate })
+        }
+      }
+  }
+  foreach ($location in @(
+      [pscustomobject]@{ surface = 'VS Code'; root = (Join-Path $env:USERPROFILE '.vscode\extensions') },
+      [pscustomobject]@{ surface = 'VS Code Insiders'; root = (Join-Path $env:USERPROFILE '.vscode-insiders\extensions') },
+      [pscustomobject]@{ surface = 'Cursor'; root = (Join-Path $env:USERPROFILE '.cursor\extensions') }
+    )) {
+    $extensionsRoot = $location.root
+    if (-not (Test-Path -LiteralPath $extensionsRoot -PathType Container)) { continue }
+    Get-ChildItem -LiteralPath $extensionsRoot -Directory -Filter 'anthropic.claude-code-*' -ErrorAction SilentlyContinue |
+      ForEach-Object {
+        $candidate = Join-Path $_.FullName 'resources\native-binary\claude.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+          $candidates.Add([pscustomobject]@{ surface = $location.surface; path = $candidate })
+        }
+      }
+  }
+  $selected = New-Object 'System.Collections.Generic.List[object]'
+  foreach ($surfaceGroup in @($candidates | Sort-Object surface, path -Unique | Group-Object surface)) {
+    $detected = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($candidate in @($surfaceGroup.Group)) {
+      try {
+        $versionText = (& $candidate.path --version 2>$null | Select-Object -First 1)
+        if ([string]$versionText -match '(?<!\d)(\d+\.\d+\.\d+)(?!\d)') {
+          $detected.Add([pscustomobject]@{
+              surface = [string]$candidate.surface
+              version = [version]$Matches[1]
+              path = [string]$candidate.path
+            })
+        }
+      } catch { }
+    }
+    if ($detected.Count -gt 0) {
+      $selected.Add(@($detected | Sort-Object version -Descending | Select-Object -First 1)[0])
+    } else {
+      $firstCandidate = @($surfaceGroup.Group | Select-Object -First 1)[0]
+      $selected.Add([pscustomobject]@{
+          surface = [string]$firstCandidate.surface
+          version = $null
+          path = [string]$firstCandidate.path
+        })
+    }
+  }
+  return @($selected | Sort-Object surface)
+}
+
+function Assert-ClaudeCodeVersions {
+  param([object[]]$Installations)
+
+  $minimum = [version]'2.1.198'
+  $unknown = @($Installations | Where-Object { $null -eq $_.version })
+  if ($unknown.Count -gt 0) {
+    $details = @($unknown | ForEach-Object { "$($_.surface) at $($_.path)" }) -join '; '
+    throw "Could not determine the Claude Code version for: $details. Version $minimum or newer is required."
+  }
+  $unsupported = @($Installations | Where-Object { $_.version -lt $minimum })
+  if ($unsupported.Count -gt 0) {
+    $details = @($unsupported | ForEach-Object { "$($_.surface) $($_.version) at $($_.path)" }) -join '; '
+    throw "Claude Code version $minimum or newer is required on every detected surface. Upgrade: $details"
+  }
+  foreach ($installation in $Installations) {
+    Write-Status "Detected Claude Code $($installation.version) for $($installation.surface)."
+  }
+}
+
+function Restore-ClaudeCodeSettings {
+  param(
+    [string]$SettingsPath,
+    [string]$BackupPath,
+    [bool]$PreviouslyPresent
+  )
+
+  $saved = Join-Path $BackupPath 'claude-settings.json'
+  if (Test-Path -LiteralPath $saved) {
+    $stage = "$SettingsPath.rollback"
+    Copy-Item -LiteralPath $saved -Destination $stage -Force
+    Move-Item -LiteralPath $stage -Destination $SettingsPath -Force
+  } elseif (-not $PreviouslyPresent) {
+    Remove-Item -LiteralPath $SettingsPath -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -817,6 +1097,13 @@ if ($taskPreviouslyPresent -and -not (Test-OwnedScheduledTask -Task $previousTas
   throw "Scheduled task '$TaskName' already exists but is unrelated; refusing to overwrite it."
 }
 $backup = Backup-CurrentInstallation -HomePath $CodexHome
+$claudeSettingsPath = if ($EnableClaudeCode) { Join-Path $ClaudeHome 'settings.json' } else { '' }
+$claudeSettingsPreviouslyPresent = $EnableClaudeCode -and (Test-Path -LiteralPath $claudeSettingsPath)
+if ($claudeSettingsPreviouslyPresent) {
+  $claudeBackupPath = Join-Path $backup 'claude-settings.json'
+  Copy-Item -LiteralPath $claudeSettingsPath -Destination $claudeBackupPath -Force
+  Protect-PrivatePath $claudeBackupPath
+}
 $wslInstallations = @()
 
 try {
@@ -825,6 +1112,21 @@ try {
     Stop-LegacyTask
   }
   Install-WindowsFiles -HomePath $CodexHome
+  if ($EnableClaudeCode) {
+    $claudeCodeInstallations = @(Get-InstalledClaudeCodeVersions)
+    if ($claudeCodeInstallations.Count -gt 0) {
+      Assert-ClaudeCodeVersions -Installations $claudeCodeInstallations
+    } else {
+      Write-Warning 'Claude Code executable was not found. Hooks will be installed, but Claude Code 2.1.198 or newer is required.'
+    }
+    New-Item -ItemType Directory -Path $ClaudeHome -Force | Out-Null
+    $windowsPowerShellPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Ensure-ClaudeCodeHooks `
+      -SettingsPath $claudeSettingsPath `
+      -PowerShellPath $windowsPowerShellPath `
+      -ScriptPath (Join-Path $CodexHome 'notify-ntfy.ps1')
+    Write-Status 'Claude Code completion hooks installed without changing unrelated Claude settings.'
+  }
   $removedSyntheticTests = & (Join-Path $CodexHome 'notify-ntfy.ps1') -CleanupTestState
   if ($LASTEXITCODE -ne 0) { throw 'Could not clean synthetic Windows test state.' }
   if ([int]$removedSyntheticTests -gt 0) {
@@ -843,6 +1145,13 @@ try {
   }
   Write-Status 'Installation completed without exposing the ntfy destination.'
   Write-Warning 'Codex will skip the new Stop hook until you review and trust it with /hooks in every installed Codex environment.'
+  if ($EnableClaudeCode) {
+    $claudeSettings = Get-Content -LiteralPath $claudeSettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([bool](Get-ObjectValue -Object $claudeSettings -Name 'disableAllHooks' -Default $false)) {
+      Write-Warning 'Claude Code hooks are installed, but disableAllHooks is true in Claude settings.'
+    }
+    Write-Status 'Claude Code Desktop/CLI/VS Code will pick up the managed lifecycle hooks through its settings watcher.'
+  }
   Write-Status 'Reload existing VS Code windows so their Codex app-server reads the new WSL notify command.'
 } catch {
   $installationError = $_
@@ -852,6 +1161,17 @@ try {
       Write-Warning "WSL installation $($wslInstallations[$index].Distro) was restored automatically."
     } catch {
       Write-Warning "Automatic WSL rollback failed for $($wslInstallations[$index].Distro): $($_.Exception.Message)"
+    }
+  }
+  if ($EnableClaudeCode) {
+    try {
+      Restore-ClaudeCodeSettings `
+        -SettingsPath $claudeSettingsPath `
+        -BackupPath $backup `
+        -PreviouslyPresent $claudeSettingsPreviouslyPresent
+      Write-Warning 'The Claude Code settings file was restored automatically.'
+    } catch {
+      Write-Warning "Automatic Claude Code rollback failed; use the private backup at $backup. $($_.Exception.Message)"
     }
   }
   try {
