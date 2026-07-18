@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the completion-detection and delivery model implemented by version 2.5.1. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI, Anthropic, or ntfy component.
+This document describes the completion-detection and delivery model implemented by version 2.5.2. Durable Codex ntfy notifier is an unofficial community project; it is not an OpenAI, Anthropic, or ntfy component.
 
 ## Design goal
 
@@ -102,17 +102,19 @@ Immediately before promotion, a Claude candidate is checked again against its lo
 
 Active descendants are bounded by `subagent_orphan_seconds`. The timeout prevents a crashed or abandoned child rollout from blocking its root forever; it is a liveness tradeoff rather than proof that the child succeeded.
 
-For a large Windows rollout, the idle probe first builds the required lifecycle summary with a native streaming reader. It returns only terminal/open-turn, goal, user/final-message, and snapshot facts needed by the existing gate; the PowerShell parser remains the compatibility fallback. This keeps the decision semantics unchanged while avoiding a tens-of-megabytes line-by-line PowerShell replay.
+While a descendant is inside that active window, malformed lifecycle JSON, invalid UTF-8, or a missing string turn ID is permanent invalid evidence for the current candidate: both strict and balanced modes fail closed instead of releasing the root. A trailing record without its newline is treated as transient busy state and retried, while ordinary I/O races keep the existing unknown/orphan behavior.
+
+For a large Windows rollout, the idle probe first parses relevant JSON records structurally with a native snapshot-bounded reader. It returns a fixed 23-field summary containing only terminal/open-turn, goal, user/final-message, incomplete-tail, and before/after snapshot facts needed by the existing gate; historical lifecycle lines never cross back into PowerShell. A snapshot ending in a partial JSONL record returns the bounded incomplete-tail summary immediately and is retried only after more data arrives. The compatibility parser processes 64 KiB chunks and retains only an incomplete line. This keeps the fail-closed decision semantics unchanged without a tens-of-megabytes replay, duplicate full-tail buffers, or a second PowerShell deserialization pass.
 
 ## Detection modes
 
 | Mode | Behavior | Intended use |
 | --- | --- | --- |
 | `strict` | Requires verifiable root classification and matching rollout completion. Unknown evidence is retried exponentially and, after `idle_probe_grace_seconds`, suppressed locally as `unverifiable`; it is never promoted by time alone. | Default; prioritize no premature notification. |
-| `balanced` | Applies the same positive busy checks but may accept incomplete rollout evidence after `idle_probe_grace_seconds`. | Prefer eventual notification when local history may be unavailable. |
+| `balanced` | Applies the same positive busy checks but may accept otherwise valid evidence that remains unknown or unavailable after `idle_probe_grace_seconds`. Malformed lifecycle/UTF-8 data and a partial trailing JSONL record are never promoted. | Prefer eventual notification when local history may be unavailable. |
 | `off` | Skips idle detection and queues each accepted completion signal immediately. | Compatibility, diagnostics, or intentionally per-turn behavior. |
 
-`balanced` can produce a false final notification if evidence is still incomplete when its fallback expires. `off` restores the noisy per-turn behavior that version 2.4 and later are designed to avoid.
+`balanced` can produce a false final notification if otherwise valid evidence is still unknown or unavailable when its fallback expires. Invalid or half-written lifecycle data remains fail-closed in every mode except `off`. `off` restores the noisy per-turn behavior that version 2.4 and later are designed to avoid.
 
 ## Coalescing and technical-turn suppression
 
@@ -178,13 +180,13 @@ Fresh configuration uses `tags: ["white_check_mark"]`; the templates add no dupl
 
 Task navigation is assembled at send time only for Codex records. With `include_task_link: true`, a canonical UUID becomes `https://chatgpt.com/codex/tasks/<thread-id>` in the JSON `click` member. An absent or non-canonical ID omits navigation without failing delivery. `include_task_link_action: true` additionally emits one `view` action with the same URL. Claude records omit both fields because no documented existing-session Claude Code deep link maps safely from the local session ID.
 
-The send-time `include_message` check is a privacy gate for durable state. A record captured while the option was true can still contain final-message text locally, but changing it to false prevents that text from entering later network attempts, including retries of an outbox record. This does not erase the record or backups and cannot recall a request already in flight or accepted by ntfy.
+The send-time `include_message` check is a privacy gate for durable state. A record captured while the option was true can still contain final-message text locally, but changing it to false prevents that text from entering later network attempts, including retries of an outbox record. Lifecycle probe caches follow the current setting too: message-disabled native and incremental scans retain only presence facts, and changing the setting forces a replay instead of reusing text or presence markers from the opposite mode. This does not erase an already-written record or its backups and cannot recall a request already in flight or accepted by ntfy.
 
 ## Concurrency and host topology
 
 Hooks and rollout scans may run concurrently. Each state directory has one non-blocking worker lock, so a scheduled/service worker and an on-demand worker do not process the same host queue simultaneously. Sharded `mutation-locks/` additionally serialize hook/worker changes to the same deterministic event key without serializing unrelated chats.
 
-On Windows, the supervisor starts three independent runtime paths: durable delivery, the persistent local scanner, and a timeout-bounded one-shot remote scanner when UNC/WSL roots are configured. Their separate locks and health files prevent remote latency from serializing local discovery or network delivery.
+On Windows, the supervisor starts three independent runtime paths: durable delivery, the persistent local scanner, and a timeout-bounded one-shot remote scanner when UNC/WSL roots are configured. Their separate locks and health files prevent remote latency from serializing local discovery or network delivery. The remote timeout budget starts only after the child process is created, so slow process startup is not misreported as remote scan time.
 
 Remote SSH does not share that UNC scanner: each remote installation owns a host-local worker, queue, rollout state, and network path. A stalled SSH host therefore cannot serialize the local Windows queue either.
 

@@ -108,7 +108,7 @@ La versione 2.4 ha introdotto il **periodo di idle logico** mantenuto dalla 2.5:
 - su Windows il watcher locale persistente ottiene i rollout attivi o ripresi di recente dall'indice SQLite Codex in sola lettura e controlla soltanto i percorsi correnti più caldi; il percorso continuo non ripete scansioni ricorsive di alberi `sessions/` e `archived_sessions/` da molti gigabyte;
 - il recovery fallback UNC/WSL usa uno scanner separato con timeout, quindi una distro sospesa o una share lenta non ritarda lo scanner locale né una consegna ntfy già pronta;
 - ogni candidato entra prima in `pending/`;
-- l’idle gate verifica che lo stesso turno sia completo, che non sia iniziato un turno successivo, che il goal non sia più attivo, che i discendenti abbiano finito e che il rollout sia rimasto quieto per una breve finestra; su Windows un riepilogo nativo in streaming evita di rileggere un rollout grande riga per riga in PowerShell;
+- l’idle gate verifica che lo stesso turno sia completo, che non sia iniziato un turno successivo, che il goal non sia più attivo, che i discendenti abbiano finito e che il rollout sia rimasto quieto per una breve finestra; su Windows un parser strutturale nativo restituisce un riepilogo lifecycle di dimensione fissa invece di rileggere un rollout grande riga per riga in PowerShell;
 - i candidati ancora pending della stessa chat root vengono consolidati; una completion seguita da una task successiva ancora aperta viene soppressa come predecessore superato, mentre un’epoca già promossa nell’outbox resta immutabile;
 - la modalità predefinita `strict` non fa mai fail-open: ritenta le prove mancanti per `idle_probe_grace_seconds`, poi sopprime localmente un candidato non verificabile invece di annunciare prematuramente la fine.
 
@@ -214,7 +214,7 @@ La configurazione privata è `~/.codex/ntfy-config.json`; vedere [ntfy-config.ex
 | --- | ---: | --- |
 | `idle_detection_mode` | `"strict"` | `strict` non trasforma mai una prova mancante in notifica; `balanced` può usare il fallback temporale; `off` torna alla coda immediata per turno. |
 | `idle_grace_seconds` | `1.5` | Quiet time richiesto dopo la completion corrispondente. |
-| `idle_probe_grace_seconds` | `30` | Finestra di verifica: alla scadenza `balanced` può accettare prove incomplete, mentre `strict` sopprime localmente il candidato non verificabile senza inviarlo. |
+| `idle_probe_grace_seconds` | `30` | Finestra di verifica: alla scadenza `balanced` può accettare prove sconosciute o non disponibili; UTF-8/lifecycle malformati e una riga JSONL finale parziale restano sempre fail-closed. `strict` sopprime localmente il candidato non verificabile senza inviarlo. |
 | `unknown_retry_max_seconds` | `60` | Intervallo massimo tra i tentativi esponenziali quando la prova root o rollout resta sconosciuta. |
 | `goal_aware` | `true` | Trattiene il candidato finché il goal root è `active`. |
 | `goal_poll_seconds` | `1` | Intervallo di ricontrollo di goal, turno e discendenti. |
@@ -229,7 +229,7 @@ La configurazione privata è `~/.codex/ntfy-config.json`; vedere [ntfy-config.ex
 | `watch_roots` | `[]` | Root Codex aggiuntive osservate dal worker Windows; `install.ps1` gestisce quelle delle distribuzioni WSL selezionate, con root SQLite e origine. |
 | `worker_sqlite_path` | gestito dall'installer | Root SQLite locale usata dal watcher pianificato Windows se diversa da `CODEX_HOME`; gli installer remoti la reimpostano sulla destinazione. |
 
-Usare `strict` quando evitare falsi “finito” è la priorità. Ritenta le prove sconosciute con intervalli esponenziali limitati, poi registra localmente `unverifiable` al termine della finestra senza inviarlo a ntfy. `balanced` privilegia la disponibilità dopo 30 secondi anche con prove incomplete e può quindi produrre un falso positivo. `off` è una modalità di compatibilità/diagnostica.
+Usare `strict` quando evitare falsi “finito” è la priorità. Ritenta le prove sconosciute con intervalli esponenziali limitati, poi registra localmente `unverifiable` al termine della finestra senza inviarlo a ntfy. `balanced` privilegia la disponibilità dopo 30 secondi quando prove altrimenti valide restano sconosciute o non disponibili e può quindi produrre un falso positivo; non promuove mai UTF-8/lifecycle malformati o una riga JSONL finale parziale. `off` è una modalità di compatibilità/diagnostica.
 
 ### Privacy e consegna
 
@@ -297,7 +297,7 @@ Non cancellare `pending/` o `outbox/` durante un problema normale. Consultare [R
 - Il supporto Claude riguarda attualmente Claude Code locale su Windows. La normale scheda Chat di Claude non espone gli hook Code, un'interruzione manuale non emette `Stop` e il lavoro hosted senza hook locale non è osservabile.
 - La finalità di Claude `/goal` dipende da una scansione inversa a memoria limitata dei record locali `attachment.goal_status`, senza caricare l'intero transcript. È un formato upstream che può richiedere un adattamento se Claude lo cambia; prove mancanti o malformate per un goal attivo fanno fail-closed invece di inviare un risultato intermedio.
 - `strict` sopprime localmente come `unverifiable` una vera completion se, trascorsi `idle_probe_grace_seconds`, Codex non conserva più le prove necessarie.
-- `balanced` può notificare con prova incompleta dopo il grace period.
+- `balanced` può notificare dopo il grace period quando una prova altrimenti valida resta sconosciuta o non disponibile; dati lifecycle malformati o parziali restano fail-closed.
 - I formati rollout e gli schemi SQLite locali appartengono a Codex e possono cambiare.
 - Un figlio abbandonato smette di bloccare dopo `subagent_orphan_seconds`.
 - Le task solo cloud non sono garantite senza stato locale.

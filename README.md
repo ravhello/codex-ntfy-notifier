@@ -108,9 +108,9 @@ Version 2.4 introduced the logical **idle epoch** retained by 2.5:
 - on Windows, the persistent local watcher obtains active and recently resumed rollout paths from Codex's read-only SQLite index and checks only hot current-day paths; its continuous path does not recursively rescan a multi-gigabyte `sessions/` and `archived_sessions/` tree;
 - UNC/WSL fallback recovery runs as a separate timeout-bounded scanner, so a suspended distro or slow share cannot delay the local scanner or an already-ready ntfy delivery;
 - candidates first enter a private `pending/` area;
-- the idle gate confirms the same turn completed, no later turn is open, any goal is no longer active, descendants are no longer running, and the rollout stayed quiet for a short settling window; on Windows, a native streaming lifecycle summary avoids replaying a large rollout line by line in PowerShell;
+- the idle gate confirms the same turn completed, no later turn is open, any goal is no longer active, descendants are no longer running, and the rollout stayed quiet for a short settling window; on Windows, a structural native parser returns a fixed-size lifecycle summary instead of replaying a large rollout line by line in PowerShell;
 - pending candidates for one root thread are coalesced, and a completion followed by a later open task is suppressed as an obsolete predecessor; an already promoted outbox epoch remains immutable;
-- `strict` mode never fails open: incomplete evidence is retried during `idle_probe_grace_seconds`, then an unverifiable candidate is suppressed locally instead of becoming a false “done” alert.
+- `strict` mode never fails open: unknown or unavailable evidence is retried during `idle_probe_grace_seconds`, then an unverifiable candidate is suppressed locally instead of becoming a false “done” alert.
 
 Version 2.5 adds a provider-specific Claude path on Windows. Claude `Stop` is accepted only for the main agent when both authoritative work registries are present and empty; `session_id + prompt_id` provides stable deduplication, and `StopFailure` covers turns ended by an API error. `Stop`, `StopFailure`, and `UserPromptSubmit` are ordered synchronously so repeated same-prompt goal stops cannot finish out of order; their initial reverse scan is capped at 1 MiB and any full reconciliation runs in the worker. `UserPromptSubmit` snapshots the previous session-level goal marker and cancels stale candidates before a new prompt can finish. The gate then mirrors Claude's own resume rule from the newest local `attachment.goal_status`: active/not-met markers hold the candidate, a newer achieved/failed marker releases it, and a newer manual-clear sentinel discards it without a notification. `idle_prompt`/`agent_completed` with the same non-empty `prompt_id` are optional asynchronous fallbacks, never required for correctness, so delayed or uncorrelated VS Code idle events cannot release the wrong candidate. The notification body still uses Claude's supplied final message.
 
@@ -227,7 +227,7 @@ The private configuration lives at `~/.codex/ntfy-config.json`. Start from [ntfy
 | --- | ---: | --- |
 | `idle_detection_mode` | `"strict"` | `strict` never turns missing evidence into a notification; `balanced` may fall back after the probe grace period; `off` restores immediate per-turn queueing. |
 | `idle_grace_seconds` | `1.5` | Required quiet time after the matching completion before the task is considered idle. |
-| `idle_probe_grace_seconds` | `30` | Evidence-probe window. At expiry, `balanced` may accept incomplete evidence; `strict` suppresses an unverifiable candidate locally and never sends it. |
+| `idle_probe_grace_seconds` | `30` | Evidence-probe window. At expiry, `balanced` may accept unknown or unavailable evidence; malformed UTF-8/lifecycle data and a partial trailing JSONL record always remain fail-closed. `strict` suppresses an unverifiable candidate locally and never sends it. |
 | `unknown_retry_max_seconds` | `60` | Maximum interval between exponential retries while root or rollout evidence remains unknown. |
 | `goal_aware` | `true` | Hold a candidate while the root task goal status is `active`. |
 | `goal_poll_seconds` | `1` | Poll cadence while goal, turn, or descendant state can still change. |
@@ -325,7 +325,7 @@ Read [Security and privacy](docs/security-and-privacy.md) before enabling messag
 - Claude support currently targets local Claude Code on Windows. The ordinary Claude Chat tab does not expose Claude Code hooks, user interrupts do not emit `Stop`, and hosted work without a local hook is outside the observation boundary.
 - Claude `/goal` finality relies on a memory-bounded reverse scan of Claude's local transcript `attachment.goal_status` records without loading the full transcript. That is an upstream local format and may require an adapter update if Claude changes it; missing or malformed active-goal evidence fails closed instead of sending an intermediate alert.
 - `strict` mode suppresses a candidate locally as `unverifiable` when matching rollout, root classification, or completion evidence is still missing after `idle_probe_grace_seconds`. This avoids a false final notification but can withhold a true one after an upstream format or storage change.
-- `balanced` can notify after `idle_probe_grace_seconds` when evidence stays incomplete, so it has a higher false-positive risk.
+- `balanced` can notify after `idle_probe_grace_seconds` when otherwise valid evidence stays unknown or unavailable, so it has a higher false-positive risk. It never promotes malformed UTF-8/lifecycle data or a partial trailing JSONL record.
 - Rollout and local Codex database schemas are upstream implementation details and may require adapter updates.
 - A stale child is ignored after `subagent_orphan_seconds` so an abandoned rollout cannot block forever.
 - Pure cloud tasks are not guaranteed unless their lifecycle state is mirrored into the local environment being watched.

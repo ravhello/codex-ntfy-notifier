@@ -1,6 +1,6 @@
 # Security and privacy
 
-Durable Codex ntfy notifier 2.5.1 is an unofficial local hook and worker that reads local Codex lifecycle metadata—and, when explicitly enabled on Windows, Claude Code completion metadata—and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, local agent state, notifier state, and backups as private data.
+Durable Codex ntfy notifier 2.5.2 is an unofficial local hook and worker that reads local Codex lifecycle metadata—and, when explicitly enabled on Windows, Claude Code completion metadata—and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, local agent state, notifier state, and backups as private data.
 
 ## Privacy defaults
 
