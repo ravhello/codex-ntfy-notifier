@@ -24,7 +24,7 @@ tail -n 40 "$HOME/.codex/ntfy-state/notify.log"
 
 The doctor output does not print the topic or credentials. Check:
 
-- `version` is `2.5.0` or a newer compatible release;
+- `version` is `2.5.1` or a newer compatible release;
 - `topic_configured` is `true`;
 - `idle_detection_mode` is `strict` when intermediate notifications must never be sent;
 - `goal_aware` and `watch_rollouts` are `true`;
@@ -154,7 +154,7 @@ Inspect the sanitized log first. Common idle reasons are:
 
 ### Strict mode suppresses unverifiable evidence
 
-This is intentional for unresolved root classification or missing matching rollout completion. `strict` retries unknown evidence with exponential intervals capped by `unknown_retry_max_seconds`, then writes an `unverifiable` suppressed receipt after `idle_probe_grace_seconds`. It never uses the timeout as permission to notify.
+This is intentional for unresolved root classification or missing matching rollout completion. `strict` retries unknown evidence with exponential intervals capped by `unknown_retry_max_seconds`, then writes an `unverifiable` suppressed receipt after `idle_probe_grace_seconds`. It never uses the timeout as permission to notify. An epoch-anchored Claude candidate that cannot pass the locked session/prompt-epoch check immediately before promotion is terminalized locally with receipt reason `claude-session-unverifiable` rather than retried forever; it does not create an ntfy request.
 
 Check:
 
@@ -184,7 +184,7 @@ Lowering that timeout can notify while a genuinely long-running child is still a
 
 Confirm all of the following:
 
-- doctor reports version 2.5.0+ and `idle_detection_mode: "strict"`;
+- doctor reports version 2.5.1+ and `idle_detection_mode: "strict"`;
 - the alert comes from this installation/topic rather than an older custom hook or another notifier;
 - no duplicate/legacy managed notifier handlers remain under `UserPromptExpansion`, `SubagentStop`, or unexpected hook groups; the single managed `UserPromptSubmit` is intentional;
 - only one intended `notify-ntfy` `Stop` group exists per environment;

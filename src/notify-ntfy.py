@@ -33,7 +33,7 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 MAX_NTFY_MESSAGE_BYTES = 3500
 SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
@@ -130,6 +130,65 @@ def sanitize(text: Any, max_length: int = 900, *, preserve_lines: bool = False) 
     value = re.sub(r"(?i)\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,})\b", "[REDACTED]", value)
     value = re.sub(r"(?i)https://ntfy\.sh/[A-Za-z0-9._~-]+", "https://ntfy.sh/[REDACTED]", value)
     return truncate_text(value, max_length)
+
+
+def markdown_to_plain_text(text: Any) -> str:
+    """Render the small Markdown subset used in completion summaries as compact text."""
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    literals: list[str] = []
+
+    def protect(literal: str) -> str:
+        token = f"\ue000{len(literals)}\ue001"
+        literals.append(literal)
+        return token
+
+    prepared_lines: list[str] = []
+    inside_fence = False
+    for raw_line in value.split("\n"):
+        if re.match(r"^\s{0,3}(?:`{3,}|~{3,})", raw_line):
+            inside_fence = not inside_fence
+            continue
+        prepared_lines.append(protect(raw_line) if inside_fence and raw_line.strip() else raw_line)
+    value = "\n".join(prepared_lines)
+    value = re.sub(r"`([^`\r\n]+)`", lambda match: protect(match.group(1)), value)
+    value = re.sub(r"\\([^\w\s])", lambda match: protect(match.group(1)), value)
+
+    value = re.sub(r"!\[([^\]]*)\]\([^\r\n)]*\)", r"\1", value)
+    value = re.sub(r"\[([^\]]+)\]\([^\r\n)]*\)", r"\1", value)
+    value = re.sub(r"!\[([^\]]*)\]\[[^\]\r\n]*\]", r"\1", value)
+    value = re.sub(r"(?<!!)\[([^\]]+)\]\[[^\]\r\n]*\]", r"\1", value)
+    value = re.sub(r"<(https?://[^>\s]+)>", r"\1", value, flags=re.IGNORECASE)
+
+    plain_lines: list[str] = []
+    for raw_line in value.split("\n"):
+        line = raw_line
+        if re.match(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$", line):
+            continue
+        if re.match(r"^\s{0,3}(?:[-*_]\s*){3,}$", line):
+            continue
+        if re.match(r"^\s{0,3}\[[^\]]+\]:\s+\S+", line):
+            continue
+        line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+        line = re.sub(r"^(?:(?:\s{0,3}>\s?)|(?:\s*[-*+]\s+)|(?:\s*\d+[.)]\s+))+", "", line)
+        stripped = line.strip()
+        looks_like_table = stripped.startswith("|") or stripped.endswith("|") or " | " in line
+        if looks_like_table and "|" in line:
+            cells = [cell.strip() for cell in stripped.strip("|").split("|") if cell.strip()]
+            line = " · ".join(cells)
+        line = line.strip()
+        if line:
+            plain_lines.append(line)
+
+    value = " · ".join(plain_lines)
+    for _ in range(2):
+        value = re.sub(r"\*\*(.+?)\*\*", r"\1", value)
+        value = re.sub(r"__(.+?)__", r"\1", value)
+        value = re.sub(r"~~(.+?)~~", r"\1", value)
+        value = re.sub(r"(?<![\w*])\*([^*\r\n]+)\*(?![\w*])", r"\1", value)
+        value = re.sub(r"(?<![\w_])_([^_\r\n]+)_(?![\w_])", r"\1", value)
+    for index, literal in enumerate(literals):
+        value = value.replace(f"\ue000{index}\ue001", literal)
+    return value.strip()
 
 
 class Runtime:
@@ -1753,8 +1812,11 @@ def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any
 
     summary = ""
     if config["include_message"]:
+        raw_message = obj_value(event, "last-assistant-message", "last_assistant_message", default="")
+        if not config["markdown"]:
+            raw_message = markdown_to_plain_text(raw_message)
         summary = sanitize(
-            obj_value(event, "last-assistant-message", "last_assistant_message", default=""),
+            raw_message,
             config["max_message_chars"],
             preserve_lines=config["markdown"],
         )

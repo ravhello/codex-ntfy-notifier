@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-07-18
+
+### Changed
+
+- With `markdown: false`, an opted-in final-message excerpt is converted to compact plain text before one-line normalization and size limiting: presentational Markdown is removed while link labels and table-cell text are retained. Explicit `markdown: true` keeps Markdown behavior.
+
+### Fixed
+
+- Windows hook payloads are read from raw standard input with strict UTF-8 decoding instead of the active console code page, preventing non-ASCII JSON from becoming mojibake and rejecting malformed byte sequences rather than silently replacing them.
+- Bounded Claude transcript-tail reads align their starting offset to a valid UTF-8 code-point boundary, so a window beginning inside a multibyte character cannot corrupt title or goal-state parsing.
+- An epoch-anchored Claude candidate that cannot pass the final session/epoch commit check is terminalized locally with receipt reason `claude-session-unverifiable` and is never sent, instead of remaining in an unproductive retry loop. Maintenance also preserves session state referenced by a pending Claude candidate.
+
 ## [2.5.0] - 2026-07-17
 
 ### Added
@@ -197,7 +209,8 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.0...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.1...HEAD
+[2.5.1]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.1
 [2.5.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.0
 [2.4.3]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.3
 [2.4.2]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.2
