@@ -334,7 +334,23 @@ class NotifierContractTests(unittest.TestCase):
             origin,
         ]
 
-    def claude_hook_command(self, *, origin: str = "Claude Code") -> list[str]:
+    def claude_hook_command(self, *, origin: str = "Claude Code", input_encoding: int | None = None) -> list[str]:
+        if input_encoding is not None:
+            script_path = str(POWERSHELL_NOTIFIER).replace("'", "''")
+            escaped_origin = origin.replace("'", "''")
+            command = (
+                f"[Console]::InputEncoding = [Text.Encoding]::GetEncoding({input_encoding}); "
+                f"& '{script_path}' -NoSpawn -ClaudeHook -ReadStdin -Origin '{escaped_origin}'"
+            )
+            return [
+                str(WINDOWS_POWERSHELL),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ]
         return [
             str(WINDOWS_POWERSHELL),
             "-NoProfile",
@@ -425,18 +441,44 @@ class NotifierContractTests(unittest.TestCase):
             stream.write(json.dumps(entry, separators=(",", ":")) + "\n")
         return marker
 
-    def run_claude_hook(self, event: dict) -> subprocess.CompletedProcess[str]:
+    def run_claude_hook(
+        self, event: dict, *, input_encoding: int | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
         result = subprocess.run(
-            self.claude_hook_command(),
-            input=json.dumps(event),
+            self.claude_hook_command(input_encoding=input_encoding),
+            input=json.dumps(event, ensure_ascii=False).encode("utf-8"),
             env=self.env,
-            text=True,
             capture_output=True,
-            timeout=30,
+            timeout=60,
         )
-        self.assertEqual(result.returncode, 0, msg=f"stdout={result.stdout}\nstderr={result.stderr}")
-        self.assertEqual(result.stdout.strip(), "{}")
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        self.assertEqual(result.returncode, 0, msg=f"stdout={stdout}\nstderr={stderr}")
+        self.assertEqual(stdout.strip(), "{}")
         return result
+
+    def write_reverse_boundary_transcript(
+        self,
+        path: Path,
+        *,
+        prefix: bytes,
+        line: bytes,
+        target: bytes,
+        split_offset: int,
+    ) -> None:
+        target_index = line.index(target)
+        boundary = len(prefix) + target_index + split_offset
+        suffix_length = boundary + 65536 - len(prefix) - len(line)
+        self.assertGreater(suffix_length, 0)
+        suffix_parts: list[bytes] = []
+        remaining = suffix_length
+        while remaining > 0:
+            chunk_length = min(300, remaining)
+            suffix_parts.append((b"x" * (chunk_length - 1) + b"\n") if chunk_length > 1 else b"\n")
+            remaining -= chunk_length
+        data = prefix + line + b"".join(suffix_parts)
+        self.assertEqual(len(data) - 65536, boundary)
+        path.write_bytes(data)
 
     def state_debug(self) -> str:
         files = {
@@ -444,7 +486,10 @@ class NotifierContractTests(unittest.TestCase):
             for name in ("pending", "outbox", "sent", "suppressed", "dead")
         }
         log_path = self.state / "notify.log"
-        log = log_path.read_text(encoding="utf-8-sig", errors="replace") if log_path.exists() else ""
+        try:
+            log = log_path.read_text(encoding="utf-8-sig", errors="replace") if log_path.exists() else ""
+        except OSError as error:
+            log = f"<log temporarily unavailable: {error}>"
         return json.dumps(files) + "\n" + log[-4000:]
 
     def worker_command(self, implementation: str) -> list[str]:
@@ -639,6 +684,53 @@ class NotifierContractTests(unittest.TestCase):
                 self.assertLessEqual(len(payload["message"].encode("utf-8")), 3500)
                 self.assertNotIn("�", payload["message"])
                 self.assertTrue(payload["message"].endswith("perfect notifier · test-host · #33333333"))
+                captured[implementation] = payload
+                shutil.rmtree(self.state, ignore_errors=True)
+        if "powershell" in captured:
+            self.assertEqual(captured["powershell"], captured["python"])
+
+    def test_plain_text_payload_compacts_markdown_with_unicode_and_redaction(self) -> None:
+        self.configure(markdown=False, max_message_chars=1000)
+        thread_id = "66666666-6666-7666-8666-666666666666"
+        turn_id = "77777777-7777-7777-8777-777777777777"
+        message = (
+            "## Risultato **finale**\n"
+            "- `Più` già, è ✅\n"
+            "- Vedi [guida](https://example.test/private)\n"
+            "- `last_assistant_message` `__init__` `a*b*c`\n"
+            "- [Riferimento][ref] e <https://example.test/ref>\n"
+            "- **outer *inner* text**\n"
+            "- \\*letterale\\*\n"
+            "```python\n"
+            "snake_case = __init__ * a*b*c\n"
+            "```\n"
+            "| Campo | Valore |\n"
+            "| --- | --- |\n"
+            "| Stato | pronto |\n"
+            "- token=top-secret-value\n"
+            "[ref]: https://example.test/reference"
+        )
+        expected = (
+            "Risultato finale · Più già, è ✅ · Vedi guida · "
+            "last_assistant_message __init__ a*b*c · "
+            "Riferimento e https://example.test/ref · outer inner text · *letterale* · "
+            "snake_case = __init__ * a*b*c · Campo · Valore · "
+            "Stato · pronto · token=[REDACTED]"
+        )
+        captured: dict[str, dict] = {}
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                event = self.event(thread_id=thread_id, turn_id=turn_id)
+                event["last-assistant-message"] = message
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    payload = self.server.payloads.pop()
+                self.assertTrue(payload["message"].startswith(expected + " · "), payload["message"])
+                self.assertNotIn("top-secret-value", payload["message"])
+                for marker in ("##", "**", "`", "[guida]", "| ---"):
+                    self.assertNotIn(marker, payload["message"])
+                self.assertNotIn("markdown", payload)
                 captured[implementation] = payload
                 shutil.rmtree(self.state, ignore_errors=True)
         if "powershell" in captured:
@@ -1694,6 +1786,84 @@ class NotifierContractTests(unittest.TestCase):
                     self.server.payloads.clear()
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_stdin_is_strict_utf8_independent_of_console_code_page(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        message = "Fatto — più già; è ✅ 👩🏽‍💻; 中文"
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        event["last_assistant_message"] = message
+
+        self.run_claude_hook(event, input_encoding=850)
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(record["event"]["last-assistant-message"], message)
+
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertIn(message, payloads[0]["message"])
+        for mojibake in ("ÔÇ", "├", "Γ£", "≡ƒ", "�"):
+            self.assertNotIn(mojibake, payloads[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_invalid_utf8_stdin_fails_closed(self) -> None:
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        event["last_assistant_message"] = "INVALID_UTF8_BYTE"
+        encoded = json.dumps(event, ensure_ascii=False).encode("utf-8")
+        invalid = encoded.replace(b"INVALID_UTF8_BYTE", b"\x80")
+        cases = {
+            "invalid-utf8": invalid,
+            "invalid-after-utf8-bom": b"\xef\xbb\xbf" + invalid,
+            "utf16-bom": json.dumps(event, ensure_ascii=False).encode("utf-16"),
+        }
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                result = subprocess.run(
+                    self.claude_hook_command(input_encoding=850),
+                    input=raw,
+                    env=self.env,
+                    capture_output=True,
+                    timeout=60,
+                )
+                stdout = result.stdout.decode("utf-8", errors="replace")
+                stderr = result.stderr.decode("utf-8", errors="replace")
+                self.assertEqual(result.returncode, 0, msg=f"stdout={stdout}\nstderr={stderr}")
+                self.assertEqual(stdout.strip(), "{}")
+                for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+                    self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_valid_utf8_bom_stdin_is_supported_without_code_page_fallback(self) -> None:
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        message = "BOM UTF-8 valido — già ✅"
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        event["last_assistant_message"] = message
+        raw = b"\xef\xbb\xbf" + json.dumps(event, ensure_ascii=False).encode("utf-8")
+        result = subprocess.run(
+            self.claude_hook_command(input_encoding=850),
+            input=raw,
+            env=self.env,
+            capture_output=True,
+            timeout=60,
+        )
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        self.assertEqual(result.returncode, 0, msg=f"stdout={stdout}\nstderr={stderr}")
+        self.assertEqual(stdout.strip(), "{}")
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(record["event"]["last-assistant-message"], message)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
     def test_claude_final_stop_is_strong_deduplicated_and_has_no_codex_link(self) -> None:
         self.configure(
             idle_detection_mode="strict",
@@ -1820,6 +1990,126 @@ class NotifierContractTests(unittest.TestCase):
             self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_unverifiable_session_state_is_terminal_even_during_refresh_race(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        cases = (("missing", False), ("corrupt", False), ("missing", True))
+        for state_mode, refresh in cases:
+            with self.subTest(state_mode=state_mode, refresh=refresh):
+                session_id = str(uuid.uuid4())
+                transcript = self.temp / f"{session_id}.jsonl"
+                transcript.write_text("", encoding="utf-8")
+                event = self.claude_event(session_id=session_id, transcript_path=transcript)
+                self.run_claude_hook(self.claude_prompt_event(event))
+                self.run_claude_hook(event)
+
+                marker = self.temp / f"before-unverifiable-{state_mode}-{refresh}.marker"
+                release = self.temp / f"release-unverifiable-{state_mode}-{refresh}.marker"
+                worker_env = {
+                    **self.env,
+                    "CODEX_NTFY_TEST_BEFORE_PROMOTE_MS": "10000",
+                    "CODEX_NTFY_TEST_BEFORE_PROMOTE_MARKER": str(marker),
+                    "CODEX_NTFY_TEST_BEFORE_PROMOTE_RELEASE": str(release),
+                }
+                worker = subprocess.Popen(
+                    self.worker_command("powershell"),
+                    env=worker_env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                try:
+                    deadline = time.time() + 30
+                    while time.time() < deadline and not marker.exists():
+                        time.sleep(0.05)
+                    self.assertTrue(marker.exists(), self.state_debug())
+
+                    session_files = list((self.state / "claude-sessions").glob("*.json"))
+                    self.assertEqual(len(session_files), 1, self.state_debug())
+                    if state_mode == "missing":
+                        session_files[0].unlink()
+                    else:
+                        session_files[0].write_text("{not-json", encoding="utf-8")
+                    expected_suppressed_revision = marker.read_text(encoding="utf-8")
+                    if refresh:
+                        pending = list((self.state / "pending").glob("*.json"))
+                        self.assertEqual(len(pending), 1, self.state_debug())
+                        canonical = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+                        self.assertEqual(canonical["candidate_revision"], expected_suppressed_revision)
+                        expected_suppressed_revision = uuid.uuid4().hex
+                        canonical["candidate_revision"] = expected_suppressed_revision
+                        canonical["event"]["last-assistant-message"] = "New canonical revision must stay suppressed."
+                        replacement = pending[0].with_suffix(".refresh.tmp")
+                        replacement.write_text(json.dumps(canonical, ensure_ascii=False), encoding="utf-8")
+                        os.replace(replacement, pending[0])
+                    release.write_text("continue", encoding="ascii")
+
+                    self.assert_worker_ok(worker, timeout=60)
+                    with self.server.lock:
+                        self.assertEqual(self.server.payloads, [], self.state_debug())
+                    for directory in ("pending", "outbox", "sent", "dead"):
+                        self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+                    suppressed = list((self.state / "suppressed").glob("*.json"))
+                    self.assertEqual(len(suppressed), 1, self.state_debug())
+                    receipt = json.loads(suppressed[0].read_text(encoding="utf-8-sig"))
+                    self.assertEqual(receipt["reason"], "claude-session-unverifiable")
+                    self.assertEqual(receipt["candidate_revision"], expected_suppressed_revision)
+
+                    if refresh:
+                        # A duplicate Stop and another worker cannot revive this
+                        # terminal, non-technical suppression.
+                        self.run_claude_hook(event)
+                        self.run_ok(self.worker_command("powershell"), timeout=30)
+                        with self.server.lock:
+                            self.assertEqual(self.server.payloads, [], self.state_debug())
+                        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+                        self.assertEqual(len(list((self.state / "suppressed").glob("*.json"))), 1)
+                finally:
+                    with contextlib.suppress(OSError):
+                        release.write_text("continue", encoding="ascii")
+                    if worker.poll() is None:
+                        try:
+                            worker.communicate(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            worker.terminate()
+                            worker.communicate(timeout=10)
+                    shutil.rmtree(self.state, ignore_errors=True)
+                    with self.server.lock:
+                        self.server.payloads.clear()
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_maintenance_preserves_claude_session_state_referenced_by_pending(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0, sent_retention_days=1)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(self.claude_prompt_event(event))
+        self.run_claude_hook(event)
+        session_files = list((self.state / "claude-sessions").glob("*.json"))
+        self.assertEqual(len(session_files), 1, self.state_debug())
+        old = time.time() - (3 * 24 * 60 * 60)
+        os.utime(session_files[0], (old, old))
+
+        maintenance = [
+            str(WINDOWS_POWERSHELL),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(POWERSHELL_NOTIFIER),
+            "-Maintenance",
+        ]
+        self.run_ok(maintenance)
+        self.assertTrue(session_files[0].exists(), self.state_debug())
+
+        for pending in (self.state / "pending").glob("*.json"):
+            pending.unlink()
+        os.utime(session_files[0], (old, old))
+        self.run_ok(maintenance)
+        self.assertFalse(session_files[0].exists(), self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
     def test_claude_large_transcript_scan_and_title_do_not_use_slow_tail_path(self) -> None:
         self.configure(
             idle_detection_mode="strict",
@@ -1855,6 +2145,80 @@ class NotifierContractTests(unittest.TestCase):
             notifier_source.index("function Get-ClaudeThreadTitle") : notifier_source.index("function Get-CompletionLabel")
         ]
         self.assertNotIn(" -Tail ", claude_source)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_title_tail_preserves_utf8_across_every_four_byte_chunk_split(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            include_thread_title=True,
+        )
+        for split_offset in (1, 2, 3):
+            with self.subTest(split_offset=split_offset):
+                session_id = str(uuid.uuid4())
+                transcript = self.temp / f"{session_id}.jsonl"
+                title = f"Attività — 👩🏽‍💻 pronta 中文 {split_offset}"
+                title_line = (
+                    json.dumps(
+                        {"type": "custom-title", "sessionId": session_id, "customTitle": title},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                self.write_reverse_boundary_transcript(
+                    transcript,
+                    prefix=b"{}\n" * 501,
+                    line=title_line,
+                    target="👩".encode("utf-8"),
+                    split_offset=split_offset,
+                )
+                try:
+                    event = self.claude_event(session_id=session_id, transcript_path=transcript)
+                    self.run_claude_hook(event)
+                    self.run_ok(self.worker_command("powershell"), timeout=60)
+                    payloads = self.wait_for_payloads(1)
+                    self.assertEqual(len(payloads), 1, self.state_debug())
+                    self.assertEqual(payloads[0]["title"], title)
+                    self.assertNotIn("�", payloads[0]["title"])
+                finally:
+                    shutil.rmtree(self.state, ignore_errors=True)
+                    with self.server.lock:
+                        self.server.payloads.clear()
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
+    def test_claude_goal_tail_preserves_utf8_marker_across_chunk_split(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.temp / f"{session_id}.jsonl"
+        marker = "goal-👩🏽‍💻-è-中文"
+        goal_line = (
+            json.dumps(
+                {
+                    "type": "attachment",
+                    "uuid": marker,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "attachment": {"type": "goal_status", "met": False, "sentinel": True},
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        self.write_reverse_boundary_transcript(
+            transcript,
+            prefix=b"{}\n" * 10,
+            line=goal_line,
+            target="👩".encode("utf-8"),
+            split_offset=2,
+        )
+        event = self.claude_event(session_id=session_id, transcript_path=transcript)
+        self.run_claude_hook(event)
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(record["claude_goal_state"], "active")
+        self.assertEqual(record["claude_goal_marker"], marker)
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
     def test_claude_prompt_baseline_and_huge_line_scans_fail_closed(self) -> None:

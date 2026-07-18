@@ -68,7 +68,7 @@ jobs:
   windows:
     name: Windows / Python 3.14 / Windows PowerShell 5.1
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository

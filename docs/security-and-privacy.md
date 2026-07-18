@@ -1,6 +1,6 @@
 # Security and privacy
 
-Durable Codex ntfy notifier 2.5.0 is an unofficial local hook and worker that reads local Codex lifecycle metadata—and, when explicitly enabled on Windows, Claude Code completion metadata—and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, local agent state, notifier state, and backups as private data.
+Durable Codex ntfy notifier 2.5.1 is an unofficial local hook and worker that reads local Codex lifecycle metadata—and, when explicitly enabled on Windows, Claude Code completion metadata—and sends a small notification to a server selected by the operator. Treat its topic, authentication values, hook configuration, local agent state, notifier state, and backups as private data.
 
 ## Privacy defaults
 
@@ -45,7 +45,7 @@ To distinguish a final root completion from an intermediate result, the notifier
 
 SQLite access is opened read-only and query-only. Goal awareness selects the goal **status**, not its objective. The notifier does not update Codex databases.
 
-With `-EnableClaudeCode`, the Windows hook receives Claude's `session_id`, `prompt_id`, work registries, final message, working directory, and transcript path. It uses the registries only to prove no background work remains. A memory-bounded reverse scan finds the newest local `attachment.goal_status` lifecycle record; only the boolean state and an opaque UUID/hash marker are retained. The pre-existing goal condition/reason is not extracted, stored, logged, or sent. A separate bounded head/tail lookup runs only when `include_thread_title: true` and looks for title metadata. The notifier does not parse the transcript for the final response because Claude supplies `last_assistant_message` directly.
+With `-EnableClaudeCode`, the Windows hook receives Claude's `session_id`, `prompt_id`, work registries, final message, working directory, and transcript path. Redirected hook JSON is decoded from raw standard input as strict UTF-8 rather than through the active console code page; malformed byte sequences are rejected. The notifier uses the registries only to prove no background work remains. A memory-bounded reverse scan finds the newest local `attachment.goal_status` lifecycle record and aligns bounded tail reads to a valid UTF-8 code-point boundary; only the boolean state and an opaque UUID/hash marker are retained. The pre-existing goal condition/reason is not extracted, stored, logged, or sent. A separate bounded head/tail lookup runs only when `include_thread_title: true` and looks for title metadata. The notifier does not parse the transcript for the final response because Claude supplies `last_assistant_message` directly.
 
 The rollout watcher reads newly appended complete JSONL lines in memory to find `task_complete` and `turn_aborted`. It persists a cursor containing the rollout path, byte offset, timestamp, and thread ID. It does not copy prompt lines into `watch/`.
 
@@ -66,7 +66,7 @@ The default JSON title is only `<project>`, while the single applicable tag rend
 
 `include_full_path: true` uses the sanitized working-directory path as the body's location context instead of a project-name context item. A full path can reveal usernames, clients, repository names, mounts, or organization structure.
 
-`include_message: true` adds a sanitized and truncated copy of the final assistant message ahead of the context. `max_message_chars` limits that excerpt to 180 characters by default. With the default `markdown: false`, whitespace is normalized and the whole body stays on one line. The complete ntfy `message` is also hard-capped at 3,500 UTF-8 bytes, even if `max_message_chars` is increased. Truncation and the byte cap limit size, not sensitivity.
+`include_message: true` adds a sanitized and truncated copy of the final assistant message ahead of the context. `max_message_chars` limits that excerpt to 180 characters by default. With the default `markdown: false`, presentational Markdown is converted to compact plain text before whitespace is normalized and the whole body is placed on one line; link labels and table-cell text remain. Explicit `markdown: true` preserves Markdown and line breaks. The complete ntfy `message` is also hard-capped at 3,500 UTF-8 bytes, even if `max_message_chars` is increased. Plain-text conversion, truncation, and the byte cap limit presentation and size, not sensitivity.
 
 For Codex records only, `include_task_link: true` adds `https://chatgpt.com/codex/tasks/<thread-id>` as the ntfy `click` target after validating a canonical UUID. This sends the full thread ID to the ntfy server and its subscribed clients instead of only the default eight-character prefix. The URL still requires the appropriate ChatGPT account, workspace, and Remote host access; it is not an authentication token and does not bypass authorization. `include_task_link_action: true` duplicates the same destination in one visible `view` action, so it is a separate opt-in and remains off by default. Claude records never add this URL or send the full Claude session ID through a task link.
 
@@ -186,7 +186,7 @@ Prefer a host-specific publish-only token. Verify a new host interactively befor
 
 Defaults are 14 days for sent/suppressed receipts and 30 days for dead letters. Cleanup runs when a worker starts.
 
-Busy pending candidates and network-ready outbox records have no time-based expiry because silently dropping an unfinished/offline notification would violate the delivery goal. Unknown evidence is different: in `strict` mode it is retried locally only through `idle_probe_grace_seconds`, then reduced to an `unverifiable` suppressed receipt and never sent. Watch cursors persist so scans can resume without replaying old rollout history; unchanged cursor files are not rewritten.
+Busy pending candidates and network-ready outbox records have no time-based expiry because silently dropping an unfinished/offline notification would violate the delivery goal. Unknown evidence is different: in `strict` mode it is retried locally only through `idle_probe_grace_seconds`, then reduced to an `unverifiable` suppressed receipt and never sent. An epoch-anchored Claude candidate that cannot be reconciled with its locked session/prompt epoch at the final commit boundary is likewise terminalized locally with receipt reason `claude-session-unverifiable`; it never enters the outbox. Maintenance does not delete a Claude session-state record while a pending candidate references it. Watch cursors persist so scans can resume without replaying old rollout history; unchanged cursor files are not rewritten.
 
 For deliberate local erasure:
 

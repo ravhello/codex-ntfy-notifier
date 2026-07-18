@@ -32,7 +32,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.5.0'
+$ScriptVersion = '2.5.1'
 $MaxNtfyMessageBytes = 3500
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
@@ -72,6 +72,7 @@ $RemoteScanHealthPath = Join-Path $StateRoot 'remote-watch-health.json'
 $MaintenanceLockPath = Join-Path $StateRoot 'maintenance.lock'
 $LogPath = Join-Path $StateRoot 'notify.log'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$Utf8StrictNoBom = New-Object System.Text.UTF8Encoding($false, $true)
 $script:ClaudeGoalStateCache = @{}
 $ClaudePromptBaselineMaxBytes = [int64](1024 * 1024)
 $ClaudeGoalMaxLineBytes = 1024 * 1024
@@ -406,6 +407,87 @@ function Limit-Utf8Text {
   return $Value.Substring(0, $prefixEnd).TrimEnd() + $suffix
 }
 
+function Convert-MarkdownToPlainText {
+  param([AllowEmptyString()][string]$Text)
+
+  if ([string]::IsNullOrEmpty($Text)) { return '' }
+  $value = $Text -replace "`r`n?", "`n"
+
+  # Protect literal code and escaped Markdown punctuation while formatting the
+  # surrounding prose. Without this, identifiers such as __init__,
+  # last_assistant_message, and a*b*c would be mistaken for emphasis.
+  $literals = New-Object 'System.Collections.Generic.List[string]'
+  $protectLiteral = {
+    param([AllowEmptyString()][string]$Literal)
+    $index = $literals.Count
+    [void]$literals.Add($Literal)
+    return "$([char]0xE000)$index$([char]0xE001)"
+  }
+  $preparedLines = New-Object 'System.Collections.Generic.List[string]'
+  $insideFence = $false
+  foreach ($rawLine in $value.Split([char]10)) {
+    $line = [string]$rawLine
+    if ($line -match '^\s{0,3}(?:`{3,}|~{3,})') {
+      $insideFence = -not $insideFence
+      continue
+    }
+    if ($insideFence -and -not [string]::IsNullOrWhiteSpace($line)) {
+      $line = & $protectLiteral $line
+    }
+    $preparedLines.Add($line)
+  }
+  $value = $preparedLines -join "`n"
+  $value = [regex]::Replace($value, '`([^`\r\n]+)`', [System.Text.RegularExpressions.MatchEvaluator]{
+      param($match)
+      return (& $protectLiteral ([string]$match.Groups[1].Value))
+    })
+  $value = [regex]::Replace($value, '\\([^\w\s])', [System.Text.RegularExpressions.MatchEvaluator]{
+      param($match)
+      return (& $protectLiteral ([string]$match.Groups[1].Value))
+    })
+
+  $value = [regex]::Replace($value, '!\[([^\]]*)\]\([^\r\n)]*\)', '$1')
+  $value = [regex]::Replace($value, '\[([^\]]+)\]\([^\r\n)]*\)', '$1')
+  $value = [regex]::Replace($value, '!\[([^\]]*)\]\[[^\]\r\n]*\]', '$1')
+  $value = [regex]::Replace($value, '(?<!!)\[([^\]]+)\]\[[^\]\r\n]*\]', '$1')
+  $value = [regex]::Replace($value, '<(https?://[^>\s]+)>', '$1', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+  $plainLines = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($rawLine in $value.Split([char]10)) {
+    $line = [string]$rawLine
+    if ($line -match '^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$' -or
+        $line -match '^\s{0,3}(?:[-*_]\s*){3,}$' -or
+        $line -match '^\s{0,3}\[[^\]]+\]:\s+\S+') {
+      continue
+    }
+    $line = [regex]::Replace($line, '^\s{0,3}#{1,6}\s+', '')
+    $line = [regex]::Replace($line, '^(?:(?:\s{0,3}>\s?)|(?:\s*[-*+]\s+)|(?:\s*\d+[.)]\s+))+', '')
+    $looksLikeTable = $line.Trim().StartsWith('|') -or $line.Trim().EndsWith('|') -or $line.Contains(' | ')
+    if ($looksLikeTable -and $line.Contains('|')) {
+      $cells = @($line.Trim().Trim('|').Split('|') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+      $line = $cells -join (" $MiddleDot ")
+    }
+    $line = $line.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($line)) {
+      $plainLines.Add($line)
+    }
+  }
+
+  $value = $plainLines -join " $MiddleDot "
+  for ($pass = 0; $pass -lt 2; $pass++) {
+    $value = [regex]::Replace($value, '\*\*(.+?)\*\*', '$1')
+    $value = [regex]::Replace($value, '__(.+?)__', '$1')
+    $value = [regex]::Replace($value, '~~(.+?)~~', '$1')
+    $value = [regex]::Replace($value, '(?<![\w*])\*([^*\r\n]+)\*(?![\w*])', '$1')
+    $value = [regex]::Replace($value, '(?<![\w_])_([^_\r\n]+)_(?![\w_])', '$1')
+  }
+  for ($index = 0; $index -lt $literals.Count; $index++) {
+    $token = "$([char]0xE000)$index$([char]0xE001)"
+    $value = $value.Replace($token, $literals[$index])
+  }
+  return $value.Trim()
+}
+
 function Sanitize-NotificationText {
   param(
     [string]$Text,
@@ -592,14 +674,37 @@ function Get-EventClassification {
 }
 
 function Get-RawNotification {
+  function Read-Utf8StandardInput {
+    $stream = $null
+    $reader = $null
+    try {
+      $stream = [Console]::OpenStandardInput()
+      # Never let BOM detection replace the strict decoder with UTF-16 or with
+      # a replacement-fallback UTF-8 instance. Decode one contract only, then
+      # remove an optional UTF-8 BOM after it has been validated as UTF-8.
+      $reader = New-Object System.IO.StreamReader($stream, $Utf8StrictNoBom, $false, 4096, $false)
+      $value = $reader.ReadToEnd()
+      if ($value.Length -gt 0 -and $value[0] -eq [char]0xFEFF) {
+        return $value.Substring(1)
+      }
+      return $value
+    } finally {
+      if ($null -ne $reader) {
+        $reader.Dispose()
+      } elseif ($null -ne $stream) {
+        $stream.Dispose()
+      }
+    }
+  }
+
   if ($HookEvent -or $ClaudeHook -or $ReadStdin) {
-    return [Console]::In.ReadToEnd()
+    return Read-Utf8StandardInput
   }
   if ($NotificationArgs.Count -gt 0) {
     return ($NotificationArgs -join ' ')
   }
   if ([Console]::IsInputRedirected) {
-    return [Console]::In.ReadToEnd()
+    return Read-Utf8StandardInput
   }
   return ''
 }
@@ -1154,6 +1259,49 @@ function Get-Utf8HeadLinesFast {
   }
 }
 
+function ConvertFrom-ReverseUtf8Chunk {
+  param(
+    [byte[]]$Buffer,
+    [int]$Count,
+    [byte[]]$RightPrefix
+  )
+
+  if ($Count -lt 0 -or $Count -gt $Buffer.Length) {
+    throw 'invalid reverse UTF-8 chunk length'
+  }
+  if ($null -eq $RightPrefix) { $RightPrefix = [byte[]]@() }
+  if ($RightPrefix.Length -gt 3) {
+    throw 'invalid UTF-8 continuation prefix'
+  }
+
+  $leadingContinuationCount = 0
+  while ($leadingContinuationCount -lt $Count -and
+      (($Buffer[$leadingContinuationCount] -band 0xC0) -eq 0x80)) {
+    $leadingContinuationCount++
+  }
+  if ($leadingContinuationCount -gt 3) {
+    throw 'invalid UTF-8 continuation prefix'
+  }
+
+  $bodyLength = $Count - $leadingContinuationCount
+  $decodeBytes = New-Object byte[] ($bodyLength + $RightPrefix.Length)
+  if ($bodyLength -gt 0) {
+    [Array]::Copy($Buffer, $leadingContinuationCount, $decodeBytes, 0, $bodyLength)
+  }
+  if ($RightPrefix.Length -gt 0) {
+    [Array]::Copy($RightPrefix, 0, $decodeBytes, $bodyLength, $RightPrefix.Length)
+  }
+
+  $nextPrefix = New-Object byte[] $leadingContinuationCount
+  if ($leadingContinuationCount -gt 0) {
+    [Array]::Copy($Buffer, 0, $nextPrefix, 0, $leadingContinuationCount)
+  }
+  return [pscustomobject]@{
+    text = $Utf8StrictNoBom.GetString($decodeBytes)
+    prefix = $nextPrefix
+  }
+}
+
 function Get-Utf8TailLinesFast {
   param(
     [string]$Path,
@@ -1169,18 +1317,24 @@ function Get-Utf8TailLinesFast {
     $buffer = New-Object byte[] 65536
     $position = [int64]$stream.Length
     $carry = ''
+    $rightPrefix = [byte[]]@()
     while ($position -gt 0 -and $reversed.Count -lt $MaxLines) {
       $count = [int][Math]::Min($buffer.Length, $position)
       $position -= $count
       [void]$stream.Seek($position, [IO.SeekOrigin]::Begin)
       $read = $stream.Read($buffer, 0, $count)
       if ($read -le 0) { break }
-      $combined = $Utf8NoBom.GetString($buffer, 0, $read) + $carry
+      $decoded = ConvertFrom-ReverseUtf8Chunk -Buffer $buffer -Count $read -RightPrefix $rightPrefix
+      $rightPrefix = [byte[]]$decoded.prefix
+      $combined = [string]$decoded.text + $carry
       $parts = $combined.Split([char]10)
       $carry = [string]$parts[0]
       for ($index = $parts.Length - 1; $index -ge 1 -and $reversed.Count -lt $MaxLines; $index--) {
         $reversed.Add(([string]$parts[$index]).TrimEnd([char]13))
       }
+    }
+    if ($position -eq 0 -and $rightPrefix.Length -gt 0) {
+      throw 'transcript begins with invalid UTF-8 continuation bytes'
     }
     if ($position -eq 0 -and $reversed.Count -lt $MaxLines -and -not [string]::IsNullOrEmpty($carry)) {
       $reversed.Add($carry.TrimEnd([char]13))
@@ -1334,6 +1488,7 @@ function Get-ClaudeGoalTranscriptState {
         $goalToken = '"goal_status"'
         $goalTokenOverlapLength = $goalToken.Length - 1
         $carry = ''
+        $rightPrefix = [byte[]]@()
         $lineOversize = $false
         $oversizeBoundary = ''
         $found = $false
@@ -1343,7 +1498,9 @@ function Get-ClaudeGoalTranscriptState {
           [void]$stream.Seek($position, [IO.SeekOrigin]::Begin)
           $read = $stream.Read($buffer, 0, $count)
           if ($read -le 0) { break }
-          $chunkText = $Utf8NoBom.GetString($buffer, 0, $read)
+          $decoded = ConvertFrom-ReverseUtf8Chunk -Buffer $buffer -Count $read -RightPrefix $rightPrefix
+          $rightPrefix = [byte[]]$decoded.prefix
+          $chunkText = [string]$decoded.text
           $parts = $chunkText.Split([char]10)
           if ($parts.Length -eq 1) {
             $piece = [string]$parts[0]
@@ -1431,6 +1588,9 @@ function Get-ClaudeGoalTranscriptState {
               $carry = ''
             }
           }
+        }
+        if (-not $limited -and $position -eq 0 -and $rightPrefix.Length -gt 0) {
+          throw 'transcript begins with invalid UTF-8 continuation bytes'
         }
         if (-not $found -and $position -eq 0) {
           # At the beginning of the file an oversize record without the token is
@@ -1550,7 +1710,8 @@ function New-NtfyPayload {
     if ($Config.markdown) {
       $summary = Sanitize-NotificationText -Text $rawMessage -MaxLength $Config.maxMessageChars -PreserveLines
     } else {
-      $summary = Sanitize-NotificationText -Text $rawMessage -MaxLength $Config.maxMessageChars
+      $plainMessage = Convert-MarkdownToPlainText -Text $rawMessage
+      $summary = Sanitize-NotificationText -Text $plainMessage -MaxLength $Config.maxMessageChars
     }
   }
   $separator = if ($Config.markdown -and -not [string]::IsNullOrWhiteSpace($summary)) { "`n`n" } else { " $MiddleDot " }
@@ -1831,6 +1992,7 @@ function Move-ToSuppressedCore {
     thread_id = $Record.thread_id
     turn_id = $Record.turn_id
     origin = $Record.origin
+    candidate_revision = [string](Get-ObjectValue $Record 'candidate_revision' '')
     suppressed_at = [DateTimeOffset]::UtcNow.ToString('o')
     reason = $Reason
   }
@@ -1850,6 +2012,24 @@ function Move-ToSuppressed {
     } -Arguments @($Path, $Record, $Reason))
 }
 
+function Test-ClaudeSessionHasPendingRecord {
+  param([string]$SessionKey)
+
+  foreach ($file in @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+    try {
+      $record = Read-JsonFile -Path $file.FullName
+      if ([string](Get-ObjectValue $record 'provider' '') -ne 'claude') { continue }
+      $info = Get-ClaudeSessionStateInfo -SessionId ([string](Get-ObjectValue $record 'thread_id' ''))
+      if ($null -ne $info -and $info.key -eq $SessionKey) { return $true }
+    } catch {
+      # An unreadable pending record may still reference this session. Preserve
+      # state until the delivery worker has dead-lettered the bad record.
+      return $true
+    }
+  }
+  return $false
+}
+
 function Clean-RuntimeState {
   param(
     [int]$ReceiptRetentionDays,
@@ -1866,9 +2046,22 @@ function Clean-RuntimeState {
   Get-ChildItem -LiteralPath $DeadDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTimeUtc -lt $deadCutoff } |
     Remove-Item -Force -ErrorAction SilentlyContinue
-  Get-ChildItem -LiteralPath $ClaudeSessionsDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.LastWriteTimeUtc -lt $cutoff } |
-    Remove-Item -Force -ErrorAction SilentlyContinue
+  foreach ($sessionFile in @(Get-ChildItem -LiteralPath $ClaudeSessionsDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTimeUtc -lt $cutoff })) {
+    $sessionInfo = [pscustomobject]@{
+      key = $sessionFile.BaseName
+      path = $sessionFile.FullName
+      lock_path = Join-Path $ClaudeSessionsDir ($sessionFile.BaseName + '.lock')
+    }
+    [void](Invoke-WithClaudeSessionLock -Info $sessionInfo -Action {
+        param($lockedInfo, $lockedCutoff)
+        if (-not (Test-Path -LiteralPath $lockedInfo.path -PathType Leaf)) { return }
+        $current = Get-Item -LiteralPath $lockedInfo.path -ErrorAction Stop
+        if ($current.LastWriteTimeUtc -ge $lockedCutoff) { return }
+        if (Test-ClaudeSessionHasPendingRecord -SessionKey $lockedInfo.key) { return }
+        Remove-Item -LiteralPath $lockedInfo.path -Force -ErrorAction SilentlyContinue
+      } -Arguments @($sessionInfo, $cutoff))
+  }
 
   # Versions before 2.4.3 left one zero-byte lock per completion in the state
   # root. New code uses 256 lock shards in mutation-locks instead.
@@ -3890,7 +4083,9 @@ function Commit-PendingRecord {
     return Invoke-PendingRecordCommit -Path $Path -Record $Record -Promote:$Promote
   }
   $sessionInfo = Get-ClaudeSessionStateInfo -SessionId ([string](Get-ObjectValue $Record 'thread_id' ''))
-  if ($null -eq $sessionInfo) { return [pscustomobject]@{ status = 'session-unverifiable' } }
+  if ($null -eq $sessionInfo) {
+    return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $Path -Record $Record
+  }
   return Invoke-WithClaudeSessionLock -Info $sessionInfo -Action {
     param($lockedInfo, $lockedPath, $lockedRecord, $shouldPromote)
     $sessionState = $null
@@ -3899,7 +4094,7 @@ function Commit-PendingRecord {
     }
     $disposition = Get-ClaudeSessionCommitDisposition -Record $lockedRecord -SessionState $sessionState
     if ($disposition -eq 'unverifiable') {
-      return [pscustomobject]@{ status = 'session-unverifiable' }
+      return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $lockedPath -Record $lockedRecord
     }
     if ($disposition -eq 'stale') {
       $discard = Discard-PendingRecord -Path $lockedPath -Record $lockedRecord
@@ -3910,6 +4105,47 @@ function Commit-PendingRecord {
     }
     return Invoke-PendingRecordCommit -Path $lockedPath -Record $lockedRecord -Promote:$shouldPromote
   } -Arguments @($sessionInfo, $Path, $Record, [bool]$Promote)
+}
+
+function Suppress-ClaudeSessionUnverifiablePendingRecord {
+  param(
+    [string]$Path,
+    [object]$Record
+  )
+
+  return Invoke-WithRecordMutationLock -Key ([string]$Record.key) -Action {
+    param($lockedPath, $incomingRecord)
+    $suppressedPath = Join-Path $SuppressedDir ([string]$incomingRecord.key + '.json')
+    if (-not (Test-Path -LiteralPath $lockedPath)) {
+      if (Test-Path -LiteralPath $suppressedPath -PathType Leaf) {
+        try {
+          $receipt = Read-JsonFile -Path $suppressedPath
+          if ([string](Get-ObjectValue $receipt 'reason' '') -eq 'claude-session-unverifiable') {
+            return [pscustomobject]@{ status = 'already-session-suppressed' }
+          }
+        } catch {}
+      }
+      return [pscustomobject]@{ status = 'missing' }
+    }
+
+    $canonical = Read-JsonFile -Path $lockedPath
+    Assert-QueuedRecord -Record $canonical -ExpectedKey ([string]$incomingRecord.key)
+    $sameClaudeTurn =
+      [string](Get-ObjectValue $canonical 'provider' '') -eq 'claude' -and
+      [string](Get-ObjectValue $canonical 'thread_id' '') -eq [string](Get-ObjectValue $incomingRecord 'thread_id' '') -and
+      [string](Get-ObjectValue $canonical 'turn_id' '') -eq [string](Get-ObjectValue $incomingRecord 'turn_id' '')
+    if (-not $sameClaudeTurn) {
+      Set-RecordValue -Record $canonical -Name 'last_error' -Value 'Claude session identity changed during terminal suppression'
+      Move-ToDeadLetter -Path $lockedPath -Record $canonical
+      return [pscustomobject]@{ status = 'invalid-session-record' }
+    }
+
+    # Intentionally suppress the current canonical revision. A same-prompt Stop
+    # refresh cannot repair a missing or corrupt session state while the caller
+    # owns the session lock, and retrying it could incorrectly promote epoch 0.
+    Move-ToSuppressedCore -Path $lockedPath -Record $canonical -Reason 'claude-session-unverifiable'
+    return [pscustomobject]@{ status = 'session-unverifiable-suppressed' }
+  } -Arguments @($Path, $Record)
 }
 
 function Discard-PendingRecord {
@@ -4081,10 +4317,14 @@ function Process-PendingCandidates {
         Set-RecordValue -Record $record -Name 'next_attempt_unix_ms' -Value ([int64]$gate.retryAtUnixMs)
         Set-RecordValue -Record $record -Name 'gate_reason' -Value $gate.reason
         $commit = Commit-PendingRecord -Path $file.FullName -Record $record
-        if ($null -eq $nextDue -or [int64]$gate.retryAtUnixMs -lt $nextDue) { $nextDue = [int64]$gate.retryAtUnixMs }
-        if ($commit.status -in @('stop-won', 'stale-snapshot')) { $nextDue = $now }
-        if ($commit.status -eq 'stale-session') {
+        if ($commit.status -eq 'updated') {
+          if ($null -eq $nextDue -or [int64]$gate.retryAtUnixMs -lt $nextDue) { $nextDue = [int64]$gate.retryAtUnixMs }
+        } elseif ($commit.status -in @('stop-won', 'stale-snapshot')) {
+          $nextDue = $now
+        } elseif ($commit.status -eq 'stale-session') {
           Write-RuntimeLog "discarded stale Claude candidate after prompt epoch changed key=$($record.key.Substring(0, 12))"
+        } elseif ($commit.status -in @('session-unverifiable-suppressed', 'already-session-suppressed')) {
+          Write-RuntimeLog "suppressed Claude candidate with unverifiable session state key=$($record.key.Substring(0, 12))"
         }
         $promote = $false
         break
@@ -4100,16 +4340,23 @@ function Process-PendingCandidates {
       if (-not [string]::IsNullOrWhiteSpace($testMarker)) {
         [System.IO.File]::WriteAllText($testMarker, [string]$record.candidate_revision, $Utf8NoBom)
       }
-      Start-Sleep -Milliseconds ([Math]::Min(10000, $testPromoteDelayMs))
+      $testRelease = [string]$env:CODEX_NTFY_TEST_BEFORE_PROMOTE_RELEASE
+      if (-not [string]::IsNullOrWhiteSpace($testRelease)) {
+        $testDeadline = [DateTimeOffset]::UtcNow.AddMilliseconds([Math]::Min(10000, $testPromoteDelayMs))
+        while (-not (Test-Path -LiteralPath $testRelease) -and [DateTimeOffset]::UtcNow -lt $testDeadline) {
+          Start-Sleep -Milliseconds 25
+        }
+      } else {
+        Start-Sleep -Milliseconds ([Math]::Min(10000, $testPromoteDelayMs))
+      }
     }
     $commit = Commit-PendingRecord -Path $file.FullName -Record $record -Promote
     if ($commit.status -in @('promoted', 'already-promoted')) {
       Write-RuntimeLog "idle candidate promoted key=$($record.key.Substring(0, 12)) reason=$($gate.reason)"
     } elseif ($commit.status -in @('stop-won', 'stale-snapshot')) {
       if ($null -eq $nextDue -or $now -lt $nextDue) { $nextDue = $now }
-    } elseif ($commit.status -eq 'session-unverifiable') {
-      $sessionRetryAt = $now + 500
-      if ($null -eq $nextDue -or $sessionRetryAt -lt $nextDue) { $nextDue = $sessionRetryAt }
+    } elseif ($commit.status -in @('session-unverifiable-suppressed', 'already-session-suppressed')) {
+      Write-RuntimeLog "suppressed Claude candidate with unverifiable session state key=$($record.key.Substring(0, 12))"
     } elseif ($commit.status -eq 'stale-session') {
       Write-RuntimeLog "discarded stale Claude candidate before promotion key=$($record.key.Substring(0, 12))"
     }
