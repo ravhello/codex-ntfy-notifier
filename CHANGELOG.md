@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-07-18
+
+### Fixed
+
+- Windows cold lifecycle probes now parse relevant rollout records structurally in C# one line at a time and return a fixed 23-field summary. Large Codex conversations no longer marshal their complete lifecycle history back into PowerShell and deserialize every record a second time before a pending completion can be evaluated; an incomplete final JSONL record returns a bounded busy summary without invoking the full compatibility parser.
+- The conservative incremental rollout fallback now processes 64 KiB chunks while retaining at most one capped incomplete line, instead of repeatedly concatenating the complete unread tail; descendant lifecycle checks use the same fixed-size native summary on their normal path.
+- WSL/Linux probes check the snapshot's final byte before materializing unread data, so a large half-written JSONL record remains pending without allocating or rescanning the complete tail.
+- Windows and WSL/Linux lifecycle probes now fail closed on malformed UTF-8, invalid lifecycle shapes, missing string turn IDs, and incomplete trailing JSONL records in both root and active descendant rollouts. A corrupt or half-written later turn can no longer release an earlier completion, even when balanced fallback is enabled.
+- Summary message limits no longer split a UTF-16 surrogate pair, and message-disabled native or incremental probes retain only presence facts rather than private assistant text; changing the privacy mode forces a safe replay instead of reusing incompatible cached state.
+- A latest-only probe cached while checking descendants now retains its terminal turn and event type, so a later turn-less `Stop` can still recover the completed root turn.
+- Remote-scan timeout accounting now starts after the child process has actually been created, so slow PowerShell startup is not incorrectly charged against the remote scan's runtime budget.
+
 ## [2.5.1] - 2026-07-18
 
 ### Changed
@@ -209,7 +221,8 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.1...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.2...HEAD
+[2.5.2]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.2
 [2.5.1]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.1
 [2.5.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.0
 [2.4.3]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.4.3

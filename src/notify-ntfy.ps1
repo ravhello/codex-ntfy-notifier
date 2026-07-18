@@ -32,7 +32,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.5.1'
+$ScriptVersion = '2.5.2'
 $MaxNtfyMessageBytes = 3500
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
@@ -76,6 +76,7 @@ $Utf8StrictNoBom = New-Object System.Text.UTF8Encoding($false, $true)
 $script:ClaudeGoalStateCache = @{}
 $ClaudePromptBaselineMaxBytes = [int64](1024 * 1024)
 $ClaudeGoalMaxLineBytes = 1024 * 1024
+$MaxFallbackRolloutLineBytes = 8 * 1024 * 1024
 
 function Ensure-RuntimeDirectories {
   foreach ($path in @($StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir, $DeadDir, $MutationLocksDir, $ClaudeSessionsDir)) {
@@ -2127,12 +2128,44 @@ function Initialize-WinSqlite {
   if ($null -ne ([System.Management.Automation.PSTypeName]'CodexNtfyWinSqlite').Type) {
     return
   }
-  Add-Type -TypeDefinition @'
+  Add-Type -ReferencedAssemblies 'System.Web.Extensions' -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Web.Script.Serialization;
+
+public sealed class CodexNtfyLimitedReadStream : Stream {
+    private readonly Stream inner;
+    private long remaining;
+
+    public CodexNtfyLimitedReadStream(Stream inner, long length) {
+        if (inner == null) throw new ArgumentNullException("inner");
+        this.inner = inner;
+        this.remaining = Math.Max(0, length);
+    }
+
+    public override bool CanRead { get { return inner.CanRead; } }
+    public override bool CanSeek { get { return false; } }
+    public override bool CanWrite { get { return false; } }
+    public override long Length { get { throw new NotSupportedException(); } }
+    public override long Position {
+        get { throw new NotSupportedException(); }
+        set { throw new NotSupportedException(); }
+    }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, int offset, int count) {
+        if (remaining <= 0) return 0;
+        int requested = (int)Math.Min((long)count, remaining);
+        int read = inner.Read(buffer, offset, requested);
+        remaining -= read;
+        return read;
+    }
+    public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+    public override void SetLength(long value) { throw new NotSupportedException(); }
+    public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+}
 
 public static class CodexNtfyWinSqlite {
     private const int SQLITE_OK = 0;
@@ -2249,71 +2282,103 @@ public static class CodexNtfyWinSqlite {
         }
     }
 
-    private static string JsonString(string line, string name, int startIndex) {
-        string token = "\"" + name + "\"";
-        int key = line.IndexOf(token, Math.Max(0, startIndex), StringComparison.Ordinal);
-        if (key < 0) return String.Empty;
-        int colon = line.IndexOf(':', key + token.Length);
-        if (colon < 0) return String.Empty;
-        int index = colon + 1;
-        while (index < line.Length && Char.IsWhiteSpace(line[index])) index++;
-        if (index >= line.Length || line[index] != '"') return String.Empty;
-        index++;
-        StringBuilder value = new StringBuilder();
-        bool escaped = false;
-        bool closed = false;
-        for (; index < line.Length; index++) {
-            char current = line[index];
-            if (escaped) {
-                value.Append(current);
-                escaped = false;
-            } else if (current == '\\') {
-                escaped = true;
-            } else if (current == '"') {
-                closed = true;
-                break;
-            } else {
-                value.Append(current);
+    private static int TryParseLifecyclePayload(JavaScriptSerializer serializer, string line, out Dictionary<string, object> payload) {
+        payload = null;
+        try {
+            Dictionary<string, object> envelope = serializer.DeserializeObject(line) as Dictionary<string, object>;
+            if (envelope == null) return 0;
+            object envelopeType;
+            if (!envelope.TryGetValue("type", out envelopeType) || !String.Equals(envelopeType as string, "event_msg", StringComparison.Ordinal))
+                return 0;
+            object payloadValue;
+            if (!envelope.TryGetValue("payload", out payloadValue)) return -1;
+            payload = payloadValue as Dictionary<string, object>;
+            return payload == null ? -1 : 1;
+        } catch {
+            return -1;
+        }
+    }
+
+    private static string JsonString(Dictionary<string, object> values, params string[] names) {
+        if (values == null) return String.Empty;
+        foreach (string name in names) {
+            object value;
+            if (values.TryGetValue(name, out value)) {
+                string text = value as string;
+                if (text != null) return text;
             }
         }
-        return closed ? value.ToString() : String.Empty;
+        return String.Empty;
+    }
+
+    private static string SummaryMessage(Dictionary<string, object> payload, bool includeMessage) {
+        string message = JsonString(payload, "last_agent_message", "last-assistant-message", "last_assistant_message");
+        if (String.IsNullOrWhiteSpace(message)) return String.Empty;
+        if (!includeMessage) return "1";
+        if (message.Length <= 8192) return message;
+        int length = 8192;
+        if (Char.IsHighSurrogate(message[length - 1]) && Char.IsLowSurrogate(message[length])) length--;
+        return message.Substring(0, length);
     }
 
     public static string[] ScanLifecycleSummary(string path, string candidateTurnId) {
+        return ScanLifecycleSummary(path, candidateTurnId, true);
+    }
+
+    public static string[] ScanLifecycleSummary(string path, string candidateTurnId, bool includeMessage) {
         FileInfo before = new FileInfo(path);
         long initialLength = before.Length;
         long initialTicks = before.LastWriteTimeUtc.Ticks;
         long sequence = 0;
         long candidateSequence = 0;
         string candidateType = String.Empty;
-        string candidateLine = String.Empty;
+        string candidateMessage = String.Empty;
         long candidateCompletedSequence = 0;
         long candidateAbortedSequence = 0;
-        string candidateCompletedLine = String.Empty;
-        string candidateAbortedLine = String.Empty;
+        string candidateCompletedMessage = String.Empty;
+        string candidateAbortedMessage = String.Empty;
         bool candidateUserMessage = false;
         bool candidateFinalMessage = false;
         string currentTurn = String.Empty;
         string latestTerminalType = String.Empty;
         string latestTerminalTurn = String.Empty;
-        string latestTerminalLine = String.Empty;
+        string latestTerminalMessage = String.Empty;
         long latestTerminalSequence = 0;
+        bool latestTerminalUserMessage = false;
         string goalStatus = String.Empty;
         Dictionary<string, long> openTurns = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-        HashSet<string> userMessageTurns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        List<string> lifecycleLines = new List<string>();
+        Dictionary<string, bool> openTurnUserMessages = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        JavaScriptSerializer serializer = new JavaScriptSerializer();
+        serializer.MaxJsonLength = Int32.MaxValue;
+        serializer.RecursionLimit = 256;
 
         if (initialLength > 0) {
             using (FileStream tail = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
                 tail.Seek(initialLength - 1, SeekOrigin.Begin);
-                if (tail.ReadByte() != 10) return new string[0];
+                if (tail.ReadByte() != 10) {
+                    FileInfo incompleteAfter = new FileInfo(path);
+                    return new[] {
+                        String.Empty, String.Empty, "0", "0", "0",
+                        String.Empty, String.Empty, String.Empty, "0", String.Empty, "0", String.Empty,
+                        initialLength.ToString(), initialTicks.ToString(), incompleteAfter.Length.ToString(),
+                        incompleteAfter.LastWriteTimeUtc.Ticks.ToString(),
+                        new DateTimeOffset(incompleteAfter.LastWriteTimeUtc).ToUnixTimeMilliseconds().ToString(),
+                        "0", "0", "0", String.Empty, String.Empty, "1"
+                    };
+                }
             }
         }
 
         using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-        using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true, 65536)) {
+        using (CodexNtfyLimitedReadStream snapshot = new CodexNtfyLimitedReadStream(stream, initialLength))
+        using (StreamReader reader = new StreamReader(snapshot, new UTF8Encoding(false, true), false, 65536)) {
             string line;
+            bool firstLine = true;
             while ((line = reader.ReadLine()) != null) {
+                if (firstLine) {
+                    firstLine = false;
+                    if (line.Length > 0 && line[0] == '\uFEFF') line = line.Substring(1);
+                }
                 if (line.IndexOf("\"event_msg\"", StringComparison.Ordinal) < 0 ||
                     line.IndexOf("\"payload\"", StringComparison.Ordinal) < 0) continue;
                 if (line.IndexOf("\"task_started\"", StringComparison.Ordinal) < 0 &&
@@ -2321,48 +2386,77 @@ public static class CodexNtfyWinSqlite {
                     line.IndexOf("\"turn_aborted\"", StringComparison.Ordinal) < 0 &&
                     line.IndexOf("\"user_message\"", StringComparison.Ordinal) < 0 &&
                     line.IndexOf("\"thread_goal_updated\"", StringComparison.Ordinal) < 0) continue;
-                lifecycleLines.Add(line);
-                int payloadAt = line.IndexOf("\"payload\"", StringComparison.Ordinal);
-                string eventType = JsonString(line, "type", payloadAt);
+                Dictionary<string, object> payload;
+                int parseStatus = TryParseLifecyclePayload(serializer, line, out payload);
+                // A malformed line that advertises a lifecycle marker must not
+                // close an open turn or otherwise mutate the gate summary.
+                // Returning no summary makes PowerShell use the conservative
+                // streaming fallback for this snapshot.
+                if (parseStatus < 0) return new string[0];
+                if (parseStatus == 0) continue;
+                string eventType = JsonString(payload, "type");
+                if (String.IsNullOrWhiteSpace(eventType)) return new string[0];
+                eventType = eventType.Trim();
                 if (eventType != "task_started" && eventType != "task_complete" &&
                     eventType != "turn_aborted" && eventType != "user_message" &&
                     eventType != "thread_goal_updated") continue;
                 sequence++;
-                string turnId = JsonString(line, "turn_id", payloadAt);
-                if (String.IsNullOrEmpty(turnId)) turnId = JsonString(line, "turn-id", payloadAt);
-                if (eventType == "task_started" && !String.IsNullOrEmpty(turnId)) {
+                string turnId = JsonString(payload, "turn_id", "turn-id", "turnId");
+                if ((eventType == "task_started" || eventType == "task_complete" || eventType == "turn_aborted") &&
+                    String.IsNullOrWhiteSpace(turnId)) return new string[0];
+                turnId = turnId.Trim();
+                if (eventType == "task_started") {
                     openTurns[turnId] = sequence;
+                    if (!openTurnUserMessages.ContainsKey(turnId)) openTurnUserMessages[turnId] = false;
                     currentTurn = turnId;
                 } else if (eventType == "user_message") {
                     if (!String.IsNullOrEmpty(currentTurn)) {
-                        userMessageTurns.Add(currentTurn);
+                        if (openTurnUserMessages.ContainsKey(currentTurn)) openTurnUserMessages[currentTurn] = true;
                         if (String.Equals(currentTurn, candidateTurnId, StringComparison.OrdinalIgnoreCase))
                             candidateUserMessage = true;
                     }
-                } else if ((eventType == "task_complete" || eventType == "turn_aborted") && !String.IsNullOrEmpty(turnId)) {
+                } else if (eventType == "task_complete" || eventType == "turn_aborted") {
+                    string terminalMessage = SummaryMessage(payload, includeMessage);
+                    bool terminalUserMessage = false;
+                    openTurnUserMessages.TryGetValue(turnId, out terminalUserMessage);
+                    if (String.Equals(turnId, candidateTurnId, StringComparison.OrdinalIgnoreCase) && candidateUserMessage)
+                        terminalUserMessage = true;
+                    if (String.Equals(turnId, latestTerminalTurn, StringComparison.OrdinalIgnoreCase) && latestTerminalUserMessage)
+                        terminalUserMessage = true;
                     openTurns.Remove(turnId);
+                    openTurnUserMessages.Remove(turnId);
                     latestTerminalType = eventType;
                     latestTerminalTurn = turnId;
-                    latestTerminalLine = line;
+                    latestTerminalMessage = terminalMessage;
                     latestTerminalSequence = sequence;
+                    latestTerminalUserMessage = terminalUserMessage;
                     if (String.Equals(turnId, candidateTurnId, StringComparison.OrdinalIgnoreCase)) {
+                        candidateUserMessage = candidateUserMessage || terminalUserMessage;
                         candidateType = eventType;
-                        candidateLine = line;
+                        candidateMessage = terminalMessage;
                         candidateSequence = sequence;
-                        candidateFinalMessage = eventType == "turn_aborted";
+                        candidateFinalMessage = eventType == "turn_aborted" || !String.IsNullOrEmpty(terminalMessage);
                         if (eventType == "task_complete") {
                             candidateCompletedSequence = sequence;
-                            candidateCompletedLine = line;
+                            candidateCompletedMessage = terminalMessage;
                         } else {
                             candidateAbortedSequence = sequence;
-                            candidateAbortedLine = line;
+                            candidateAbortedMessage = terminalMessage;
                         }
                     }
                     if (String.Equals(currentTurn, turnId, StringComparison.OrdinalIgnoreCase)) currentTurn = String.Empty;
                 } else if (eventType == "thread_goal_updated") {
-                    int goalAt = line.IndexOf("\"goal\"", payloadAt, StringComparison.Ordinal);
-                    string status = JsonString(line, "status", goalAt < 0 ? payloadAt : goalAt);
-                    if (!String.IsNullOrWhiteSpace(status)) goalStatus = status.ToLowerInvariant();
+                    object goalValue;
+                    Dictionary<string, object> goal = payload.TryGetValue("goal", out goalValue)
+                        ? goalValue as Dictionary<string, object>
+                        : null;
+                    string status = JsonString(goal, "status");
+                    if (String.IsNullOrWhiteSpace(status)) return new string[0];
+                    status = status.Trim().ToLowerInvariant();
+                    if (status != "active" && status != "paused" && status != "blocked" &&
+                        status != "usage_limited" && status != "budget_limited" && status != "complete")
+                        return new string[0];
+                    goalStatus = status;
                 }
             }
         }
@@ -2377,16 +2471,15 @@ public static class CodexNtfyWinSqlite {
         }
         FileInfo after = new FileInfo(path);
         List<string> result = new List<string>(new[] {
-            candidateType, candidateLine, candidateUserMessage ? "1" : "0", candidateFinalMessage ? "1" : "0",
-            candidateSequence.ToString(), latestTerminalType, latestTerminalTurn, latestTerminalLine,
+            candidateType, candidateMessage, candidateUserMessage ? "1" : "0", candidateFinalMessage ? "1" : "0",
+            candidateSequence.ToString(), latestTerminalType, latestTerminalTurn, latestTerminalMessage,
             latestTerminalSequence.ToString(), openLaterTurn, openLaterSequence.ToString(), goalStatus,
             initialLength.ToString(), initialTicks.ToString(), after.Length.ToString(), after.LastWriteTimeUtc.Ticks.ToString(),
             new DateTimeOffset(after.LastWriteTimeUtc).ToUnixTimeMilliseconds().ToString(),
-            userMessageTurns.Contains(latestTerminalTurn) ? "1" : "0",
+            latestTerminalUserMessage ? "1" : "0",
             candidateCompletedSequence.ToString(), candidateAbortedSequence.ToString(),
-            candidateCompletedLine, candidateAbortedLine
+            candidateCompletedMessage, candidateAbortedMessage, "0"
         });
-        result.AddRange(lifecycleLines);
         return result.ToArray();
     }
 }
@@ -2645,10 +2738,10 @@ function Get-ActiveDescendants {
   $threadId = [string](Get-ObjectValue $Record 'thread_id' '')
   $descendants = Get-DescendantThreadIds -ThreadId $threadId -SqliteHome $SqliteHome
   if (-not $descendants.ok) {
-    return [pscustomobject]@{ ok = $false; busy = $false; count = 0; error = $descendants.error }
+    return [pscustomobject]@{ ok = $false; busy = $false; count = 0; invalidEvidence = $false; error = $descendants.error }
   }
   if (-not $descendants.available -or @($descendants.entries).Count -eq 0) {
-    return [pscustomobject]@{ ok = $true; busy = $false; count = 0; error = '' }
+    return [pscustomobject]@{ ok = $true; busy = $false; count = 0; invalidEvidence = $false; error = '' }
   }
   $orphanMs = [int64]([Math]::Max(0, $Config.subagentOrphanSeconds) * 1000)
   $unknownSince = @{}
@@ -2679,7 +2772,7 @@ function Get-ActiveDescendants {
     }
     $childInfo = Get-ThreadDatabaseInfo -ThreadId $childId -SqliteHome $SqliteHome -SessionHome $SessionHome
     if (-not $childInfo.ok) {
-      return [pscustomobject]@{ ok = $false; busy = $false; count = $active; error = $childInfo.error }
+      return [pscustomobject]@{ ok = $false; busy = $false; count = $active; invalidEvidence = $false; error = $childInfo.error }
     }
     $rolloutPath = if ($childInfo.found) { [string]$childInfo.rolloutPath } else { '' }
     if ([string]::IsNullOrWhiteSpace($rolloutPath)) {
@@ -2708,9 +2801,28 @@ function Get-ActiveDescendants {
         # The authoritative probe below retains strict unknown/error semantics.
       }
     }
-    $probe = Update-RolloutProbe -Path $rolloutPath
+    $childProbeCacheKey = $rolloutPath.ToLowerInvariant()
+    $cachedChildProbe = if ($script:RolloutProbeCache.ContainsKey($childProbeCacheKey)) { $script:RolloutProbeCache[$childProbeCacheKey] } else { $null }
+    $probe = if ($null -ne $cachedChildProbe -and
+        [string](Get-ObjectValue $cachedChildProbe 'summaryCandidateTurnId' '') -eq '') {
+      Update-RolloutProbe -Path $rolloutPath -IncludeMessage $false
+    } else {
+      Get-FastRolloutLatestProbe -Path $rolloutPath
+    }
     if (-not $probe.ok) {
-      return [pscustomobject]@{ ok = $false; busy = $false; count = $active; error = $probe.error }
+      # Preserve future-format and partial-line compatibility without putting
+      # the ordinary large-rollout path through PowerShell JSON conversion.
+      $probe = Update-RolloutProbe -Path $rolloutPath -IncludeMessage $false
+    }
+    if (-not $probe.ok) {
+      $invalidEvidence = $null -ne $probe.state -and
+        [bool](Get-ObjectValue $probe.state 'invalidLifecycle' $false)
+      return [pscustomobject]@{ ok = $false; busy = $false; count = $active; invalidEvidence = $invalidEvidence; error = $probe.error }
+    }
+    if ([bool](Get-ObjectValue $probe.state 'snapshotChanged' $false) -or
+        [bool](Get-ObjectValue $probe.state 'incompleteTail' $false)) {
+      $active++
+      continue
     }
     $lifecycle = [string](Get-ObjectValue $probe.state 'lastLifecycleType' 'unknown')
     $modifiedMs = [int64](Get-ObjectValue $probe.state 'modifiedUnixMs' 0)
@@ -2727,7 +2839,7 @@ function Get-ActiveDescendants {
     }
   }
   Set-RecordValue -Record $Record -Name 'descendant_unknown_since' -Value $unknownSince
-  return [pscustomobject]@{ ok = $true; busy = $active -gt 0; count = $active; error = '' }
+  return [pscustomobject]@{ ok = $true; busy = $active -gt 0; count = $active; invalidEvidence = $false; error = '' }
 }
 
 function New-RolloutProbeState {
@@ -2751,11 +2863,107 @@ function New-RolloutProbeState {
     goalStatus = ''
     modifiedUnixMs = [int64]0
     snapshotChanged = $false
+    summaryCandidateTurnId = ''
+    summaryIncludedMessage = $false
+    incompleteTail = $false
+    invalidLifecycle = $false
+  }
+}
+
+function Update-RolloutProbeStateFromLine {
+  param(
+    [object]$State,
+    [string]$Line,
+    [bool]$IncludeMessage = $false
+  )
+
+  if ($Line -notmatch '"(?:task_started|task_complete|turn_aborted|thread_goal_updated|user_message)"') { return }
+  try {
+    $item = $Line | ConvertFrom-Json -ErrorAction Stop
+    if ([string](Get-ObjectValue $item 'type' '') -ne 'event_msg') { return }
+    $payload = Get-ObjectValue $item 'payload'
+    if ($null -eq $payload) {
+      $State.invalidLifecycle = $true
+      return
+    }
+    $payloadTypeProperty = $payload.PSObject.Properties['type']
+    if ($null -eq $payloadTypeProperty) {
+      $State.invalidLifecycle = $true
+      return
+    }
+    if ($payloadTypeProperty.Value -isnot [string]) {
+      $State.invalidLifecycle = $true
+      return
+    }
+    $eventType = ([string]$payloadTypeProperty.Value).Trim()
+    if ($eventType -notin @('task_started', 'task_complete', 'turn_aborted', 'user_message', 'thread_goal_updated')) { return }
+    $rawTurn = Get-FirstObjectValue $payload @('turn_id', 'turn-id', 'turnId')
+    if ($eventType -in @('task_started', 'task_complete', 'turn_aborted') -and $rawTurn -isnot [string]) {
+      $State.invalidLifecycle = $true
+      return
+    }
+    $turn = ([string]$rawTurn).Trim()
+    if ($eventType -in @('task_started', 'task_complete', 'turn_aborted') -and
+        [string]::IsNullOrWhiteSpace($turn)) {
+      $State.invalidLifecycle = $true
+      return
+    }
+    if ($eventType -eq 'thread_goal_updated') {
+      $goal = Get-ObjectValue $payload 'goal'
+      $rawStatus = Get-ObjectValue $goal 'status'
+      $status = ([string]$rawStatus).Trim().ToLowerInvariant()
+      if ($null -eq $goal -or $rawStatus -isnot [string] -or [string]::IsNullOrWhiteSpace($status) -or
+          $status -notin @('active', 'paused', 'blocked', 'usage_limited', 'budget_limited', 'complete')) {
+        $State.invalidLifecycle = $true
+        return
+      }
+    }
+    $State.sequence = [int64]$State.sequence + 1
+    if ($eventType -eq 'task_started') {
+      $State.openTurns[$turn] = [int64]$State.sequence
+      $State.lastLifecycleType = 'task_started'
+      $State.lastLifecycleTurnId = $turn
+      $State.currentTurnId = $turn
+    } elseif ($eventType -eq 'task_complete' -and -not [string]::IsNullOrWhiteSpace($turn)) {
+      [void]$State.openTurns.Remove($turn)
+      $State.completedTurns[$turn] = [int64]$State.sequence
+      $State.terminalTurns[$turn] = [int64]$State.sequence
+      $State.terminalEventTypes[$turn] = 'task_complete'
+      $State.lastLifecycleType = 'task_complete'
+      $State.lastLifecycleTurnId = $turn
+      $lastAgentMessage = [string](Get-FirstObjectValue $payload @('last_agent_message', 'last-assistant-message', 'last_assistant_message'))
+      $State.terminalMessages[$turn] = if ($IncludeMessage) {
+        Sanitize-NotificationText -Text $lastAgentMessage -MaxLength 4000 -PreserveLines
+      } else { '' }
+      if (-not [string]::IsNullOrWhiteSpace($lastAgentMessage)) { $State.finalMessageTurns[$turn] = $true }
+      if ([string]$State.currentTurnId -eq $turn) { $State.currentTurnId = '' }
+    } elseif ($eventType -eq 'turn_aborted' -and -not [string]::IsNullOrWhiteSpace($turn)) {
+      [void]$State.openTurns.Remove($turn)
+      $State.abortedTurns[$turn] = [int64]$State.sequence
+      $State.terminalTurns[$turn] = [int64]$State.sequence
+      $State.terminalEventTypes[$turn] = 'turn_aborted'
+      $State.terminalMessages[$turn] = ''
+      $State.lastLifecycleType = 'turn_aborted'
+      $State.lastLifecycleTurnId = $turn
+      $State.finalMessageTurns[$turn] = $true
+      if ([string]$State.currentTurnId -eq $turn) { $State.currentTurnId = '' }
+    } elseif ($eventType -eq 'user_message' -and -not [string]::IsNullOrWhiteSpace([string]$State.currentTurnId)) {
+      $State.userMessageTurns[[string]$State.currentTurnId] = $true
+    } elseif ($eventType -eq 'thread_goal_updated') {
+      $State.goalStatus = $status
+    }
+  } catch {
+    # A newline-terminated record that advertises a lifecycle event but cannot
+    # be parsed is not safe evidence of idleness.
+    $State.invalidLifecycle = $true
   }
 }
 
 function Update-RolloutProbe {
-  param([string]$Path)
+  param(
+    [string]$Path,
+    [bool]$IncludeMessage = $false
+  )
 
   if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
     return [pscustomobject]@{ ok = $false; state = $null; error = 'rollout missing' }
@@ -2766,8 +2974,15 @@ function Update-RolloutProbe {
   } else {
     New-RolloutProbeState -Path $Path
   }
+  # A message-disabled probe must not retain text collected by an earlier
+  # message-enabled pass. Conversely, presence markers cannot reconstruct text
+  # if the setting is later enabled, so a privacy-mode change requires replay.
+  if ([bool](Get-ObjectValue $state 'summaryIncludedMessage' $false) -ne $IncludeMessage) {
+    $state = New-RolloutProbeState -Path $Path
+  }
+  $state.summaryIncludedMessage = $IncludeMessage
   $stream = $null
-  $memory = $null
+  $lineBuffer = $null
   try {
     $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
     $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharing)
@@ -2779,90 +2994,57 @@ function Update-RolloutProbe {
     }
     $stream.Position = [int64]$state.offset
     $bytesRemaining = [int64]$snapshotLength - $stream.Position
-    $memory = New-Object IO.MemoryStream
     $buffer = New-Object byte[] 65536
+    $carry = [byte[]]$state.carry
+    if ($carry.Length -gt $MaxFallbackRolloutLineBytes) { throw 'rollout line exceeds fallback limit' }
+    $lineBuffer = New-Object IO.MemoryStream
+    if ($carry.Length -gt 0) { $lineBuffer.Write($carry, 0, $carry.Length) }
     while ($bytesRemaining -gt 0) {
       $requested = [int][Math]::Min([int64]$buffer.Length, $bytesRemaining)
       $count = $stream.Read($buffer, 0, $requested)
       if ($count -le 0) { break }
-      $memory.Write($buffer, 0, $count)
       $bytesRemaining -= $count
+      $segmentStart = 0
+      for ($index = 0; $index -lt $count; $index++) {
+        if ($buffer[$index] -ne 10) { continue }
+        $segmentLength = $index - $segmentStart
+        if ($segmentLength -gt 0) { $lineBuffer.Write($buffer, $segmentStart, $segmentLength) }
+        if ($lineBuffer.Length -gt $MaxFallbackRolloutLineBytes) { throw 'rollout line exceeds fallback limit' }
+        $lineLength = [int]$lineBuffer.Length
+        $lineBytes = $lineBuffer.GetBuffer()
+        if ($lineLength -gt 0 -and $lineBytes[$lineLength - 1] -eq 13) { $lineLength-- }
+        if ($lineLength -gt 0) {
+          $line = $Utf8StrictNoBom.GetString($lineBytes, 0, $lineLength).TrimStart([char]0xFEFF)
+          Update-RolloutProbeStateFromLine -State $state -Line $line -IncludeMessage $IncludeMessage
+        }
+        $lineBuffer.SetLength(0)
+        $lineBuffer.Position = 0
+        $segmentStart = $index + 1
+      }
+      $remaining = $count - $segmentStart
+      if ($remaining -gt 0) { $lineBuffer.Write($buffer, $segmentStart, $remaining) }
+      if ($lineBuffer.Length -gt $MaxFallbackRolloutLineBytes) { throw 'rollout line exceeds fallback limit' }
     }
     $state.offset = $stream.Position
-    $newBytes = $memory.ToArray()
-    $carry = [byte[]]$state.carry
-    $combined = New-Object byte[] ($carry.Length + $newBytes.Length)
-    if ($carry.Length -gt 0) { [Array]::Copy($carry, 0, $combined, 0, $carry.Length) }
-    if ($newBytes.Length -gt 0) { [Array]::Copy($newBytes, 0, $combined, $carry.Length, $newBytes.Length) }
-    $lineStart = 0
-    for ($index = 0; $index -lt $combined.Length; $index++) {
-      if ($combined[$index] -ne 10) { continue }
-      $lineLength = $index - $lineStart
-      if ($lineLength -gt 0 -and $combined[$index - 1] -eq 13) { $lineLength-- }
-      if ($lineLength -gt 0) {
-        $line = $Utf8NoBom.GetString($combined, $lineStart, $lineLength).TrimStart([char]0xFEFF)
-        if ($line -match '"(?:task_started|task_complete|turn_aborted|thread_goal_updated|user_message)"') {
-          try {
-            $item = $line | ConvertFrom-Json -ErrorAction Stop
-            if ([string](Get-ObjectValue $item 'type' '') -eq 'event_msg') {
-              $payload = Get-ObjectValue $item 'payload'
-              $eventType = [string](Get-ObjectValue $payload 'type' '')
-              $turn = [string](Get-FirstObjectValue $payload @('turn_id', 'turn-id', 'turnId'))
-              $state.sequence = [int64]$state.sequence + 1
-              if ($eventType -eq 'task_started' -and -not [string]::IsNullOrWhiteSpace($turn)) {
-                $state.openTurns[$turn] = [int64]$state.sequence
-                $state.lastLifecycleType = 'task_started'
-                $state.lastLifecycleTurnId = $turn
-                $state.currentTurnId = $turn
-              } elseif ($eventType -eq 'task_complete' -and -not [string]::IsNullOrWhiteSpace($turn)) {
-                [void]$state.openTurns.Remove($turn)
-                $state.completedTurns[$turn] = [int64]$state.sequence
-                $state.terminalTurns[$turn] = [int64]$state.sequence
-                $state.terminalEventTypes[$turn] = 'task_complete'
-                $state.lastLifecycleType = 'task_complete'
-                $state.lastLifecycleTurnId = $turn
-                $lastAgentMessage = [string](Get-FirstObjectValue $payload @('last_agent_message', 'last-assistant-message', 'last_assistant_message'))
-                $state.terminalMessages[$turn] = Sanitize-NotificationText -Text $lastAgentMessage -MaxLength 4000 -PreserveLines
-                if (-not [string]::IsNullOrWhiteSpace($lastAgentMessage)) { $state.finalMessageTurns[$turn] = $true }
-                if ([string]$state.currentTurnId -eq $turn) { $state.currentTurnId = '' }
-              } elseif ($eventType -eq 'turn_aborted' -and -not [string]::IsNullOrWhiteSpace($turn)) {
-                [void]$state.openTurns.Remove($turn)
-                $state.abortedTurns[$turn] = [int64]$state.sequence
-                $state.terminalTurns[$turn] = [int64]$state.sequence
-                $state.terminalEventTypes[$turn] = 'turn_aborted'
-                $state.terminalMessages[$turn] = ''
-                $state.lastLifecycleType = 'turn_aborted'
-                $state.lastLifecycleTurnId = $turn
-                $state.finalMessageTurns[$turn] = $true
-                if ([string]$state.currentTurnId -eq $turn) { $state.currentTurnId = '' }
-              } elseif ($eventType -eq 'user_message' -and -not [string]::IsNullOrWhiteSpace([string]$state.currentTurnId)) {
-                $state.userMessageTurns[[string]$state.currentTurnId] = $true
-              } elseif ($eventType -eq 'thread_goal_updated') {
-                $goal = Get-ObjectValue $payload 'goal'
-                $status = [string](Get-ObjectValue $goal 'status' '')
-                if (-not [string]::IsNullOrWhiteSpace($status)) { $state.goalStatus = $status.ToLowerInvariant() }
-              }
-            }
-          } catch {
-            # Ignore complete non-JSON or future-format lines without losing the cursor.
-          }
-        }
-      }
-      $lineStart = $index + 1
-    }
-    $remaining = $combined.Length - $lineStart
-    $state.carry = New-Object byte[] $remaining
-    if ($remaining -gt 0) { [Array]::Copy($combined, $lineStart, $state.carry, 0, $remaining) }
+    $state.carry = $lineBuffer.ToArray()
+    $state.incompleteTail = $state.carry.Length -gt 0
     $itemInfo = Get-Item -LiteralPath $Path -ErrorAction Stop
     $state.modifiedUnixMs = ([DateTimeOffset]$itemInfo.LastWriteTimeUtc).ToUnixTimeMilliseconds()
     $state.snapshotChanged = [int64]$itemInfo.Length -ne $snapshotLength -or
       [int64]$itemInfo.LastWriteTimeUtc.Ticks -ne $snapshotWriteTicks
     $script:RolloutProbeCache[$cacheKey] = $state
+    if ([bool]$state.invalidLifecycle) {
+      return [pscustomobject]@{ ok = $false; state = $state; error = 'invalid lifecycle JSON' }
+    }
     return [pscustomobject]@{ ok = $true; state = $state; snapshotChanged = [bool]$state.snapshotChanged; error = '' }
   } catch {
+    $baseException = $_.Exception.GetBaseException()
+    if ($baseException -is [Text.DecoderFallbackException]) {
+      $state.invalidLifecycle = $true
+    }
     return [pscustomobject]@{ ok = $false; state = $state; error = Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 240 }
   } finally {
-    if ($null -ne $memory) { $memory.Dispose() }
+    if ($null -ne $lineBuffer) { $lineBuffer.Dispose() }
     if ($null -ne $stream) { $stream.Dispose() }
   }
 }
@@ -2870,7 +3052,8 @@ function Update-RolloutProbe {
 function Get-FastRolloutProbe {
   param(
     [string]$Path,
-    [string]$CandidateTurnId
+    [string]$CandidateTurnId,
+    [bool]$IncludeMessage = $false
   )
 
   if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($CandidateTurnId) -or
@@ -2879,25 +3062,13 @@ function Get-FastRolloutProbe {
   }
   try {
     Initialize-WinSqlite
-    $values = [CodexNtfyWinSqlite]::ScanLifecycleSummary($Path, $CandidateTurnId)
-    if ($null -eq $values -or $values.Count -lt 22 -or [string]$values[0] -notin @('task_complete', 'turn_aborted')) {
-      return [pscustomobject]@{ ok = $false; state = $null; error = 'candidate terminal event unavailable' }
-    }
-    for ($lineIndex = 22; $lineIndex -lt $values.Count; $lineIndex++) {
-      try {
-        $validatedEnvelope = [string]$values[$lineIndex] | ConvertFrom-Json -ErrorAction Stop
-        if ([string](Get-ObjectValue $validatedEnvelope 'type' '') -ne 'event_msg') {
-          return [pscustomobject]@{ ok = $false; state = $null; error = 'non-event lifecycle envelope' }
-        }
-        $validatedPayload = Get-ObjectValue $validatedEnvelope 'payload'
-        if ($null -eq $validatedPayload) {
-          return [pscustomobject]@{ ok = $false; state = $null; error = 'lifecycle payload unavailable' }
-        }
-      } catch {
-        return [pscustomobject]@{ ok = $false; state = $null; error = 'invalid lifecycle JSON' }
-      }
+    $values = [CodexNtfyWinSqlite]::ScanLifecycleSummary($Path, $CandidateTurnId, $IncludeMessage)
+    if ($null -eq $values -or $values.Count -lt 23) {
+      return [pscustomobject]@{ ok = $false; state = $null; error = 'lifecycle summary unavailable' }
     }
     $state = New-RolloutProbeState -Path $Path
+    $state.summaryCandidateTurnId = $CandidateTurnId
+    $state.summaryIncludedMessage = $IncludeMessage
     $candidateType = [string]$values[0]
     $candidateSequence = [int64]$values[4]
     $latestType = [string]$values[5]
@@ -2911,31 +3082,22 @@ function Get-FastRolloutProbe {
     $state.sequence = [Math]::Max($candidateSequence, [Math]::Max($latestSequence, $openLaterSequence))
     $state.modifiedUnixMs = [int64]$values[16]
     $state.snapshotChanged = [int64]$values[12] -ne [int64]$values[14] -or [int64]$values[13] -ne [int64]$values[15]
+    $state.incompleteTail = [string]$values[22] -eq '1'
     $state.goalStatus = [string]$values[11]
     if ([string]$values[2] -eq '1') { $state.userMessageTurns[$CandidateTurnId] = $true }
 
     $seenTerminals = @{}
     $terminalCandidates = @(
-        [pscustomobject]@{ turn = $CandidateTurnId; type = 'task_complete'; sequence = $candidateCompletedSequence; line = [string]$values[20] },
-        [pscustomobject]@{ turn = $CandidateTurnId; type = 'turn_aborted'; sequence = $candidateAbortedSequence; line = [string]$values[21] },
-        [pscustomobject]@{ turn = $latestTurn; type = $latestType; sequence = $latestSequence; line = [string]$values[7] }
+        [pscustomobject]@{ turn = $CandidateTurnId; type = 'task_complete'; sequence = $candidateCompletedSequence; message = [string]$values[20] },
+        [pscustomobject]@{ turn = $CandidateTurnId; type = 'turn_aborted'; sequence = $candidateAbortedSequence; message = [string]$values[21] },
+        [pscustomobject]@{ turn = $latestTurn; type = $latestType; sequence = $latestSequence; message = [string]$values[7] }
       ) | Sort-Object @{ Expression = { [int64]$_.sequence } }, @{ Expression = { [string]$_.type } }
     foreach ($terminal in $terminalCandidates) {
       if ([string]::IsNullOrWhiteSpace($terminal.turn) -or $terminal.type -notin @('task_complete', 'turn_aborted') -or
-          [int64]$terminal.sequence -le 0 -or [string]::IsNullOrWhiteSpace($terminal.line)) { continue }
+          [int64]$terminal.sequence -le 0) { continue }
       $terminalKey = '{0}|{1}|{2}' -f $terminal.turn, $terminal.type, $terminal.sequence
       if ($seenTerminals.ContainsKey($terminalKey)) { continue }
       $seenTerminals[$terminalKey] = $true
-      $payload = $null
-      try {
-        $envelope = $terminal.line | ConvertFrom-Json -ErrorAction Stop
-        $payload = Get-ObjectValue $envelope 'payload'
-        $parsedType = [string](Get-ObjectValue $payload 'type' '')
-        $parsedTurn = [string](Get-FirstObjectValue $payload @('turn_id', 'turn-id'))
-        if ($parsedType -ne $terminal.type -or $parsedTurn -ne $terminal.turn) { continue }
-      } catch {
-        continue
-      }
       if ($terminal.type -eq 'turn_aborted') {
         $state.abortedTurns[$terminal.turn] = [int64]$terminal.sequence
       } else {
@@ -2947,14 +3109,16 @@ function Get-FastRolloutProbe {
           ($terminal.turn -eq $latestTurn -and [string]$values[17] -eq '1')) {
         $state.userMessageTurns[$terminal.turn] = $true
       }
-      $message = ''
-      $message = [string](Get-FirstObjectValue $payload @('last_agent_message', 'last-assistant-message', 'last_assistant_message'))
-      $state.terminalMessages[$terminal.turn] = Sanitize-NotificationText -Text $message -MaxLength 4000 -PreserveLines
+      $message = [string]$terminal.message
+      $state.terminalMessages[$terminal.turn] = if ($IncludeMessage) {
+        Sanitize-NotificationText -Text $message -MaxLength 4000 -PreserveLines
+      } else { '' }
       if ($terminal.type -eq 'turn_aborted' -or -not [string]::IsNullOrWhiteSpace($message)) {
         $state.finalMessageTurns[$terminal.turn] = $true
       }
     }
-    if (-not $state.completedTurns.ContainsKey($CandidateTurnId) -and -not $state.abortedTurns.ContainsKey($CandidateTurnId)) {
+    if ($candidateType -in @('task_complete', 'turn_aborted') -and
+        -not $state.completedTurns.ContainsKey($CandidateTurnId) -and -not $state.abortedTurns.ContainsKey($CandidateTurnId)) {
       return [pscustomobject]@{ ok = $false; state = $null; error = 'candidate terminal JSON invalid' }
     }
     if (-not [string]::IsNullOrWhiteSpace($openLaterTurn) -and $openLaterSequence -gt $candidateSequence) {
@@ -2966,7 +3130,61 @@ function Get-FastRolloutProbe {
       $state.lastLifecycleType = $latestType
       $state.lastLifecycleTurnId = $latestTurn
     }
-    if (-not $state.snapshotChanged) {
+    if (-not $state.snapshotChanged -and -not $state.incompleteTail) {
+      $script:RolloutProbeCache[$Path.ToLowerInvariant()] = $state
+    }
+    return [pscustomobject]@{ ok = $true; state = $state; snapshotChanged = [bool]$state.snapshotChanged; error = '' }
+  } catch {
+    return [pscustomobject]@{ ok = $false; state = $null; error = Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 240 }
+  }
+}
+
+function Get-FastRolloutLatestProbe {
+  param([string]$Path)
+
+  if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+    return [pscustomobject]@{ ok = $false; state = $null; error = 'fast lifecycle probe unavailable' }
+  }
+  try {
+    Initialize-WinSqlite
+    $values = [CodexNtfyWinSqlite]::ScanLifecycleSummary($Path, '', $false)
+    if ($null -eq $values -or $values.Count -lt 23) {
+      return [pscustomobject]@{ ok = $false; state = $null; error = 'lifecycle summary unavailable' }
+    }
+    $state = New-RolloutProbeState -Path $Path
+    $latestType = [string]$values[5]
+    $latestTurn = [string]$values[6]
+    $latestSequence = [int64]$values[8]
+    $openTurn = [string]$values[9]
+    $openSequence = [int64]$values[10]
+    $state.offset = [int64]$values[14]
+    $state.sequence = [Math]::Max($latestSequence, $openSequence)
+    $state.modifiedUnixMs = [int64]$values[16]
+    $state.snapshotChanged = [int64]$values[12] -ne [int64]$values[14] -or [int64]$values[13] -ne [int64]$values[15]
+    $state.incompleteTail = [string]$values[22] -eq '1'
+    $state.goalStatus = [string]$values[11]
+    if (-not [string]::IsNullOrWhiteSpace($openTurn) -and $openSequence -gt $latestSequence) {
+      $state.openTurns[$openTurn] = $openSequence
+      $state.currentTurnId = $openTurn
+      $state.lastLifecycleType = 'task_started'
+      $state.lastLifecycleTurnId = $openTurn
+    } elseif ($latestType -in @('task_complete', 'turn_aborted') -and -not [string]::IsNullOrWhiteSpace($latestTurn)) {
+      if ($latestType -eq 'turn_aborted') {
+        $state.abortedTurns[$latestTurn] = $latestSequence
+      } else {
+        $state.completedTurns[$latestTurn] = $latestSequence
+      }
+      $state.terminalTurns[$latestTurn] = $latestSequence
+      $state.terminalEventTypes[$latestTurn] = $latestType
+      $state.terminalMessages[$latestTurn] = ''
+      if ([string]$values[17] -eq '1') { $state.userMessageTurns[$latestTurn] = $true }
+      if ($latestType -eq 'turn_aborted' -or -not [string]::IsNullOrWhiteSpace([string]$values[7])) {
+        $state.finalMessageTurns[$latestTurn] = $true
+      }
+      $state.lastLifecycleType = $latestType
+      $state.lastLifecycleTurnId = $latestTurn
+    }
+    if (-not $state.snapshotChanged -and -not $state.incompleteTail) {
       $script:RolloutProbeCache[$Path.ToLowerInvariant()] = $state
     }
     return [pscustomobject]@{ ok = $true; state = $state; snapshotChanged = [bool]$state.snapshotChanged; error = '' }
@@ -2988,15 +3206,16 @@ function Get-UnknownGateResult {
   param(
     [object]$Record,
     [object]$Config,
-    [string]$Reason
+    [string]$Reason,
+    [bool]$NeverPromote = $false
   )
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $created = [int64](Get-ObjectValue $Record 'created_unix_ms' $now)
   $fallbackAt = $created + [int64]([Math]::Max(0, $Config.idleProbeGraceSeconds) * 1000)
-  if ($Config.idleDetectionMode -eq 'balanced' -and $now -ge $fallbackAt) {
+  if (-not $NeverPromote -and $Config.idleDetectionMode -eq 'balanced' -and $now -ge $fallbackAt) {
     return New-GateResult -State 'ready' -Reason ('balanced-fallback:' + $Reason) -RetryAtUnixMs $now
   }
-  if ($Config.idleDetectionMode -eq 'strict' -and $now -ge $fallbackAt) {
+  if (($NeverPromote -or $Config.idleDetectionMode -eq 'strict') -and $now -ge $fallbackAt) {
     return New-GateResult -State 'unverifiable' -Reason $Reason -RetryAtUnixMs $now
   }
 
@@ -3230,38 +3449,51 @@ function Test-RecordIdleGate {
     return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'rollout-path-unknown'
   }
   $probeCacheKey = $rolloutPath.ToLowerInvariant()
-  $probe = if ($script:RolloutProbeCache.ContainsKey($probeCacheKey)) {
-    Update-RolloutProbe -Path $rolloutPath
+  $cachedProbeState = if ($script:RolloutProbeCache.ContainsKey($probeCacheKey)) { $script:RolloutProbeCache[$probeCacheKey] } else { $null }
+  $probe = if ($null -ne $cachedProbeState -and
+      [string](Get-ObjectValue $cachedProbeState 'summaryCandidateTurnId' '') -eq $turnId -and
+      [bool](Get-ObjectValue $cachedProbeState 'summaryIncludedMessage' $false) -eq [bool]$Config.includeMessage) {
+    Update-RolloutProbe -Path $rolloutPath -IncludeMessage ([bool]$Config.includeMessage)
   } else {
-    Get-FastRolloutProbe -Path $rolloutPath -CandidateTurnId $turnId
+    Get-FastRolloutProbe -Path $rolloutPath -CandidateTurnId $turnId -IncludeMessage ([bool]$Config.includeMessage)
   }
   if ($probe.ok -and -not [string]::IsNullOrWhiteSpace($turnId) -and
       -not $probe.state.completedTurns.ContainsKey($turnId) -and
-      -not $probe.state.abortedTurns.ContainsKey($turnId)) {
+      -not $probe.state.abortedTurns.ContainsKey($turnId) -and
+      [string](Get-ObjectValue $probe.state 'summaryCandidateTurnId' '') -ne $turnId) {
     # The cache is path-scoped while the native cold summary materializes the
     # requested candidate plus the absolute latest terminal. A second pending
     # candidate on the same already-scanned rollout needs one fresh native pass.
     [void]$script:RolloutProbeCache.Remove($probeCacheKey)
-    $probe = Get-FastRolloutProbe -Path $rolloutPath -CandidateTurnId $turnId
+    $probe = Get-FastRolloutProbe -Path $rolloutPath -CandidateTurnId $turnId -IncludeMessage ([bool]$Config.includeMessage)
   }
   if (-not $probe.ok) {
     # Stop hooks can race the terminal rollout write, and future/legacy formats
     # may not expose enough lifecycle data for the native summary. Preserve the
     # original full parser as a correctness fallback.
-    $probe = Update-RolloutProbe -Path $rolloutPath
+    $probe = Update-RolloutProbe -Path $rolloutPath -IncludeMessage ([bool]$Config.includeMessage)
   }
   if (-not $probe.ok) {
-    return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'rollout-probe-failed'
+    $invalidLifecycle = $null -ne $probe.state -and
+      [bool](Get-ObjectValue $probe.state 'invalidLifecycle' $false)
+    return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'rollout-probe-failed' -NeverPromote $invalidLifecycle
   }
   $state = $probe.state
   if ([bool](Get-ObjectValue $state 'snapshotChanged' $false)) {
     return New-GateResult -State 'busy' -Reason 'rollout-changing' -RetryAtUnixMs ($now + [int64]([Math]::Max(0.1, $Config.goalPollSeconds) * 1000))
   }
+  if ([bool](Get-ObjectValue $state 'incompleteTail' $false)) {
+    return New-GateResult -State 'busy' -Reason 'probe-incomplete' -RetryAtUnixMs ($now + [int64]([Math]::Max(0.1, $Config.goalPollSeconds) * 1000))
+  }
   if ([string]::IsNullOrWhiteSpace($turnId) -and $candidateKind -eq 'hook_stop') {
-    $latestCompleted = $state.completedTurns.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
-    if ($null -ne $latestCompleted) {
-      $turnId = [string]$latestCompleted.Key
+    $latestTerminal = $state.terminalTurns.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+    if ($null -ne $latestTerminal) {
+      $turnId = [string]$latestTerminal.Key
       Set-RecordValue -Record $Record -Name 'turn_id' -Value $turnId
+      $inferredEventType = if ($state.terminalEventTypes.ContainsKey($turnId)) {
+        [string]$state.terminalEventTypes[$turnId]
+      } else { 'task_complete' }
+      Set-RecordValue -Record $Record -Name 'completion_event_type' -Value $inferredEventType
     }
   }
   if ([string]::IsNullOrWhiteSpace($turnId)) {
@@ -3358,7 +3590,7 @@ function Test-RecordIdleGate {
   $descendants = Get-ActiveDescendants -Record $Record -Config $Config -NowUnixMs $now -SessionHome $sessionHome -SqliteHome $sqliteHome
   Set-RecordValue -Record $Record -Name 'active_descendants' -Value ([int]$descendants.count)
   if (-not $descendants.ok) {
-    return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'descendant-probe-failed'
+    return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'descendant-probe-failed' -NeverPromote ([bool](Get-ObjectValue $descendants 'invalidEvidence' $false))
   }
   if ($descendants.busy) {
     return New-GateResult -State 'busy' -Reason 'subagents-active' -RetryAtUnixMs ($now + [int64]([Math]::Max(0.1, $Config.goalPollSeconds) * 1000))
@@ -4493,6 +4725,13 @@ function Start-RolloutScanProcess {
     [switch]$OneShot
   )
   try {
+    if ($Scope -eq 'Remote') {
+      $testStartDelayMs = 0
+      if ([int]::TryParse([string]$env:CODEX_NTFY_TEST_REMOTE_SCAN_START_DELAY_MS, [ref]$testStartDelayMs) -and
+          $testStartDelayMs -gt 0) {
+        Start-Sleep -Milliseconds $testStartDelayMs
+      }
+    }
     $powerShellExe = Join-Path $PSHOME 'powershell.exe'
     if (-not (Test-Path -LiteralPath $powerShellExe)) {
       $powerShellExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -4669,7 +4908,10 @@ function Invoke-OutboxWorker {
         if ($null -eq $remoteScanProcess) {
           $nextRemoteWatchScanMs = $nowMs + [int64]([Math]::Max(5, $config.watchDiscoverySeconds) * 1000)
         } else {
-          $remoteScanStartedUnixMs = $nowMs
+          # Process startup can itself be slow under load. Start the timeout
+          # budget only after Start-Process has returned, not from the stale
+          # loop timestamp captured before local work and child creation.
+          $remoteScanStartedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
         }
       }
       if (-not $DeliveryOnly -and $Continuous -and -not $deliveryReadyForMaintenance) {

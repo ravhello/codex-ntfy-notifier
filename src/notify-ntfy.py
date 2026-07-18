@@ -33,7 +33,7 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.5.1"
+VERSION = "2.5.2"
 MAX_NTFY_MESSAGE_BYTES = 3500
 SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
@@ -518,34 +518,71 @@ def descendant_threads(codex_home: Path, thread_id: str) -> tuple[bool, list[tup
     return available, [(row[0], row[1].lower()) for row in rows if row and row[0]]
 
 
-def last_rollout_lifecycle(path: Path) -> tuple[str, str, int]:
+def last_rollout_lifecycle(path: Path) -> tuple[str, str, int, bool, bool]:
+    """Return lifecycle, turn, mtime, invalid evidence, and incomplete-tail state."""
     try:
-        stat = path.stat()
         # Child rollouts are normally small. Reading from the end avoids parsing
         # prompt/tool bodies and finds the newest lifecycle marker quickly.
         with path.open("rb") as handle:
+            stat = os.fstat(handle.fileno())
             size = stat.st_size
+            modified_ms = stat.st_mtime_ns // 1_000_000
+            if size > 0:
+                handle.seek(size - 1)
+                if handle.read(1) != b"\n":
+                    return "unknown", "", modified_ms, False, True
             window = min(size, 4 * 1024 * 1024)
             handle.seek(size - window)
-            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+            raw_tail = handle.read(window)
+            after = os.fstat(handle.fileno())
+        if after.st_size != size or after.st_mtime_ns != stat.st_mtime_ns:
+            return "unknown", "", after.st_mtime_ns // 1_000_000, False, False
+        if window < size:
+            boundary = raw_tail.find(b"\n")
+            raw_tail = raw_tail[boundary + 1 :] if boundary >= 0 else b""
+        invalid_lifecycle = False
+        latest_lifecycle = "unknown"
+        latest_turn_id = ""
+        lines = raw_tail.splitlines()
         for line in reversed(lines):
-            if not any(marker in line for marker in ("task_started", "task_complete", "turn_aborted")):
+            try:
+                decoded = line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                invalid_lifecycle = True
                 continue
-            with contextlib.suppress(json.JSONDecodeError):
-                envelope = json.loads(line)
-                payload = envelope.get("payload") if isinstance(envelope, dict) else None
-                if not isinstance(payload, dict):
-                    continue
-                event_type = str(payload.get("type", ""))
-                if event_type in ("task_started", "task_complete", "turn_aborted"):
-                    return (
-                        event_type,
-                        str(obj_value(payload, "turn_id", "turnId", default="")),
-                        stat.st_mtime_ns // 1_000_000,
-                    )
-        return "unknown", "", stat.st_mtime_ns // 1_000_000
+            if not any(marker in decoded for marker in ("task_started", "task_complete", "turn_aborted")):
+                continue
+            try:
+                envelope = json.loads(decoded)
+            except json.JSONDecodeError:
+                invalid_lifecycle = True
+                continue
+            if not isinstance(envelope, dict) or envelope.get("type") != "event_msg":
+                continue
+            payload = envelope.get("payload")
+            if not isinstance(payload, dict):
+                invalid_lifecycle = True
+                continue
+            event_type_value = payload.get("type")
+            if not isinstance(event_type_value, str) or not event_type_value.strip():
+                invalid_lifecycle = True
+                continue
+            event_type = event_type_value.strip()
+            if event_type not in ("task_started", "task_complete", "turn_aborted"):
+                continue
+            raw_turn_id = obj_value(payload, "turn_id", "turn-id", "turnId", default="")
+            turn_id = raw_turn_id.strip() if isinstance(raw_turn_id, str) else ""
+            if not turn_id:
+                invalid_lifecycle = True
+                continue
+            if latest_lifecycle == "unknown":
+                latest_lifecycle = event_type
+                latest_turn_id = turn_id
+        return latest_lifecycle, latest_turn_id, modified_ms, invalid_lifecycle, False
     except OSError:
-        return "unknown", "", 0
+        # Read/stat races are transient unknowns. They retain the existing
+        # descendant orphan handling instead of becoming permanent corruption.
+        return "unknown", "", 0, False, False
 
 
 def active_descendants(
@@ -553,12 +590,12 @@ def active_descendants(
     record: dict[str, Any],
     config: dict[str, Any],
     now_ms: int,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, bool]:
     codex_home = Path(str(record.get("session_codex_home") or runtime.codex_home))
     sqlite_home = Path(str(record.get("session_sqlite_home") or codex_home))
     available, descendants = descendant_threads(sqlite_home, str(record.get("thread_id", "")))
     if available and not descendants:
-        return False, 0
+        return False, 0, False
     orphan_ms = int(max(0, float(config["subagent_orphan_seconds"])) * 1000)
     unknown_since = record.get("descendant_unknown_since")
     if not isinstance(unknown_since, dict):
@@ -572,10 +609,11 @@ def active_descendants(
         mode = str(config.get("idle_detection_mode", "strict")).lower()
         fallback_ms = int(max(0, float(config.get("idle_probe_grace_seconds", 30))) * 1000)
         blocked = mode == "strict" or (fallback_ms > 0 and now_ms - first_seen < fallback_ms)
-        return blocked, 1 if blocked else 0
+        return blocked, 1 if blocked else 0, False
 
     unknown_since.pop("__tree__", None)
     active = 0
+    invalid_evidence = False
     seen_children: set[str] = set()
     for child_id, edge_status in descendants:
         seen_children.add(child_id)
@@ -591,7 +629,15 @@ def active_descendants(
             if orphan_ms <= 0 or now_ms - first_seen < orphan_ms:
                 active += 1
             continue
-        lifecycle, _, mtime_ms = last_rollout_lifecycle(rollout)
+        lifecycle, _, mtime_ms, child_invalid, child_incomplete = last_rollout_lifecycle(rollout)
+        fresh = orphan_ms <= 0 or (mtime_ms > 0 and now_ms - mtime_ms < orphan_ms)
+        if child_incomplete and fresh:
+            active += 1
+            continue
+        if child_invalid and fresh:
+            invalid_evidence = True
+            active += 1
+            continue
         if lifecycle == "task_started" and (orphan_ms <= 0 or now_ms - mtime_ms < orphan_ms):
             active += 1
         elif lifecycle == "unknown" and mtime_ms and (orphan_ms <= 0 or now_ms - mtime_ms < orphan_ms):
@@ -609,7 +655,7 @@ def active_descendants(
         if child_id != "__tree__" and child_id not in seen_children:
             unknown_since.pop(child_id, None)
     record["descendant_unknown_since"] = unknown_since
-    return active > 0, active
+    return active > 0, active, invalid_evidence
 
 
 def normalize_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -735,6 +781,8 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
             "candidate_final_message": False,
             "goal_status": "",
             "mtime_unix_ms": 0,
+            "incomplete_tail": False,
+            "invalid_lifecycle": False,
         }
         record["idle_probe"] = probe
         return probe
@@ -753,6 +801,7 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
     latest_terminal_end_offset = int(previous.get("latest_terminal_end_offset", 0) or 0) if same_rollout else 0
     latest_terminal_timestamp = str(previous.get("latest_terminal_timestamp", "")) if same_rollout else ""
     rollout_goal_status = str(previous.get("goal_status", "")) if same_rollout else ""
+    invalid_lifecycle = bool(previous.get("invalid_lifecycle", False)) if same_rollout else False
     previous_offset = int(previous.get("offset", 0) or 0) if same_rollout else 0
     candidate_turn = str(record.get("turn_id", ""))
     current_turn = last_lifecycle_turn_id if last_lifecycle == "task_started" else ""
@@ -773,8 +822,44 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
                 latest_terminal_end_offset = 0
                 latest_terminal_timestamp = ""
                 rollout_goal_status = ""
-            handle.seek(previous_offset)
+                invalid_lifecycle = False
             snapshot_size = stat.st_size
+            if snapshot_size > 0:
+                handle.seek(snapshot_size - 1)
+                if handle.read(1) != b"\n":
+                    after = os.fstat(handle.fileno())
+                    probe = {
+                        "status": (
+                            "busy"
+                            if last_lifecycle == "task_started"
+                            else "idle"
+                            if last_lifecycle in ("task_complete", "turn_aborted")
+                            else "unknown"
+                        ),
+                        "reason": "",
+                        "rollout_path": str(rollout),
+                        "offset": previous_offset,
+                        "last_lifecycle": last_lifecycle,
+                        "last_lifecycle_turn_id": last_lifecycle_turn_id,
+                        "candidate_completed": candidate_completed,
+                        "candidate_user_message": candidate_user_message,
+                        "candidate_final_message": candidate_final_message,
+                        "candidate_completion_end_offset": candidate_completion_end_offset,
+                        "latest_terminal_message": latest_terminal_message,
+                        "latest_terminal_event_type": latest_terminal_event_type,
+                        "latest_terminal_end_offset": latest_terminal_end_offset,
+                        "latest_terminal_timestamp": latest_terminal_timestamp,
+                        "goal_status": rollout_goal_status,
+                        "mtime_unix_ms": after.st_mtime_ns // 1_000_000,
+                        "snapshot_changed": (
+                            after.st_size != snapshot_size or after.st_mtime_ns != stat.st_mtime_ns
+                        ),
+                        "incomplete_tail": True,
+                        "invalid_lifecycle": invalid_lifecycle,
+                    }
+                    record["idle_probe"] = probe
+                    return probe
+            handle.seek(previous_offset)
             appended = handle.read(max(0, snapshot_size - previous_offset))
             last_newline = appended.rfind(b"\n")
             if last_newline >= 0:
@@ -786,6 +871,7 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
                 # than any fixed overlap window.
                 complete_bytes = b""
                 observed_size = previous_offset
+            incomplete_tail = observed_size < snapshot_size
             after = os.fstat(handle.fileno())
             snapshot_changed = after.st_size != snapshot_size or after.st_mtime_ns != stat.st_mtime_ns
             observed_mtime_ms = after.st_mtime_ns // 1_000_000
@@ -808,6 +894,8 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
             "goal_status": rollout_goal_status,
             "mtime_unix_ms": 0,
             "snapshot_changed": False,
+            "incomplete_tail": False,
+            "invalid_lifecycle": invalid_lifecycle,
         }
         record["idle_probe"] = probe
         return probe
@@ -815,52 +903,76 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
     line_offset = previous_offset
     for raw_line in complete_bytes.splitlines(keepends=True):
         line_offset += len(raw_line)
-        line = raw_line.rstrip(b"\r\n").decode("utf-8", errors="replace")
+        try:
+            line = raw_line.rstrip(b"\r\n").decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            invalid_lifecycle = True
+            continue
         if not any(
             marker in line
             for marker in ("task_started", "task_complete", "turn_aborted", "thread_goal_updated", "user_message")
         ):
             continue
-        with contextlib.suppress(json.JSONDecodeError):
+        try:
             envelope = json.loads(line)
-            payload = envelope.get("payload") if isinstance(envelope, dict) else None
-            if not isinstance(payload, dict):
+        except json.JSONDecodeError:
+            invalid_lifecycle = True
+            continue
+        if not isinstance(envelope, dict) or envelope.get("type") != "event_msg":
+            continue
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            invalid_lifecycle = True
+            continue
+        event_type_value = payload.get("type")
+        if not isinstance(event_type_value, str) or not event_type_value.strip():
+            invalid_lifecycle = True
+            continue
+        event_type = event_type_value.strip()
+        if event_type not in ("task_started", "task_complete", "turn_aborted", "thread_goal_updated", "user_message"):
+            continue
+        if event_type in ("task_started", "task_complete", "turn_aborted"):
+            raw_event_turn = obj_value(payload, "turn_id", "turn-id", "turnId", default="")
+            event_turn = raw_event_turn.strip() if isinstance(raw_event_turn, str) else ""
+            if not event_turn:
+                invalid_lifecycle = True
                 continue
-            event_type = str(payload.get("type", ""))
-            if event_type in ("task_started", "task_complete", "turn_aborted"):
-                event_turn = str(obj_value(payload, "turn_id", "turnId", default=""))
-                last_lifecycle = event_type
-                last_lifecycle_turn_id = event_turn
-                if event_type == "task_started":
-                    current_turn = event_turn
-                if event_type in ("task_complete", "turn_aborted"):
-                    latest_terminal_event_type = event_type
-                    raw_terminal_message = (
-                        str(payload.get("last_agent_message", ""))
-                        if event_type == "task_complete"
-                        else ""
-                    )
-                    latest_terminal_message = (
-                        sanitize(raw_terminal_message, 4000, preserve_lines=True)
-                        if include_message
-                        else ""
-                    )
-                    latest_terminal_end_offset = line_offset
-                    latest_terminal_timestamp = str(envelope.get("timestamp", ""))
-                if event_turn and event_turn == candidate_turn and event_type in ("task_complete", "turn_aborted"):
-                    candidate_completed = True
-                    candidate_final_message = bool(str(payload.get("last_agent_message", "")).strip()) or event_type == "turn_aborted"
-                    candidate_completion_end_offset = line_offset
-                    record["completion_event_type"] = event_type
-                if event_type in ("task_complete", "turn_aborted") and current_turn == event_turn:
-                    current_turn = ""
-            elif event_type == "user_message":
-                if current_turn and current_turn == candidate_turn:
-                    candidate_user_message = True
-            elif event_type == "thread_goal_updated":
-                goal = payload.get("goal")
-                if isinstance(goal, dict):
-                    rollout_goal_status = str(goal.get("status", ""))
+            last_lifecycle = event_type
+            last_lifecycle_turn_id = event_turn
+            if event_type == "task_started":
+                current_turn = event_turn
+            if event_type in ("task_complete", "turn_aborted"):
+                latest_terminal_event_type = event_type
+                raw_terminal_message = (
+                    str(payload.get("last_agent_message", ""))
+                    if event_type == "task_complete"
+                    else ""
+                )
+                latest_terminal_message = (
+                    sanitize(raw_terminal_message, 4000, preserve_lines=True)
+                    if include_message
+                    else ""
+                )
+                latest_terminal_end_offset = line_offset
+                latest_terminal_timestamp = str(envelope.get("timestamp", ""))
+            if event_turn == candidate_turn and event_type in ("task_complete", "turn_aborted"):
+                candidate_completed = True
+                candidate_final_message = bool(str(payload.get("last_agent_message", "")).strip()) or event_type == "turn_aborted"
+                candidate_completion_end_offset = line_offset
+                record["completion_event_type"] = event_type
+            if event_type in ("task_complete", "turn_aborted") and current_turn == event_turn:
+                current_turn = ""
+        elif event_type == "user_message":
+            if current_turn and current_turn == candidate_turn:
+                candidate_user_message = True
+        elif event_type == "thread_goal_updated":
+            goal = payload.get("goal")
+            raw_goal_state = goal.get("status") if isinstance(goal, dict) else None
+            goal_state = raw_goal_state.strip().lower() if isinstance(raw_goal_state, str) else ""
+            if goal_state not in ("active", "paused", "blocked", "usage_limited", "budget_limited", "complete"):
+                invalid_lifecycle = True
+                continue
+            rollout_goal_status = goal_state
 
     status = "busy" if last_lifecycle == "task_started" else "idle" if last_lifecycle in ("task_complete", "turn_aborted") else "unknown"
     if candidate_completion_end_offset > 0:
@@ -884,6 +996,8 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
         "goal_status": rollout_goal_status,
         "mtime_unix_ms": observed_mtime_ms,
         "snapshot_changed": snapshot_changed,
+        "incomplete_tail": incomplete_tail,
+        "invalid_lifecycle": invalid_lifecycle,
     }
     record["idle_probe"] = probe
     return probe
@@ -937,13 +1051,35 @@ def idle_gate(
     if config.get("goal_aware", True) and effective_goal == "active":
         return False, poll_due, "goal-active"
 
-    descendants_busy, descendant_count = active_descendants(runtime, record, config, now_ms)
+    descendants_busy, descendant_count, descendant_invalid = active_descendants(runtime, record, config, now_ms)
     record["active_descendants"] = descendant_count
+    if descendant_invalid:
+        invalid_deadline = int(record.get("created_unix_ms", now_ms) or now_ms) + int(
+            max(0, float(config.get("idle_probe_grace_seconds", 30))) * 1000
+        )
+        if now_ms >= invalid_deadline:
+            return False, now_ms, "unverifiable"
+        expired, unknown_due = unknown_probe_schedule(record, config, now_ms, "descendant-probe-failed")
+        if expired:
+            return False, now_ms, "unverifiable"
+        return False, unknown_due, "descendant-probe-failed"
     if descendants_busy:
         return False, poll_due, "subagents-active"
 
     if bool(probe.get("snapshot_changed", False)):
         return False, poll_due, "rollout-changing"
+    if bool(probe.get("incomplete_tail", False)):
+        return False, poll_due, "probe-incomplete"
+    if bool(probe.get("invalid_lifecycle", False)):
+        invalid_deadline = int(record.get("created_unix_ms", now_ms) or now_ms) + int(
+            max(0, float(config.get("idle_probe_grace_seconds", 30))) * 1000
+        )
+        if now_ms >= invalid_deadline:
+            return False, now_ms, "unverifiable"
+        expired, unknown_due = unknown_probe_schedule(record, config, now_ms, "rollout-probe-failed")
+        if expired:
+            return False, now_ms, "unverifiable"
+        return False, unknown_due, "rollout-probe-failed"
 
     probe_status = str(probe.get("status", "unknown"))
     candidate_completed = bool(probe.get("candidate_completed", False))

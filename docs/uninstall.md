@@ -1,6 +1,6 @@
 # Uninstall and rollback
 
-These procedures apply to version 2.5.1. They are intentionally explicit because `~/.codex` belongs to Codex and `~/.claude/settings.json` may contain unrelated Claude configuration; never remove either whole directory.
+These procedures apply to version 2.5.2. They are intentionally explicit because `~/.codex` belongs to Codex and `~/.claude/settings.json` may contain unrelated Claude configuration; never remove either whole directory.
 
 An **uninstall** removes only this project’s managed `notify` command, `notify-ntfy` hook handlers, scripts, and worker while preserving unrelated Codex settings and hooks. A **rollback** restores the timestamped snapshot taken immediately before a particular installation or upgrade. Decide which outcome is wanted before deleting anything.
 
@@ -334,7 +334,7 @@ if (Test-Path -LiteralPath $SavedTask -PathType Leaf) {
 
 This full rollback restores or removes Codex `hooks.json` exactly as captured and restores Claude `settings.json` only when the selected backup contains its pre-install snapshot. Do not restore either whole file when later unrelated hook/settings changes must survive; use the selective handler cleanup instead.
 
-Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.5.1 uses record schema 1 and retains the `pending/` and `watch/` state introduced in 2.4.0; compatibility with an arbitrary older build is not guaranteed.
+Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.5.2 uses record schema 1 and retains the `pending/` and `watch/` state introduced in 2.4.0; compatibility with an arbitrary older build is not guaranteed.
 
 Remote Windows backups use the same scheduled-task XML snapshot. The installer refuses to overwrite a task named `CodexNtfyWatcher` unless its action belongs to this project, and an installation failure restores the prior definition and running state automatically.
 
