@@ -2,7 +2,7 @@
 
 There are useful notification projects for Codex and other coding agents. Durable Codex ntfy notifier is not claimed to be the first or only solution. The best choice depends on whether the priority is true root-task idle detection, durable ntfy delivery, native desktop interaction, broad provider support, tmux integration, or a lightweight explicit workflow.
 
-This comparison was reviewed for version 2.5.2 on 2026-07-18, including Claude Code on Windows and the compact notification patterns described below. Projects change; verify their current documentation, code, supported platforms, maintenance status, security model, and license before adoption. The descriptions below are orientation, not security reviews or feature guarantees.
+This comparison was reviewed for version 2.6.0 on 2026-08-28, including Claude Code and AudnCode on Windows and the compact notification patterns described below. Projects change; verify their current documentation, code, supported platforms, maintenance status, security model, and license before adoption. The descriptions below are orientation, not security reviews or feature guarantees.
 
 ## Project map
 
@@ -24,7 +24,7 @@ This comparison was reviewed for version 2.5.2 on 2026-07-18, including Claude C
 
 ## What the adjacent-project review changed
 
-The lifecycle reviews behind 2.4 and 2.5 reinforced several engineering patterns:
+The lifecycle reviews behind 2.4, 2.5, and 2.6 reinforced several engineering patterns:
 
 - tail append-only lifecycle files incrementally and never advance past an incomplete JSONL line;
 - persist watcher cursors so a restart does not replay all history;
@@ -33,6 +33,9 @@ The lifecycle reviews behind 2.4 and 2.5 reinforced several engineering patterns
 - deduplicate and delay at a stable task/thread identity, not with one global cooldown;
 - keep an explicit hook signal plus a persisted-state recovery path.
 - for Claude `/goal`, use the newest durable transcript lifecycle marker instead of treating every `Stop` as final, and keep delayed idle notifications optional.
+- for AudnCode, correlate seven synchronous shape-8 events through installer-controlled expected-event arguments; use `SessionStart` for direct queries that bypass `UserPromptSubmit`, keep normal `Stop` pending until later `idle_prompt`, require transcript-backed current-prompt error proof for `StopFailure`, and bind background IDs to host PID/`startedAt` so `/clear` or `/resume` cannot erase live work;
+- pre-arm prompt/tool ingress durably before host discovery, stdin read, and JSON parsing, cap untrusted input/evidence, and treat missing, ambiguous, malformed, unstable, or oversized state as fail-closed rather than idle;
+- treat foreground idle as insufficient while a persisted command queue, explicit/custom task list, retained non-lead team directory, background/CCR claim, successful unacknowledged `SendMessage`, cron lease, or Ctrl+B sidechain remains; then repeat the full gate immediately before commit;
 
 The presentation review also found a useful compact pattern across several adjacent tools: expose a short result excerpt, commonly in roughly the 120–200 character range, and use one semantic icon/tag instead of repeating decorative markers through the title and body. That review informed this repository's 180-character default excerpt, single `white_check_mark` tag, title containing only the task/project name, and label-free one-line context. It did not change 2.4's idle-only detection semantics.
 
@@ -43,9 +46,10 @@ The implementation in this repository combines those general lessons with its ex
 Codex ntfy Notifier is a strong fit when these properties are needed together:
 
 - ntfy is the primary delivery channel;
-- “done” means the **root task is locally verifiable as idle**, not merely that one turn emitted a final response;
+- completion means the **root task is locally verifiable as idle**, not merely that one turn emitted a final response;
 - modern `Stop`, legacy `notify`, and local rollout state should converge on the same candidate;
 - opt-in Claude Code on Windows should share the durable queue while using provider-specific prompt/work/goal evidence;
+- opt-in AudnCode on Windows should combine normal `Stop` plus `idle_prompt`, or a uniquely proven `StopFailure`, with runtime-scoped background, queue, task/team, cron, and sidechain evidence without merging simultaneous sessions or releasing a newer prompt from a delayed old event;
 - an active goal or active descendant must delay the root notification;
 - automatic continuations must supersede earlier candidates;
 - concurrent app, VS Code, and CLI tasks must be isolated per root thread rather than merged by a global rate limit;
@@ -56,8 +60,9 @@ Codex ntfy Notifier is a strong fit when these properties are needed together:
 
 Its deliberate tradeoffs:
 
-- it is Codex-centered rather than universal; Claude support is intentionally limited to local Claude Code on Windows;
-- it depends on local Codex rollout/database formats for Codex's strongest idle proof and on Claude's local `attachment.goal_status` transcript format for `/goal` finality;
+- it is Codex-centered rather than universal; Claude Code and AudnCode support is intentionally limited to local Windows installations;
+- it depends on local Codex rollout/database formats for Codex's strongest idle proof, Claude's local `attachment.goal_status` transcript format for `/goal` finality, and AudnCode 0.9.x hook/session/transcript/queue/team/task/sidechain semantics;
+- the public AudnCode build can omit durable terminal/consumption evidence for `SendMessage`, overlapping same-ID resumes, `clearCommandQueue`, kill-all, some Ctrl+B paths, and session-only cron firing; CCR `/ultrareview` and durable cron work additionally require exact remote or causal native lease/file evidence. The adapter deliberately fails closed instead of announcing an intermediate state;
 - `strict` can withhold a real notification when local evidence is missing;
 - exact-task navigation is an opt-in HTTPS `click` target; native sounds, a notification center, and a central dashboard remain outside the project;
 - installation manages both hook configuration and a background worker;

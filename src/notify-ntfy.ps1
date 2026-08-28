@@ -10,6 +10,10 @@ param(
   [switch]$ReadStdin,
   [switch]$HookEvent,
   [switch]$ClaudeHook,
+  [switch]$AudnCodeHook,
+  [string]$AudnCodeHome,
+  [ValidateSet('', 'SessionStart', 'UserPromptSubmit', 'Stop', 'StopFailure', 'Notification', 'PostToolUse', 'SubagentStart')]
+  [string]$AudnCodeExpectedEvent = '',
   [switch]$BridgeFallback,
   [switch]$Worker,
   [switch]$Continuous,
@@ -32,10 +36,24 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.5.2'
+$ScriptVersion = '2.6.0'
 $MaxNtfyMessageBytes = 3500
+$MaxNtfyTitleBytes = 240
+$NotificationTitleMaxLineBytes = [int64](256 * 1024)
+$FirstMetadataLineMaxBytes = [int64](1024 * 1024)
+$ClaudeTitleHeadMaxBytes = [int64](2 * 1024 * 1024)
+$ClaudeTitleTailMaxBytes = [int64](4 * 1024 * 1024)
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
+$HookProcessStartUtcTicks = if ($AudnCodeHook) {
+  try { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks } catch { [DateTime]::UtcNow.Ticks }
+} else { [int64]0 }
+$testHookProcessStartUtcTicks = [int64]0
+if ($AudnCodeHook -and $env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+    [int64]::TryParse([string]$env:CODEX_NTFY_TEST_HOOK_START_TICKS, [ref]$testHookProcessStartUtcTicks) -and
+    $testHookProcessStartUtcTicks -gt 0) {
+  $HookProcessStartUtcTicks = $testHookProcessStartUtcTicks
+}
 $MiddleDot = [char]0x00B7
 $Ellipsis = [char]0x2026
 $CodexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
@@ -73,10 +91,75 @@ $MaintenanceLockPath = Join-Path $StateRoot 'maintenance.lock'
 $LogPath = Join-Path $StateRoot 'notify.log'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Utf8StrictNoBom = New-Object System.Text.UTF8Encoding($false, $true)
+$FileReplaceMethod = [System.IO.File].GetMethod(
+  'Replace',
+  [type[]]@([string], [string], [string])
+)
 $script:ClaudeGoalStateCache = @{}
+$script:AudnCodeQueueStateCache = @{}
+$script:AudnCodeQueueLineageCache = @{}
 $ClaudePromptBaselineMaxBytes = [int64](1024 * 1024)
 $ClaudeGoalMaxLineBytes = 1024 * 1024
+$AudnCodeQueueMaxLineChars = 1024 * 1024
+$AudnCodeQueueMaxTranscriptBytes = [int64](512 * 1024 * 1024)
+$AudnCodeQueueMaxEvidenceRecords = 4096
+$AudnCodeQueueMaxContentChars = 65536
+$AudnCodeTeamConfigMaxBytes = [int64](1024 * 1024)
+$AudnCodeTeamMaxMembers = 1024
+$AudnCodeTaskFileMaxBytes = [int64](1024 * 1024)
+$testAudnCodeQueueMaxTranscriptBytes = [int64]0
+if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+    [int64]::TryParse([string]$env:CODEX_NTFY_TEST_AUDNCODE_QUEUE_MAX_BYTES, [ref]$testAudnCodeQueueMaxTranscriptBytes) -and
+    $testAudnCodeQueueMaxTranscriptBytes -ge 1024 -and
+    $testAudnCodeQueueMaxTranscriptBytes -lt $AudnCodeQueueMaxTranscriptBytes) {
+  $AudnCodeQueueMaxTranscriptBytes = $testAudnCodeQueueMaxTranscriptBytes
+}
+$AudnCodeHookObservationMarkerName = '.codex-ntfy-hooks.json'
+$AudnCodeHookShapeVersion = 8
+$AudnCodeLifecycleMaxPendingTokens = 32
+$AudnCodeSessionMaxHostLifetimes = 8
+$AudnCodeSessionStartBusyEventRank = 1
+$AudnCodeUserPromptBusyEventRank = 2
+$AudnCodeStopFailureMaxTailBytes = [int64](8 * 1024 * 1024)
+$AudnCodeStopFailureMaxRecords = 4096
+$AudnCodeStopFailureMaxLineChars = 1024 * 1024
+$AudnCodeStopFailureAnchorBytes = 256
+$AudnCodeRemoteAgentMaxFiles = 256
+$AudnCodeRemoteAgentMaxClaims = 64
+$AudnCodeRemoteAgentMetadataMaxBytes = [int64](1024 * 1024)
+$MaxRawNotificationBytes = 8 * 1024 * 1024
+$RawNotificationReadTimeoutMilliseconds = 20000
+$testRawNotificationReadTimeoutMilliseconds = 0
+if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+    [int]::TryParse(
+      [string]$env:CODEX_NTFY_TEST_STDIN_TIMEOUT_MS,
+      [ref]$testRawNotificationReadTimeoutMilliseconds
+    ) -and
+    $testRawNotificationReadTimeoutMilliseconds -ge 100 -and
+    $testRawNotificationReadTimeoutMilliseconds -lt $RawNotificationReadTimeoutMilliseconds) {
+  # Tests may shorten this safety deadline, never lengthen or disable it.
+  $RawNotificationReadTimeoutMilliseconds = $testRawNotificationReadTimeoutMilliseconds
+}
 $MaxFallbackRolloutLineBytes = 8 * 1024 * 1024
+$RolloutWatchMaxReadBytes = [int64](8 * 1024 * 1024)
+$RolloutWatchMaxLineBytes = [int64](8 * 1024 * 1024)
+$SessionIndexMaxBytes = [int64](4 * 1024 * 1024)
+$testRolloutWatchMaxReadBytes = [int64]0
+if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+    [int64]::TryParse(
+      [string]$env:CODEX_NTFY_TEST_WATCH_MAX_BYTES,
+      [ref]$testRolloutWatchMaxReadBytes
+    ) -and
+    $testRolloutWatchMaxReadBytes -ge 256 -and
+    $testRolloutWatchMaxReadBytes -lt $RolloutWatchMaxReadBytes) {
+  # Tests may shrink the production ceiling, never expand or disable it.
+  $RolloutWatchMaxReadBytes = $testRolloutWatchMaxReadBytes
+  $RolloutWatchMaxLineBytes = $testRolloutWatchMaxReadBytes
+}
+$script:RolloutWatchBytesRead = [int64]0
+$script:RolloutWatchBacklogFiles = 0
+$script:RolloutWatchTruncatedReplays = 0
+$script:RolloutWatchCorruptFiles = 0
 
 function Ensure-RuntimeDirectories {
   foreach ($path in @($StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir, $DeadDir, $MutationLocksDir, $ClaudeSessionsDir)) {
@@ -165,9 +248,110 @@ function Get-StrongEventKey {
   return Get-Sha256Hex $identity
 }
 
+function Test-SafeUnicodeScalarText {
+  param([AllowNull()][AllowEmptyString()][string]$Value)
+
+  if ($null -eq $Value) { return $true }
+  for ($index = 0; $index -lt $Value.Length; $index++) {
+    $codeUnit = [int][char]$Value[$index]
+    if ($codeUnit -eq 0xFFFD) { return $false }
+    if ($codeUnit -ge 0xD800 -and $codeUnit -le 0xDBFF) {
+      if ($index + 1 -ge $Value.Length) { return $false }
+      $low = [int][char]$Value[$index + 1]
+      if ($low -lt 0xDC00 -or $low -gt 0xDFFF) { return $false }
+      $index++
+    } elseif ($codeUnit -ge 0xDC00 -and $codeUnit -le 0xDFFF) {
+      return $false
+    }
+  }
+  return $true
+}
+
+function Assert-SafeUnicodeScalarText {
+  param(
+    [AllowNull()][AllowEmptyString()][string]$Value,
+    [string]$Context = 'text'
+  )
+  if (-not (Test-SafeUnicodeScalarText -Value $Value)) {
+    throw "$Context contains invalid Unicode scalar data"
+  }
+}
+
+function Assert-JsonUnicodeScalars {
+  param(
+    [AllowNull()][object]$Value,
+    [int]$Depth = 0
+  )
+
+  if ($Depth -gt 64) { throw 'JSON nesting exceeds the supported depth' }
+  if ($null -eq $Value) { return }
+  if ($Value -is [string]) {
+    Assert-SafeUnicodeScalarText -Value ([string]$Value) -Context 'JSON string'
+    return
+  }
+  if ($Value -is [ValueType]) { return }
+  if ($Value -is [System.Collections.IDictionary]) {
+    foreach ($key in $Value.Keys) {
+      if ($key -is [string]) { Assert-SafeUnicodeScalarText -Value ([string]$key) -Context 'JSON object key' }
+      Assert-JsonUnicodeScalars -Value $Value[$key] -Depth ($Depth + 1)
+    }
+    return
+  }
+  if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+    foreach ($item in $Value) { Assert-JsonUnicodeScalars -Value $item -Depth ($Depth + 1) }
+    return
+  }
+  $properties = @($Value.PSObject.Properties | Where-Object { $_.MemberType -in @('NoteProperty', 'Property') })
+  foreach ($property in $properties) {
+    Assert-SafeUnicodeScalarText -Value ([string]$property.Name) -Context 'JSON object key'
+    Assert-JsonUnicodeScalars -Value $property.Value -Depth ($Depth + 1)
+  }
+}
+
+function ConvertFrom-StrictJsonText {
+  param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+  Assert-SafeUnicodeScalarText -Value $Text -Context 'JSON input'
+  $value = $Text | ConvertFrom-Json -ErrorAction Stop
+  Assert-JsonUnicodeScalars -Value $value
+  return $value
+}
+
+function Read-StrictUtf8Text {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [int64]$MaxBytes = 0
+  )
+
+  $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+  $stream = $null
+  try {
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharing)
+    if ($MaxBytes -gt 0 -and $stream.Length -gt $MaxBytes) { throw 'text input exceeds the supported byte limit' }
+    if ($stream.Length -gt [int]::MaxValue) { throw 'text input exceeds the supported byte limit' }
+    $bytes = New-Object byte[] ([int]$stream.Length)
+    $read = 0
+    while ($read -lt $bytes.Length) {
+      $count = $stream.Read($bytes, $read, $bytes.Length - $read)
+      if ($count -le 0) { throw 'text input ended unexpectedly' }
+      $read += $count
+    }
+    $offset = 0
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $offset = 3 }
+    $text = $Utf8StrictNoBom.GetString($bytes, $offset, $bytes.Length - $offset)
+    Assert-SafeUnicodeScalarText -Value $text -Context 'UTF-8 input'
+    return $text
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
 function ConvertTo-CompactJson {
   param([object]$Value)
-  return ($Value | ConvertTo-Json -Compress -Depth 20)
+  Assert-JsonUnicodeScalars -Value $Value
+  $json = $Value | ConvertTo-Json -Compress -Depth 20
+  Assert-SafeUnicodeScalarText -Value $json -Context 'JSON output'
+  return $json
 }
 
 function Write-JsonAtomic {
@@ -186,14 +370,38 @@ function Write-JsonAtomic {
   try {
     if ($NoOverwrite) {
       [System.IO.File]::Move($tempPath, $Path)
-    } elseif (Test-Path -LiteralPath $Path) {
-      try {
-        [System.IO.File]::Replace($tempPath, $Path, $null)
-      } catch {
-        Move-Item -LiteralPath $tempPath -Destination $Path -Force
-      }
     } else {
-      [System.IO.File]::Move($tempPath, $Path)
+      # File.Replace needs delete sharing on every concurrent reader. Antivirus,
+      # indexers, and even a status poll can briefly omit that share flag on
+      # Windows. Keep the temp file private and retry the atomic operation
+      # instead of immediately falling back to Move-Item -Force, which can lose
+      # a worker iteration in the same sharing window. Reflection preserves the
+      # real null backup path that Windows PowerShell 5.1 otherwise binds as an
+      # empty (and invalid) path for File.Replace.
+      $written = $false
+      for ($attempt = 0; $attempt -lt 200 -and -not $written; $attempt++) {
+        try {
+          if (Test-Path -LiteralPath $Path) {
+            $replaceArguments = New-Object 'object[]' 3
+            $replaceArguments[0] = [string]$tempPath
+            $replaceArguments[1] = [string]$Path
+            $replaceArguments[2] = $null
+            [void]$FileReplaceMethod.Invoke($null, $replaceArguments)
+          } else {
+            [System.IO.File]::Move($tempPath, $Path)
+          }
+          $written = $true
+        } catch {
+          $writeError = $_.Exception
+          while ($null -ne $writeError.InnerException) {
+            $writeError = $writeError.InnerException
+          }
+          if ($writeError -isnot [System.IO.IOException] -or $attempt -ge 199) {
+            throw $writeError
+          }
+          Start-Sleep -Milliseconds 10
+        }
+      }
     }
   } finally {
     if (Test-Path -LiteralPath $tempPath) {
@@ -208,7 +416,7 @@ function Read-JsonFile {
   if (-not (Test-Path -LiteralPath $Path)) {
     return $null
   }
-  return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+  return ConvertFrom-StrictJsonText -Text (Read-StrictUtf8Text -Path $Path)
 }
 
 function Get-NotificationTags {
@@ -227,23 +435,31 @@ function Get-NotificationTags {
   } else {
     throw 'tags must be an array of strings or a comma-separated string'
   }
-  $seen = New-Object 'System.Collections.Generic.HashSet[string]'
-  $result = New-Object 'System.Collections.Generic.List[string]'
+  $items = @($items)
+  $selected = ''
+  $normalized = $false
   foreach ($item in $items) {
     if ($item -isnot [string]) {
-      throw 'tags must be an array of strings or a comma-separated string'
+      $normalized = $true
+      continue
     }
-    $tag = $item.Trim()
-    if ([string]::IsNullOrWhiteSpace($tag)) {
-      if ($items.Count -eq 1 -and $raw -is [string]) { continue }
-      throw 'tags must contain non-empty strings of at most 32 characters without whitespace'
+    if (-not (Test-SafeUnicodeScalarText -Value ([string]$item))) { $normalized = $true; continue }
+    $tag = ([string]$item).Trim().Normalize([Text.NormalizationForm]::FormC)
+    $clusters = @(Get-NotificationClusters -Value $tag)
+    $unsafeTag = [string]::IsNullOrWhiteSpace($tag) -or $clusters.Count -gt 32 -or
+      (($clusters -join '') -cne $tag) -or [regex]::IsMatch($tag, '\s') -or
+      [regex]::IsMatch($tag, '[\x00-\x1F\x7F-\x9F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]')
+    if ($unsafeTag) { $normalized = $true; continue }
+    if ([string]::IsNullOrEmpty($selected)) {
+      $selected = $tag
+    } else {
+      $normalized = $true
     }
-    if ($tag.Length -gt 32 -or [regex]::IsMatch($tag, '\s')) {
-      throw 'tags must contain non-empty strings of at most 32 characters without whitespace'
-    }
-    if ($seen.Add($tag)) { $result.Add($tag) }
   }
-  foreach ($tag in $result) { Write-Output $tag }
+  if ([string]::IsNullOrEmpty($selected)) { $selected = 'white_check_mark' }
+  if ($items.Count -gt 1) { $normalized = $true }
+  if ($normalized) { Write-RuntimeLog 'Normalized ntfy tags to one valid status tag.' }
+  Write-Output $selected
 }
 
 function Get-Config {
@@ -360,21 +576,78 @@ function Get-Config {
   }
 }
 
+function Test-GraphemeExtensionCodePoint {
+  param(
+    [string]$Value,
+    [int]$Index,
+    [int]$CodePoint
+  )
+  $category = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($Value, $Index)
+  return $category -in @(
+      [Globalization.UnicodeCategory]::NonSpacingMark,
+      [Globalization.UnicodeCategory]::SpacingCombiningMark,
+      [Globalization.UnicodeCategory]::EnclosingMark
+    ) -or ($CodePoint -ge 0xFE00 -and $CodePoint -le 0xFE0F) -or
+    ($CodePoint -ge 0xE0100 -and $CodePoint -le 0xE01EF) -or
+    ($CodePoint -ge 0x1F3FB -and $CodePoint -le 0x1F3FF) -or
+    ($CodePoint -ge 0xE0020 -and $CodePoint -le 0xE007F)
+}
+
+function Get-NotificationClusters {
+  param([AllowEmptyString()][string]$Value)
+
+  if ([string]::IsNullOrEmpty($Value) -or -not (Test-SafeUnicodeScalarText -Value $Value)) { return @() }
+  $result = New-Object 'System.Collections.Generic.List[string]'
+  $current = ''
+  $pendingJoiner = ''
+  $regionalCount = 0
+  for ($index = 0; $index -lt $Value.Length; ) {
+    $codePoint = [char]::ConvertToUtf32($Value, $index)
+    $width = if ($codePoint -gt 0xFFFF) { 2 } else { 1 }
+    $scalar = $Value.Substring($index, $width)
+    $isJoiner = $codePoint -in @(0x200C, 0x200D)
+    $isExtension = Test-GraphemeExtensionCodePoint -Value $Value -Index $index -CodePoint $codePoint
+    $isRegional = $codePoint -ge 0x1F1E6 -and $codePoint -le 0x1F1FF
+    if ($isJoiner) {
+      if (-not [string]::IsNullOrEmpty($current)) { $pendingJoiner = $scalar }
+    } elseif ($isExtension) {
+      if (-not [string]::IsNullOrEmpty($current) -and [string]::IsNullOrEmpty($pendingJoiner)) { $current += $scalar }
+    } elseif (-not [string]::IsNullOrEmpty($pendingJoiner)) {
+      $current += $pendingJoiner + $scalar
+      $pendingJoiner = ''
+      $regionalCount = 0
+    } elseif ([string]::IsNullOrEmpty($current)) {
+      $current = $scalar
+      $regionalCount = if ($isRegional) { 1 } else { 0 }
+    } elseif ($isRegional -and $regionalCount -eq 1) {
+      $current += $scalar
+      $regionalCount = 2
+    } else {
+      $result.Add($current)
+      $current = $scalar
+      $regionalCount = if ($isRegional) { 1 } else { 0 }
+    }
+    $index += $width
+  }
+  if (-not [string]::IsNullOrEmpty($current)) { $result.Add($current) }
+  return @($result)
+}
+
 function Limit-NotificationCharacters {
   param(
     [AllowEmptyString()][string]$Value,
     [int]$MaxLength
   )
 
-  if ([string]::IsNullOrEmpty($Value)) { return '' }
-  $indexes = [Globalization.StringInfo]::ParseCombiningCharacters($Value)
-  if ($indexes.Count -le $MaxLength) { return $Value }
-  if ($MaxLength -le 0) { return '' }
+  if ([string]::IsNullOrEmpty($Value) -or $MaxLength -le 0) { return '' }
+  $clusters = @(Get-NotificationClusters -Value $Value)
+  if ($clusters.Count -eq 0) { return '' }
+  if ($clusters.Count -le $MaxLength) { return ($clusters -join '') }
   if ($MaxLength -eq 1) { return [string]$Ellipsis }
   $keep = $MaxLength - 1
-  $prefix = $Value.Substring(0, $indexes[$keep]).TrimEnd()
+  $prefix = (($clusters | Select-Object -First $keep) -join '').TrimEnd()
   $boundary = [Math]::Max($prefix.LastIndexOf(' '), $prefix.LastIndexOf("`n"))
-  if ($boundary -ge [int][Math]::Floor($keep * 0.7)) {
+  if ($boundary -ge [int][Math]::Floor($prefix.Length * 0.7)) {
     $prefix = $prefix.Substring(0, $boundary).TrimEnd()
   }
   return $prefix + $Ellipsis
@@ -386,43 +659,57 @@ function Limit-Utf8Text {
     [int]$MaxBytes
   )
 
-  if ([string]::IsNullOrEmpty($Value) -or $MaxBytes -le 0) { return '' }
-  if ($Utf8NoBom.GetByteCount($Value) -le $MaxBytes) { return $Value }
+  if ([string]::IsNullOrEmpty($Value) -or $MaxBytes -le 0 -or -not (Test-SafeUnicodeScalarText -Value $Value)) { return '' }
+  if ($Utf8StrictNoBom.GetByteCount($Value) -le $MaxBytes) { return $Value }
   $suffix = [string]$Ellipsis
-  $suffixBytes = $Utf8NoBom.GetByteCount($suffix)
+  $suffixBytes = $Utf8StrictNoBom.GetByteCount($suffix)
   if ($MaxBytes -lt $suffixBytes) { return '' }
   $budget = $MaxBytes - $suffixBytes
-  $indexes = [Globalization.StringInfo]::ParseCombiningCharacters($Value)
-  $low = 0
-  $high = $indexes.Count
-  while ($low -lt $high) {
-    $middle = [int][Math]::Ceiling(($low + $high) / 2.0)
-    $end = if ($middle -ge $indexes.Count) { $Value.Length } else { $indexes[$middle] }
-    if ($Utf8NoBom.GetByteCount($Value.Substring(0, $end)) -le $budget) {
-      $low = $middle
-    } else {
-      $high = $middle - 1
-    }
+  $builder = New-Object Text.StringBuilder
+  foreach ($cluster in @(Get-NotificationClusters -Value $Value)) {
+    if ($Utf8StrictNoBom.GetByteCount($builder.ToString() + $cluster) -gt $budget) { break }
+    [void]$builder.Append($cluster)
   }
-  $prefixEnd = if ($low -ge $indexes.Count) { $Value.Length } else { $indexes[$low] }
-  return $Value.Substring(0, $prefixEnd).TrimEnd() + $suffix
+  $prefix = $builder.ToString().TrimEnd()
+  if ([string]::IsNullOrEmpty($prefix)) { return $suffix }
+  return $prefix + $suffix
+}
+
+function Normalize-NotificationText {
+  param([AllowNull()][AllowEmptyString()][string]$Text)
+
+  if ([string]::IsNullOrEmpty($Text) -or -not (Test-SafeUnicodeScalarText -Value $Text)) { return '' }
+  $value = $Text -replace "`r`n?", "`n"
+  $value = $value -replace "[\u2028\u2029]", "`n"
+  $value = [regex]::Replace($value, '[\x00-\x08\x0B-\x1F\x7F-\x9F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]', '')
+  return $value.Normalize([Text.NormalizationForm]::FormC)
 }
 
 function Convert-MarkdownToPlainText {
   param([AllowEmptyString()][string]$Text)
 
-  if ([string]::IsNullOrEmpty($Text)) { return '' }
-  $value = $Text -replace "`r`n?", "`n"
+  $value = Normalize-NotificationText -Text $Text
+  if ([string]::IsNullOrEmpty($value)) { return '' }
 
   # Protect literal code and escaped Markdown punctuation while formatting the
   # surrounding prose. Without this, identifiers such as __init__,
   # last_assistant_message, and a*b*c would be mistaken for emphasis.
   $literals = New-Object 'System.Collections.Generic.List[string]'
+  $literalNamespace = ''
+  for ($nonce = 0; $nonce -lt 32; $nonce++) {
+    $digest = Get-Sha256Hex "codex-ntfy-markdown-literal/v1|$nonce|$value"
+    $left = [char](0xE000 + ([Convert]::ToInt32($digest.Substring(0, 4), 16) % 6400))
+    $right = [char](0xE000 + ([Convert]::ToInt32($digest.Substring(4, 4), 16) % 6400))
+    if ($right -eq $left) { $right = [char](0xE000 + (([int]$right - 0xE000 + 1) % 6400)) }
+    $candidate = [string]$left + $digest.Substring(8, 16) + [string]$right
+    if (-not $value.Contains($candidate)) { $literalNamespace = $candidate; break }
+  }
+  if ([string]::IsNullOrEmpty($literalNamespace)) { return $value }
   $protectLiteral = {
     param([AllowEmptyString()][string]$Literal)
     $index = $literals.Count
     [void]$literals.Add($Literal)
-    return "$([char]0xE000)$index$([char]0xE001)"
+    return "$literalNamespace$index$literalNamespace"
   }
   $preparedLines = New-Object 'System.Collections.Generic.List[string]'
   $insideFence = $false
@@ -483,7 +770,7 @@ function Convert-MarkdownToPlainText {
     $value = [regex]::Replace($value, '(?<![\w_])_([^_\r\n]+)_(?![\w_])', '$1')
   }
   for ($index = 0; $index -lt $literals.Count; $index++) {
-    $token = "$([char]0xE000)$index$([char]0xE001)"
+    $token = "$literalNamespace$index$literalNamespace"
     $value = $value.Replace($token, $literals[$index])
   }
   return $value.Trim()
@@ -496,17 +783,17 @@ function Sanitize-NotificationText {
     [switch]$PreserveLines
   )
 
-  if ([string]::IsNullOrWhiteSpace($Text)) {
+  $normalized = Normalize-NotificationText -Text $Text
+  if ([string]::IsNullOrWhiteSpace($normalized)) {
     return ''
   }
   if ($PreserveLines) {
-    $value = $Text -replace "`r`n?", "`n"
-    $value = [regex]::Replace($value, '[\t\f\v ]+', ' ')
+    $value = [regex]::Replace($normalized, '[\t ]+', ' ')
     $value = [regex]::Replace($value, ' *\n *', "`n")
     $value = [regex]::Replace($value, '\n{3,}', "`n`n")
     $value = $value.Trim()
   } else {
-    $value = ($Text -replace '\s+', ' ').Trim()
+    $value = ($normalized -replace '\s+', ' ').Trim()
   }
   $value = [regex]::Replace($value, '(?i)\b(authorization)\s*[:=]\s*(bearer|basic)\s+\S+', '$1=[REDACTED]')
   $value = [regex]::Replace($value, '(?i)\b(password|passwd|token|api[_-]?key|secret)\s*[:=]\s*[^\s,;]+', '$1=[REDACTED]')
@@ -556,18 +843,12 @@ function Get-ThreadTitle {
   if (-not (Test-Path -LiteralPath $indexPath)) {
     return $null
   }
-  $stream = $null
-  $reader = $null
   try {
-    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-    $stream = New-Object IO.FileStream($indexPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
-    $reader = New-Object IO.StreamReader($stream, $Utf8NoBom, $true)
     $title = $null
-    while (-not $reader.EndOfStream) {
-      $line = $reader.ReadLine()
+    foreach ($line in @(Get-Utf8TailLinesFast -Path $indexPath -MaxLines 8192 -MaxBytes $SessionIndexMaxBytes -MaxLineBytes $NotificationTitleMaxLineBytes)) {
       if ([string]::IsNullOrWhiteSpace($line) -or -not $line.Contains($ThreadId)) { continue }
       try {
-        $item = $line | ConvertFrom-Json
+        $item = ConvertFrom-StrictJsonText -Text $line
         if ([string](Get-ObjectValue $item 'id' '') -eq $ThreadId) {
           $candidate = [string](Get-ObjectValue $item 'thread_name' '')
           if (-not [string]::IsNullOrWhiteSpace($candidate)) { $title = $candidate }
@@ -578,19 +859,18 @@ function Get-ThreadTitle {
     }
   } catch {
     $title = $null
-  } finally {
-    if ($null -ne $reader) { $reader.Dispose() }
-    elseif ($null -ne $stream) { $stream.Dispose() }
   }
   if (-not [string]::IsNullOrWhiteSpace($title)) { return $title }
   return $null
 }
 
 function Read-FirstLineShared {
-  param([string]$Path)
+  param(
+    [string]$Path,
+    [int64]$MaxBytes = $FirstMetadataLineMaxBytes
+  )
 
   $stream = $null
-  $reader = $null
   try {
     # Codex keeps active rollout files open for writing. FileShare.Read alone
     # conflicts with that writer on Windows, so explicitly allow write/delete.
@@ -601,22 +881,131 @@ function Read-FirstLineShared {
       [System.IO.FileAccess]::Read,
       $sharing
     )
-    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true, 4096, $false)
-    return $reader.ReadLine()
-  } finally {
-    if ($null -ne $reader) {
-      $reader.Dispose()
-    } elseif ($null -ne $stream) {
-      $stream.Dispose()
+    $bytes = New-Object 'System.Collections.Generic.List[byte]'
+    while ($bytes.Count -le $MaxBytes) {
+      $next = $stream.ReadByte()
+      if ($next -lt 0 -or $next -eq 10) { break }
+      $bytes.Add([byte]$next)
     }
+    if ($bytes.Count -gt $MaxBytes) { throw 'metadata line exceeds the supported byte limit' }
+    $raw = $bytes.ToArray()
+    if ($raw.Length -gt 0 -and $raw[$raw.Length - 1] -eq 13) {
+      if ($raw.Length -eq 1) { $raw = [byte[]]@() } else { $raw = $raw[0..($raw.Length - 2)] }
+    }
+    $offset = 0
+    if ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF) { $offset = 3 }
+    $line = $Utf8StrictNoBom.GetString($raw, $offset, $raw.Length - $offset)
+    Assert-SafeUnicodeScalarText -Value $line -Context 'metadata line'
+    return $line
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
   }
+}
+
+function Resolve-TrustedRolloutPath {
+  param(
+    [string]$CandidatePath,
+    [string]$SessionHome,
+    [string]$ThreadId = ''
+  )
+
+  if ([string]::IsNullOrWhiteSpace($CandidatePath) -or
+      [string]::IsNullOrWhiteSpace($SessionHome) -or
+      -not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) { return '' }
+  try {
+    $candidate = [IO.Path]::GetFullPath($CandidatePath)
+    $comparison = if ($env:OS -eq 'Windows_NT') {
+      [StringComparison]::OrdinalIgnoreCase
+    } else {
+      [StringComparison]::Ordinal
+    }
+    $trustedRoot = ''
+    foreach ($rootName in @('sessions', 'archived_sessions')) {
+      $rootPath = Join-Path $SessionHome $rootName
+      if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) { continue }
+      $root = [IO.Path]::GetFullPath($rootPath).TrimEnd([char[]]@('\', '/'))
+      $prefix = $root + [IO.Path]::DirectorySeparatorChar
+      if ($candidate.StartsWith($prefix, $comparison)) {
+        $trustedRoot = $root
+        break
+      }
+    }
+    if ([string]::IsNullOrWhiteSpace($trustedRoot)) { return '' }
+
+    # A nested junction/symlink could otherwise make a lexically contained path
+    # escape the Codex session roots. The session home itself remains the trust
+    # boundary, but every component below it must be a normal filesystem entry.
+    $cursor = $trustedRoot
+    foreach ($segment in @($candidate.Substring($trustedRoot.Length).TrimStart([char[]]@('\', '/')) -split '[\\/]')) {
+      if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+      $cursor = Join-Path $cursor $segment
+      $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+      if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return '' }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ThreadId)) {
+      $metadata = ConvertFrom-StrictJsonText -Text (Read-FirstLineShared -Path $candidate)
+      if ([string](Get-ObjectValue $metadata 'type' '') -ne 'session_meta') { return '' }
+      $payload = Get-ObjectValue $metadata 'payload'
+      if ($null -eq $payload -or [string](Get-ObjectValue $payload 'id' '') -ne $ThreadId) { return '' }
+    }
+    return $candidate
+  } catch {
+    return ''
+  }
+}
+
+function Resolve-ExactRolloutPath {
+  param(
+    [string]$DatabasePathValue,
+    [string]$SessionHome,
+    [string]$ThreadId
+  )
+
+  if ([string]::IsNullOrWhiteSpace($DatabasePathValue)) { return '' }
+  $trusted = Resolve-TrustedRolloutPath -CandidatePath $DatabasePathValue -SessionHome $SessionHome -ThreadId $ThreadId
+  if (-not [string]::IsNullOrWhiteSpace($trusted)) { return $trusted }
+  $normalized = $DatabasePathValue.Replace('\', '/')
+  $marker = $normalized.IndexOf('/.codex/', [StringComparison]::OrdinalIgnoreCase)
+  if ($marker -lt 0 -or [string]::IsNullOrWhiteSpace($SessionHome)) { return '' }
+  $relativeValue = $normalized.Substring($marker + '/.codex/'.Length)
+  if ([string]::IsNullOrWhiteSpace($relativeValue) -or [IO.Path]::IsPathRooted($relativeValue) -or
+      @($relativeValue -split '/').Where({ $_ -in @('', '.', '..') }).Count -gt 0) { return '' }
+  $relative = $relativeValue.Replace('/', [IO.Path]::DirectorySeparatorChar)
+  $translated = Join-Path $SessionHome $relative
+  return Resolve-TrustedRolloutPath -CandidatePath $translated -SessionHome $SessionHome -ThreadId $ThreadId
+}
+
+function Test-BoundedSessionIndexThread {
+  param(
+    [string]$SessionHome,
+    [string]$ThreadId
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SessionHome) -or [string]::IsNullOrWhiteSpace($ThreadId)) { return $false }
+  $indexPath = Join-Path $SessionHome 'session_index.jsonl'
+  try {
+    foreach ($line in @(Get-Utf8TailLinesFast -Path $indexPath -MaxLines 8192 -MaxBytes $SessionIndexMaxBytes -MaxLineBytes $NotificationTitleMaxLineBytes)) {
+      if ([string]::IsNullOrWhiteSpace($line) -or -not $line.Contains($ThreadId)) { continue }
+      try {
+        $item = ConvertFrom-StrictJsonText -Text $line
+        if ([string](Get-ObjectValue $item 'id' '') -eq $ThreadId) { return $true }
+      } catch {
+        return $false
+      }
+    }
+  } catch {
+    return $false
+  }
+  return $false
 }
 
 function Get-EventClassification {
   param(
     [object]$Event,
     [string]$ThreadId,
-    [string]$SessionHome = $CodexHome
+    [string]$SessionHome = $CodexHome,
+    [string]$SqliteHome = $SessionHome
   )
 
   try {
@@ -646,29 +1035,72 @@ function Get-EventClassification {
   if ([string]::IsNullOrWhiteSpace($ThreadId)) {
     return 'unknown'
   }
-  foreach ($rootName in @('sessions', 'archived_sessions')) {
-    $root = Join-Path $SessionHome $rootName
-    if (-not (Test-Path -LiteralPath $root)) {
-      continue
+  if ([string]::IsNullOrWhiteSpace($SessionHome)) { $SessionHome = $CodexHome }
+  if ([string]::IsNullOrWhiteSpace($SqliteHome)) { $SqliteHome = $SessionHome }
+  $database = Get-StateDatabasePath -SqliteHome $SqliteHome
+  $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT rollout_path, COALESCE(thread_source,''), COALESCE(source,'') FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 3
+  if (-not $row.ok -and $row.error -match '(?i)no such column') {
+    $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT rollout_path, '', COALESCE(source,'') FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 3
+  }
+  if ($row.ok -and $row.found) {
+    $threadSource = [string]$row.values[1]
+    $databaseSource = [string]$row.values[2]
+    if ($threadSource.Equals('subagent', [StringComparison]::OrdinalIgnoreCase) -or
+        $databaseSource -match '(?i)"subagent"') {
+      return 'subagent'
     }
-    try {
-      $session = Get-ChildItem -LiteralPath $root -Filter "*$ThreadId*.jsonl" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-      if ($null -eq $session) {
-        continue
-      }
-      $firstLine = Read-FirstLineShared -Path $session.FullName
-      if ([string]::IsNullOrWhiteSpace($firstLine)) {
-        continue
-      }
-      $metadata = $firstLine | ConvertFrom-Json
-      $payload = Get-ObjectValue $metadata 'payload'
-      $source = Get-ObjectValue $payload 'source'
-      if ($null -ne $source -and $source -isnot [string] -and $null -ne (Get-ObjectValue $source 'subagent')) {
-        return 'subagent'
-      }
+    $edge = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT child_thread_id FROM thread_spawn_edges WHERE child_thread_id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 1
+    if ($edge.ok -and $edge.found) {
+      return 'subagent'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($threadSource) -or
+        (-not [string]::IsNullOrWhiteSpace($databaseSource) -and $edge.ok)) {
       return 'root'
-    } catch {
-      continue
+    }
+    $exactRollout = Resolve-ExactRolloutPath -DatabasePathValue ([string]$row.values[0]) -SessionHome $SessionHome -ThreadId $ThreadId
+    if (-not [string]::IsNullOrWhiteSpace($exactRollout)) {
+      try {
+        $firstLine = Read-FirstLineShared -Path $exactRollout
+        $metadata = ConvertFrom-StrictJsonText -Text $firstLine
+        $payload = Get-ObjectValue $metadata 'payload'
+        $metadataSource = Get-ObjectValue $payload 'source'
+        if ($null -ne $metadataSource -and $metadataSource -isnot [string] -and
+            $null -ne (Get-ObjectValue $metadataSource 'subagent')) {
+          return 'subagent'
+        }
+        if ($null -ne $payload) { return 'root' }
+      } catch {
+        # The bounded root index below is the final side-effect-free fallback.
+      }
+    }
+  }
+  if (Test-BoundedSessionIndexThread -SessionHome $SessionHome -ThreadId $ThreadId) { return 'root' }
+  # A brand-new active session can precede both SQLite and session_index.jsonl.
+  # Probe only current/previous date buckets and the flat archive, cap matches,
+  # then verify the embedded identity before trusting any metadata.
+  $today = [DateTime]::Now.Date
+  $todayBucket = Join-Path (Join-Path (Join-Path 'sessions' $today.ToString('yyyy')) $today.ToString('MM')) $today.ToString('dd')
+  $yesterday = $today.AddDays(-1)
+  $yesterdayBucket = Join-Path (Join-Path (Join-Path 'sessions' $yesterday.ToString('yyyy')) $yesterday.ToString('MM')) $yesterday.ToString('dd')
+  $buckets = @(
+    (Join-Path $SessionHome $todayBucket),
+    (Join-Path $SessionHome $yesterdayBucket),
+    (Join-Path $SessionHome 'archived_sessions')
+  )
+  foreach ($bucket in $buckets) {
+    if (-not (Test-Path -LiteralPath $bucket -PathType Container)) { continue }
+    foreach ($candidate in @(Get-ChildItem -LiteralPath $bucket -Filter "*$ThreadId*.jsonl" -File -ErrorAction SilentlyContinue | Select-Object -First 8)) {
+      try {
+        $trustedCandidate = Resolve-TrustedRolloutPath -CandidatePath $candidate.FullName -SessionHome $SessionHome -ThreadId $ThreadId
+        if ([string]::IsNullOrWhiteSpace($trustedCandidate)) { continue }
+        $metadata = ConvertFrom-StrictJsonText -Text (Read-FirstLineShared -Path $trustedCandidate)
+        $payload = Get-ObjectValue $metadata 'payload'
+        if ([string](Get-ObjectValue $payload 'id' '') -ne $ThreadId) { continue }
+        $metadataSource = Get-ObjectValue $payload 'source'
+        if ($null -ne $metadataSource -and $metadataSource -isnot [string] -and
+            $null -ne (Get-ObjectValue $metadataSource 'subagent')) { return 'subagent' }
+        return 'root'
+      } catch { continue }
     }
   }
   return 'unknown'
@@ -677,28 +1109,56 @@ function Get-EventClassification {
 function Get-RawNotification {
   function Read-Utf8StandardInput {
     $stream = $null
-    $reader = $null
+    $memory = $null
+    $pendingRead = $null
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
     try {
       $stream = [Console]::OpenStandardInput()
-      # Never let BOM detection replace the strict decoder with UTF-16 or with
-      # a replacement-fallback UTF-8 instance. Decode one contract only, then
-      # remove an optional UTF-8 BOM after it has been validated as UTF-8.
-      $reader = New-Object System.IO.StreamReader($stream, $Utf8StrictNoBom, $false, 4096, $false)
-      $value = $reader.ReadToEnd()
+      $memory = New-Object System.IO.MemoryStream
+      $buffer = New-Object byte[] 8192
+      $total = 0
+      while ($true) {
+        $remainingMilliseconds = $RawNotificationReadTimeoutMilliseconds - [int]$deadline.ElapsedMilliseconds
+        if ($remainingMilliseconds -le 0) {
+          throw [TimeoutException]::new('notify stdin did not reach EOF before the safety deadline')
+        }
+        # AudnCode owns the outer 30-second hook deadline. BeginRead keeps this
+        # process independently bounded when that wrapper is terminated while
+        # its inherited pipe writer remains open. Its ThreadPool callback is a
+        # background worker; disposing our stream in finally releases the OS
+        # read handle even when EOF never arrives.
+        $pendingRead = $stream.BeginRead($buffer, 0, $buffer.Length, $null, $null)
+        if (-not $pendingRead.AsyncWaitHandle.WaitOne($remainingMilliseconds)) {
+          throw [TimeoutException]::new('notify stdin did not reach EOF before the safety deadline')
+        }
+        $read = $stream.EndRead($pendingRead)
+        $pendingRead.AsyncWaitHandle.Close()
+        $pendingRead = $null
+        if ($read -le 0) { break }
+        $total += $read
+        if ($total -gt $MaxRawNotificationBytes) {
+          throw "notify payload exceeds the $MaxRawNotificationBytes byte limit"
+        }
+        $memory.Write($buffer, 0, $read)
+      }
+      # Decode exactly one contract. GetString uses the strict decoder above,
+      # so malformed UTF-8 throws instead of introducing replacement glyphs.
+      $value = $Utf8StrictNoBom.GetString($memory.ToArray())
       if ($value.Length -gt 0 -and $value[0] -eq [char]0xFEFF) {
         return $value.Substring(1)
       }
       return $value
     } finally {
-      if ($null -ne $reader) {
-        $reader.Dispose()
-      } elseif ($null -ne $stream) {
-        $stream.Dispose()
+      $deadline.Stop()
+      if ($null -ne $memory) { $memory.Dispose() }
+      if ($null -ne $stream) { $stream.Dispose() }
+      if ($null -ne $pendingRead) {
+        try { $pendingRead.AsyncWaitHandle.Close() } catch { }
       }
     }
   }
 
-  if ($HookEvent -or $ClaudeHook -or $ReadStdin) {
+  if ($HookEvent -or $ClaudeHook -or $AudnCodeHook -or $ReadStdin) {
     return Read-Utf8StandardInput
   }
   if ($NotificationArgs.Count -gt 0) {
@@ -717,7 +1177,7 @@ function ConvertTo-NotificationEvent {
     return $null
   }
   try {
-    return ($Raw | ConvertFrom-Json -ErrorAction Stop)
+    return ConvertFrom-StrictJsonText -Text $Raw
   } catch {
     Write-RuntimeLog 'ignored malformed notify payload'
     return $null
@@ -740,6 +1200,10 @@ function New-EventRecord {
 
   $threadId = [string](Get-FirstObjectValue $Event @('thread-id', 'thread_id'))
   $turnId = [string](Get-FirstObjectValue $Event @('turn-id', 'turn_id'))
+  $candidateIdentity = [string](Get-FirstObjectValue $Event @('candidate-identity', 'candidate_identity'))
+  if ($CandidateKind -eq 'audncode_stop_failure' -and $candidateIdentity -notmatch '^[a-f0-9]{64}$') {
+    throw 'invalid AudnCode StopFailure candidate identity'
+  }
   $weakIdentity = [string]::IsNullOrWhiteSpace($threadId) -or [string]::IsNullOrWhiteSpace($turnId)
   $identity = if ($weakIdentity) {
     if ($Provider -eq 'codex') {
@@ -753,6 +1217,9 @@ function New-EventRecord {
   $key = if ($weakIdentity) {
     Get-Sha256Hex $identity
   } else {
+    # Queue/receipt identity stays one-per-prompt across Stop and StopFailure.
+    # StopFailure's independently verified UUID+payload identity is persisted
+    # below and rechecked before promotion, but must not create a second key.
     Get-StrongEventKey -Provider $Provider -ThreadId $threadId -TurnId $turnId
   }
   $now = [DateTimeOffset]::UtcNow
@@ -778,6 +1245,7 @@ function New-EventRecord {
     session_sqlite_home = $EventSqliteHome
     session_classification = $EventClassification
     candidate_kind = $CandidateKind
+    candidate_identity = $candidateIdentity
     source_event = $SourceEvent
     completion_event_type = [string](Get-FirstObjectValue $Event @('completion-event-type', 'completion_event_type'))
     goal_status = [string](Get-FirstObjectValue $Event @('goal-status', 'goal_status'))
@@ -785,6 +1253,12 @@ function New-EventRecord {
     claude_session_epoch = [int64](Get-FirstObjectValue $Event @('claude-session-epoch', 'claude_session_epoch'))
     claude_goal_state = [string](Get-FirstObjectValue $Event @('claude-goal-state', 'claude_goal_state'))
     claude_goal_marker = [string](Get-FirstObjectValue $Event @('claude-goal-marker', 'claude_goal_marker'))
+    audncode_hook_start_ticks = [int64](Get-FirstObjectValue $Event @('audncode-hook-start-ticks', 'audncode_hook_start_ticks'))
+    audncode_stop_failure_uuid = [string](Get-FirstObjectValue $Event @('audncode-stop-failure-uuid', 'audncode_stop_failure_uuid'))
+    audncode_stop_failure_payload_hash = [string](Get-FirstObjectValue $Event @('audncode-stop-failure-payload-hash', 'audncode_stop_failure_payload_hash'))
+    audncode_stop_failure_line_hash = [string](Get-FirstObjectValue $Event @('audncode-stop-failure-line-hash', 'audncode_stop_failure_line_hash'))
+    audncode_stop_failure_proof_hash = [string](Get-FirstObjectValue $Event @('audncode-stop-failure-proof-hash', 'audncode_stop_failure_proof_hash'))
+    audncode_stop_failure_ambiguous = $false
     candidate_rollout_path = Sanitize-NotificationText -Text ([string](Get-FirstObjectValue $Event @('transcript_path', 'transcript-path', 'rollout_path', 'rollout-path'))) -MaxLength 1200
     rollout_sequence = [int64](Get-FirstObjectValue $Event @('rollout-sequence', 'rollout_sequence'))
     created_at = $now.ToString('o')
@@ -847,10 +1321,38 @@ function Upgrade-PendingRecordFromStop {
   # with the newest assistant message and a new revision. The transcript then
   # proves the transition to achieved/failed/cleared without ever delivering
   # an intermediate result.
+  $existingKind = [string](Get-ObjectValue $existing 'candidate_kind' '')
+  $incomingKind = [string](Get-ObjectValue $IncomingRecord 'candidate_kind' '')
+  if ($existingKind -eq 'audncode_stop_failure') {
+    $existingAmbiguous = $existing.PSObject.Properties['audncode_stop_failure_ambiguous']
+    if ($null -ne $existingAmbiguous -and $existingAmbiguous.Value -is [bool] -and
+        [bool]$existingAmbiguous.Value) {
+      return $true
+    }
+    if ($incomingKind -eq 'audncode_stop') {
+      # A transcript-proven failure is terminal without idle_prompt. Never let a
+      # later ordinary Stop downgrade it to the weaker two-signal path.
+      Write-RuntimeLog "kept stronger AudnCode StopFailure evidence key=$($IncomingRecord.key.Substring(0, 12))"
+      return $true
+    }
+    if ($incomingKind -eq 'audncode_stop_failure') {
+      $existingIdentity = [string](Get-ObjectValue $existing 'candidate_identity' '')
+      $incomingIdentity = [string](Get-ObjectValue $IncomingRecord 'candidate_identity' '')
+      if (-not [string]::Equals($existingIdentity, $incomingIdentity, [StringComparison]::Ordinal)) {
+        # Defense in depth for callers that predate session identity
+        # registration: make conflicting evidence sticky on the candidate too.
+        Set-RecordValue -Record $existing -Name 'audncode_stop_failure_ambiguous' -Value $true
+        Set-RecordValue -Record $existing -Name 'candidate_revision' -Value ([Guid]::NewGuid().ToString('N'))
+        Write-JsonAtomic -Path $Path -Value $existing
+        Write-RuntimeLog "ignored ambiguous AudnCode StopFailure evidence key=$($IncomingRecord.key.Substring(0, 12))"
+        return $true
+      }
+    }
+  }
   if ([string](Get-ObjectValue $existing 'provider' '') -eq 'claude' -and
       [string](Get-ObjectValue $IncomingRecord 'provider' '') -eq 'claude' -and
-      [string](Get-ObjectValue $existing 'candidate_kind' '') -eq 'claude_stop' -and
-      [string](Get-ObjectValue $IncomingRecord 'candidate_kind' '') -eq 'claude_stop' -and
+      $existingKind -eq $incomingKind -and
+      $existingKind -in @('claude_stop', 'audncode_stop') -and
       [string](Get-ObjectValue $existing 'claude_goal_state' '') -eq 'active') {
     Set-RecordValue -Record $IncomingRecord -Name 'claude_goal_state' -Value 'active'
     Set-RecordValue -Record $IncomingRecord -Name 'claude_goal_marker' -Value ([string](Get-ObjectValue $existing 'claude_goal_marker' ''))
@@ -1111,27 +1613,8729 @@ function Read-ClaudeSessionState {
   }
 }
 
+function Get-Sha256HexBytes {
+  param([byte[]]$Value)
+
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return (($sha.ComputeHash($Value) | ForEach-Object { $_.ToString('x2') }) -join '')
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+function Get-AudnCodeRuntimeStateInfo {
+  param(
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs
+  )
+
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or $HostPid -le 0 -or $HostStartedUnixMs -le 0) { return $null }
+  try { $canonicalHome = [IO.Path]::GetFullPath($HomePath) } catch { return $null }
+  $key = Get-Sha256Hex ("codex-ntfy/v1|audn-runtime|$canonicalHome|$HostPid|$HostStartedUnixMs")
+  return [pscustomobject]@{
+    key = $key
+    path = Join-Path $ClaudeSessionsDir ('audn-runtime-' + $key + '.json')
+    lock_path = Join-Path $ClaudeSessionsDir ('audn-runtime-' + $key + '.lock')
+    home = $canonicalHome
+    pid = $HostPid
+    started_unix_ms = $HostStartedUnixMs
+  }
+}
+
+function ConvertTo-AudnCodeClosedIdArchive {
+  param([string[]]$Ids)
+
+  # Sidechain IDs have a fixed 42-bit base-36 payload. Pack each value into
+  # six bytes before base64 encoding so long-lived runtimes retain exact
+  # tombstone membership without an ever-growing JSON object array. The hard
+  # count bound limits both decode memory and per-update CPU; exceeding it
+  # remains fail-closed rather than dropping completion evidence.
+  $numbers = New-Object 'System.Collections.Generic.List[uint64]'
+  foreach ($id in @($Ids)) {
+    if ($id -isnot [string] -or $id -notmatch '^s[a-z0-9]{8}$') {
+      throw 'invalid AudnCode sidechain tombstone'
+    }
+    [uint64]$value = 0
+    foreach ($character in $id.Substring(1).ToCharArray()) {
+      $code = [int]$character
+      $digit = if ($code -ge 48 -and $code -le 57) { $code - 48 } else { $code - 87 }
+      $value = ([uint64]$value * [uint64]36) + [uint64]$digit
+    }
+    $numbers.Add($value)
+  }
+  if ($numbers.Count -gt 65536) { throw 'too many AudnCode sidechain tombstones to compact safely' }
+  if ($numbers.Count -eq 0) { return '' }
+
+  $ordered = @($numbers.ToArray() | Sort-Object)
+  $bytes = New-Object 'System.Collections.Generic.List[byte]'
+  $previous = $null
+  foreach ($number in $ordered) {
+    if ($null -ne $previous -and [uint64]$number -le [uint64]$previous) {
+      throw 'duplicate AudnCode sidechain tombstone'
+    }
+    for ($index = 0; $index -lt 6; $index++) {
+      $bytes.Add([byte](([uint64]$number -shr (8 * $index)) -band [uint64]0xff))
+    }
+    $previous = [uint64]$number
+  }
+  return [Convert]::ToBase64String($bytes.ToArray())
+}
+
+function ConvertFrom-AudnCodeClosedIdArchive {
+  param([string]$Archive)
+
+  if ([string]::IsNullOrEmpty($Archive)) { return @() }
+  if ($Archive.Length -gt 524288 -or $Archive.Length % 8 -ne 0 -or
+      $Archive -notmatch '^[A-Za-z0-9+/]+$') {
+    throw 'invalid AudnCode sidechain tombstone archive'
+  }
+  try { $bytes = [Convert]::FromBase64String($Archive) } catch {
+    throw 'invalid AudnCode sidechain tombstone archive'
+  }
+  if ($bytes.Length % 6 -ne 0 -or ($bytes.Length / 6) -gt 65536) {
+    throw 'invalid AudnCode sidechain tombstone archive'
+  }
+
+  $alphabet = '0123456789abcdefghijklmnopqrstuvwxyz'
+  $ids = New-Object 'System.Collections.Generic.List[string]'
+  [uint64]$previous = 0
+  $hasPrevious = $false
+  for ($offset = 0; $offset -lt $bytes.Length; $offset += 6) {
+    [uint64]$value = 0
+    for ($index = 0; $index -lt 6; $index++) {
+      $value = $value -bor ([uint64]$bytes[$offset + $index] -shl (8 * $index))
+    }
+    if ($hasPrevious -and $value -le $previous) {
+      throw 'invalid AudnCode sidechain tombstone archive ordering'
+    }
+    [uint64]$remaining = $value
+    $characters = New-Object char[] 8
+    for ($index = 7; $index -ge 0; $index--) {
+      [uint64]$remainder = $remaining % [uint64]36
+      $characters[$index] = $alphabet[[int]$remainder]
+      $remaining = [uint64](($remaining - $remainder) / [uint64]36)
+    }
+    if ($remaining -ne 0) { throw 'invalid AudnCode sidechain tombstone value' }
+    $ids.Add('s' + (-join $characters))
+    $previous = $value
+    $hasPrevious = $true
+  }
+  return @($ids.ToArray())
+}
+
+function Test-AudnCodeHistoricalSessionSafeToCompact {
+  param(
+    [object]$Session,
+    [object]$RuntimeInfo,
+    [object]$ClosedIds
+  )
+
+  if ($null -eq $Session -or $null -eq $RuntimeInfo -or $null -eq $ClosedIds) { return $false }
+  $sessionId = [string](Get-ObjectValue $Session 'session_id' '')
+  $transcriptPath = [string](Get-ObjectValue $Session 'transcript_path' '')
+  $stateInfo = Get-ClaudeSessionStateInfo -SessionId $sessionId
+  if ($null -eq $stateInfo -or -not (Test-Path -LiteralPath $stateInfo.path -PathType Leaf)) { return $false }
+
+  # Do not acquire a per-session lock while holding the host runtime lock. Hook
+  # mutations take those locks in the opposite order, so nesting them here could
+  # deadlock two active /clear or /resume sessions. A read handle that denies
+  # write/delete sharing gives us one immutable session-state generation instead.
+  $stream = $null
+  try {
+    $stream = [IO.File]::Open(
+      [string]$stateInfo.path,
+      [IO.FileMode]::Open,
+      [IO.FileAccess]::Read,
+      [IO.FileShare]::Read
+    )
+    if ($stream.Length -gt 16MB -or $stream.Length -gt [int]::MaxValue) { return $false }
+    $bytes = New-Object byte[] ([int]$stream.Length)
+    $read = 0
+    while ($read -lt $bytes.Length) {
+      $count = $stream.Read($bytes, $read, $bytes.Length - $read)
+      if ($count -le 0) { return $false }
+      $read += $count
+    }
+    $offset = 0
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $offset = 3 }
+    $text = $Utf8StrictNoBom.GetString($bytes, $offset, $bytes.Length - $offset)
+    Assert-SafeUnicodeScalarText -Value $text -Context 'AudnCode historical session state'
+    $state = ConvertFrom-StrictJsonText -Text $text
+  } catch {
+    return $false
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+
+  $registryProperty = $state.PSObject.Properties['audncode_background_registry_valid']
+  $lifecycleProperty = $state.PSObject.Properties['audncode_background_lifecycle_unverifiable']
+  $prearmProperty = $state.PSObject.Properties['audncode_prompt_prearm_pending']
+  $multiHostProperty = $state.PSObject.Properties['audncode_multi_host_conflict']
+  $remoteClaimsProperty = $state.PSObject.Properties['audncode_remote_claims']
+  $remoteClaimsValidProperty = $state.PSObject.Properties['audncode_remote_claims_valid']
+  $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'background'
+  if ([string](Get-ObjectValue $state 'session_id' '') -ne $sessionId -or
+      -not [string]::Equals([string](Get-ObjectValue $state 'transcript_path' ''), $transcriptPath, [StringComparison]::OrdinalIgnoreCase) -or
+      -not [string]::Equals([string](Get-ObjectValue $state 'audncode_home' ''), [string]$RuntimeInfo.home, [StringComparison]::OrdinalIgnoreCase) -or
+      [int](Get-ObjectValue $state 'audncode_host_pid' 0) -ne [int]$RuntimeInfo.pid -or
+      [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0) -ne [int64]$RuntimeInfo.started_unix_ms -or
+      [string](Get-ObjectValue $state 'audncode_runtime_key' '') -ne [string]$RuntimeInfo.key -or
+      $null -eq $registryProperty -or $registryProperty.Value -isnot [bool] -or -not [bool]$registryProperty.Value -or
+      $null -eq $lifecycleProperty -or $lifecycleProperty.Value -isnot [bool] -or [bool]$lifecycleProperty.Value -or
+      $null -eq $prearmProperty -or $prearmProperty.Value -isnot [bool] -or [bool]$prearmProperty.Value -or
+      $null -eq $multiHostProperty -or $multiHostProperty.Value -isnot [bool] -or [bool]$multiHostProperty.Value -or
+      -not [bool](Get-ObjectValue $pendingState 'valid' $false) -or
+      @((Get-ObjectValue $pendingState 'tokens' @())).Count -gt 0 -or
+      $null -eq $remoteClaimsProperty -or $remoteClaimsProperty.Value -isnot [array] -or
+      $null -eq $remoteClaimsValidProperty -or $remoteClaimsValidProperty.Value -isnot [bool] -or
+      -not [bool]$remoteClaimsValidProperty.Value) { return $false }
+  $remoteEnvelope = Get-AudnCodeRemoteClaimEnvelope -Record $state
+  if (-not [bool](Get-ObjectValue $remoteEnvelope 'valid' $false) -or
+      @((Get-ObjectValue $remoteEnvelope 'claims' @())).Count -gt 0) { return $false }
+
+  $sidecars = Read-AudnCodeRemoteAgentSidecars `
+    -SessionId $sessionId `
+    -TranscriptPath $transcriptPath `
+    -HomePath ([string]$RuntimeInfo.home)
+  if ([string](Get-ObjectValue $sidecars 'state' 'unknown') -ne 'ok' -or
+      @((Get-ObjectValue $sidecars 'entries' @())).Count -gt 0) { return $false }
+
+  # A sidechain transcript can outlive the hook that launched it. It is safe to
+  # forget only when every observed ID has an exact terminal tombstone.
+  $sidechains = Get-AudnCodeMainSessionSidechainIds `
+    -TranscriptPath $transcriptPath `
+    -PromptBusyUnixMs ([int64]$RuntimeInfo.started_unix_ms) `
+    -HostStartedUnixMs ([int64]$RuntimeInfo.started_unix_ms)
+  if ([string](Get-ObjectValue $sidechains 'state' 'unknown') -ne 'ok') { return $false }
+  foreach ($sidechainId in @((Get-ObjectValue $sidechains 'ids' @()))) {
+    if (-not $ClosedIds.Contains([string]$sidechainId)) { return $false }
+  }
+  return $true
+}
+
+function Update-AudnCodeRuntimeBackgroundState {
+  param(
+    [object]$RuntimeInfo,
+    [string[]]$AddIds = @(),
+    [object[]]$StartIncarnations = @(),
+    [string[]]$ObservedIds = @(),
+    [string[]]$CompletedIds = @(),
+    [object[]]$CompletedReceipts = @(),
+    [object]$RegisterSession = $null,
+    [switch]$MarkLocalAgentUiUncertain,
+    [switch]$Invalidate
+  )
+
+  if ($null -eq $RuntimeInfo) { return $null }
+  $operations = [pscustomobject]@{
+    add = @($AddIds)
+    starts = @($StartIncarnations)
+    observed = @($ObservedIds)
+    completed = @($CompletedIds)
+    completion_receipts = @($CompletedReceipts)
+    register_session = $RegisterSession
+    mark_local_agent_ui_uncertain = [bool]$MarkLocalAgentUiUncertain
+  }
+  return Invoke-WithClaudeSessionLock -Info $RuntimeInfo -Action {
+    param($lockedInfo, $lockedOperations, $lockedInvalidate)
+    $previous = $null
+    try { $previous = Read-JsonFile -Path $lockedInfo.path } catch { $previous = $null }
+    $valid = $true
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $openCounts = @{}
+    $startReceipts = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $startReceiptOrder = New-Object 'System.Collections.Generic.List[string]'
+    $terminalReceipts = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $terminalReceiptOrder = New-Object 'System.Collections.Generic.List[string]'
+    $localAgentUiUncertain = $false
+    $closedIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $closedIdOrder = New-Object 'System.Collections.Generic.List[string]'
+    $sessions = New-Object 'System.Collections.Generic.List[object]'
+    $sessionIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $previous) {
+      $valid = [string](Get-ObjectValue $previous 'kind' '') -eq 'audncode-runtime' -and
+        [string]::Equals([string](Get-ObjectValue $previous 'audncode_home' ''), [string]$lockedInfo.home, [StringComparison]::OrdinalIgnoreCase) -and
+        [int](Get-ObjectValue $previous 'host_pid' 0) -eq [int]$lockedInfo.pid -and
+        [int64](Get-ObjectValue $previous 'host_started_unix_ms' 0) -eq [int64]$lockedInfo.started_unix_ms -and
+        [bool](Get-ObjectValue $previous 'registry_valid' $false)
+      $uiUncertainProperty = $previous.PSObject.Properties['local_agent_ui_uncertain']
+      if ($null -eq $uiUncertainProperty -or $uiUncertainProperty.Value -isnot [bool]) {
+        # A pre-shape-8 runtime cannot prove that no hookless UI message was
+        # queued to a local agent. Reopening AudnCode creates a fresh host-bound
+        # registry; silently migrating this missing evidence could false-notify.
+        $valid = $false
+      } else { $localAgentUiUncertain = [bool]$uiUncertainProperty.Value }
+      foreach ($existingId in @((Get-ObjectValue $previous 'background_ids' @()))) {
+        if ($existingId -is [string] -and $existingId.Length -le 160 -and $existingId -match '^[A-Za-z0-9][A-Za-z0-9._:-]*$') {
+          [void]$ids.Add($existingId)
+        } else {
+          $valid = $false
+        }
+      }
+      $openCountProperty = $previous.PSObject.Properties['background_open_counts']
+      if ($null -eq $openCountProperty) {
+        # Shape <=7 stored only set membership. Migrate every active local
+        # agent conservatively as one open lifecycle; subsequent shape-8
+        # SubagentStart receipts add distinct overlapping incarnations.
+        foreach ($existingId in @($ids)) {
+          if ($existingId -match '^a[a-z0-9]{8}$') { $openCounts[$existingId] = 1 }
+        }
+      } elseif ($openCountProperty.Value -isnot [array]) {
+        $valid = $false
+      } else {
+        foreach ($countRecord in @($openCountProperty.Value)) {
+          $countId = [string](Get-ObjectValue $countRecord 'id' '')
+          $countProperty = if ($null -ne $countRecord) { $countRecord.PSObject.Properties['count'] } else { $null }
+          if ($countId -notmatch '^a[a-z0-9]{8}$' -or $openCounts.ContainsKey($countId) -or
+              $null -eq $countProperty -or
+              ($countProperty.Value -isnot [int] -and $countProperty.Value -isnot [long]) -or
+              [int64]$countProperty.Value -lt 1 -or [int64]$countProperty.Value -gt 4096 -or
+              -not $ids.Contains($countId)) {
+            $valid = $false
+          } else {
+            $openCounts[$countId] = [int]$countProperty.Value
+          }
+        }
+        foreach ($existingId in @($ids)) {
+          if ($existingId -match '^a[a-z0-9]{8}$' -and -not $openCounts.ContainsKey($existingId)) { $valid = $false }
+        }
+      }
+      foreach ($receipt in @((Get-ObjectValue $previous 'background_start_receipts' @()))) {
+        if ($receipt -isnot [string] -or $receipt -notmatch '^[a-f0-9]{64}$' -or -not $startReceipts.Add($receipt)) {
+          $valid = $false
+        } else { $startReceiptOrder.Add($receipt) }
+      }
+      foreach ($receipt in @((Get-ObjectValue $previous 'background_terminal_receipts' @()))) {
+        if ($receipt -isnot [string] -or $receipt -notmatch '^[a-f0-9]{64}$' -or -not $terminalReceipts.Add($receipt)) {
+          $valid = $false
+        } else { $terminalReceiptOrder.Add($receipt) }
+      }
+      foreach ($closedId in @((Get-ObjectValue $previous 'closed_ids' @()))) {
+        if ($closedId -isnot [string] -or $closedId.Length -gt 160 -or $closedId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$') {
+          $valid = $false
+        } elseif ($closedId -match '^s[a-z0-9]{8}$') {
+          if ($closedIds.Add($closedId)) { $closedIdOrder.Add($closedId) } else { $valid = $false }
+        }
+      }
+      $closedArchive = [string](Get-ObjectValue $previous 'closed_ids_compact' '')
+      $closedArchiveHash = [string](Get-ObjectValue $previous 'closed_ids_compact_sha256' '')
+      if (-not [string]::IsNullOrEmpty($closedArchive)) {
+        if ($closedArchiveHash -notmatch '^[a-f0-9]{64}$' -or
+            $closedArchiveHash -ne (Get-Sha256Hex ("audn-closed/v1|$closedArchive"))) {
+          $valid = $false
+        } else {
+          try {
+            foreach ($closedId in @(ConvertFrom-AudnCodeClosedIdArchive -Archive $closedArchive)) {
+              if ($closedIds.Add($closedId)) { $closedIdOrder.Add($closedId) } else { $valid = $false }
+            }
+          } catch {
+            $valid = $false
+          }
+        }
+      } elseif (-not [string]::IsNullOrEmpty($closedArchiveHash)) {
+        $valid = $false
+      }
+      foreach ($session in @((Get-ObjectValue $previous 'sessions' @()))) {
+        $sessionId = [string](Get-ObjectValue $session 'session_id' '')
+        $transcriptPath = [string](Get-ObjectValue $session 'transcript_path' '')
+        $taskListId = [string](Get-ObjectValue $session 'task_list_id' '')
+        $teamName = [string](Get-ObjectValue $session 'team_name' '')
+        $taskListValidProperty = $session.PSObject.Properties['task_list_valid']
+        $teamNameValidProperty = $session.PSObject.Properties['team_name_valid']
+        $taskListValid = $null -eq $taskListValidProperty -or
+          ($taskListValidProperty.Value -is [bool] -and [bool]$taskListValidProperty.Value)
+        $teamNameValid = $null -eq $teamNameValidProperty -or
+          ($teamNameValidProperty.Value -is [bool] -and [bool]$teamNameValidProperty.Value)
+        $parsedSession = [Guid]::Empty
+        try {
+          $resolvedTranscript = [IO.Path]::GetFullPath($transcriptPath)
+          $projectsPrefix = [IO.Path]::GetFullPath((Join-Path $lockedInfo.home 'projects')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        } catch {
+          $valid = $false
+          continue
+        }
+        if (-not [Guid]::TryParse($sessionId, [ref]$parsedSession) -or
+            -not $resolvedTranscript.StartsWith($projectsPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([IO.Path]::GetFileNameWithoutExtension($resolvedTranscript), $sessionId, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $sessionIds.Add($sessionId) -or
+            ($null -ne $taskListValidProperty -and $taskListValidProperty.Value -isnot [bool]) -or
+            ($null -ne $teamNameValidProperty -and $teamNameValidProperty.Value -isnot [bool]) -or
+            (-not [string]::IsNullOrWhiteSpace($taskListId) -and ($taskListId.Length -gt 200 -or $taskListId -notmatch '^[A-Za-z0-9_-]+$')) -or
+            (-not [string]::IsNullOrWhiteSpace($teamName) -and ($teamName.Length -gt 200 -or $teamName -notmatch '^[A-Za-z0-9_-]+$'))) {
+          $valid = $false
+          continue
+        }
+        $sessions.Add([pscustomobject]@{
+            session_id = $sessionId
+            transcript_path = $resolvedTranscript
+            task_list_id = $taskListId
+            task_list_valid = [bool]$taskListValid
+            team_name = $teamName
+            team_name_valid = [bool]$teamNameValid
+          })
+      }
+    }
+    $registration = Get-ObjectValue $lockedOperations 'register_session'
+    if ($null -ne $registration) {
+      $registrationId = [string](Get-ObjectValue $registration 'session_id' '')
+      $registrationPath = [string](Get-ObjectValue $registration 'transcript_path' '')
+      $registrationTaskListId = [string](Get-ObjectValue $registration 'task_list_id' '')
+      $registrationTeamName = [string](Get-ObjectValue $registration 'team_name' '')
+      $registrationTaskListValidProperty = $registration.PSObject.Properties['task_list_valid']
+      $registrationTeamNameValidProperty = $registration.PSObject.Properties['team_name_valid']
+      $registrationTaskListValid = $null -eq $registrationTaskListValidProperty -or
+        ($registrationTaskListValidProperty.Value -is [bool] -and [bool]$registrationTaskListValidProperty.Value)
+      $registrationTeamNameValid = $null -eq $registrationTeamNameValidProperty -or
+        ($registrationTeamNameValidProperty.Value -is [bool] -and [bool]$registrationTeamNameValidProperty.Value)
+      $parsedRegistration = [Guid]::Empty
+      $projectsPrefix = ''
+      try {
+        $resolvedRegistrationPath = [IO.Path]::GetFullPath($registrationPath)
+        $projectsPrefix = [IO.Path]::GetFullPath((Join-Path $lockedInfo.home 'projects')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+      } catch {
+        $valid = $false
+        $resolvedRegistrationPath = ''
+      }
+      if (-not [Guid]::TryParse($registrationId, [ref]$parsedRegistration) -or
+          [string]::IsNullOrWhiteSpace($resolvedRegistrationPath) -or
+          -not $resolvedRegistrationPath.StartsWith($projectsPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+          -not [string]::Equals([IO.Path]::GetFileNameWithoutExtension($resolvedRegistrationPath), $registrationId, [StringComparison]::OrdinalIgnoreCase) -or
+          ($null -ne $registrationTaskListValidProperty -and $registrationTaskListValidProperty.Value -isnot [bool]) -or
+          ($null -ne $registrationTeamNameValidProperty -and $registrationTeamNameValidProperty.Value -isnot [bool]) -or
+          (-not [string]::IsNullOrWhiteSpace($registrationTaskListId) -and ($registrationTaskListId.Length -gt 200 -or $registrationTaskListId -notmatch '^[A-Za-z0-9_-]+$')) -or
+          (-not [string]::IsNullOrWhiteSpace($registrationTeamName) -and ($registrationTeamName.Length -gt 200 -or $registrationTeamName -notmatch '^[A-Za-z0-9_-]+$'))) {
+        $valid = $false
+      } elseif ($sessionIds.Contains($registrationId)) {
+        $existingRegistration = @($sessions | Where-Object { [string]$_.session_id -eq $registrationId })
+        if ($existingRegistration.Count -ne 1 -or
+            -not [string]::Equals([string]$existingRegistration[0].transcript_path, $resolvedRegistrationPath, [StringComparison]::OrdinalIgnoreCase)) {
+          $valid = $false
+        } else {
+          $existing = $existingRegistration[0]
+          foreach ($provenance in @(
+              [pscustomobject]@{ value_name = 'task_list_id'; valid_name = 'task_list_valid'; value = $registrationTaskListId; valid = [bool]$registrationTaskListValid },
+              [pscustomobject]@{ value_name = 'team_name'; valid_name = 'team_name_valid'; value = $registrationTeamName; valid = [bool]$registrationTeamNameValid }
+            )) {
+            $existingValue = [string](Get-ObjectValue $existing ([string]$provenance.value_name) '')
+            $existingValid = [bool](Get-ObjectValue $existing ([string]$provenance.valid_name) $true)
+            $newValue = [string]$provenance.value
+            $newValid = [bool]$provenance.valid
+            if (-not $existingValid -or -not $newValid) {
+              Set-RecordValue -Record $existing -Name ([string]$provenance.valid_name) -Value $false
+            } elseif ([string]::IsNullOrWhiteSpace($existingValue) -and -not [string]::IsNullOrWhiteSpace($newValue)) {
+              Set-RecordValue -Record $existing -Name ([string]$provenance.value_name) -Value $newValue
+            } elseif (-not [string]::IsNullOrWhiteSpace($newValue) -and
+                -not [string]::Equals($existingValue, $newValue, [StringComparison]::OrdinalIgnoreCase)) {
+              Set-RecordValue -Record $existing -Name ([string]$provenance.valid_name) -Value $false
+            }
+          }
+          # Registration is the durable recency signal for /clear and /resume.
+          # Move this lineage to the tail so compaction can never discard the
+          # session currently producing hooks merely because its ID is old.
+          if (-not $sessions.Remove($existing)) {
+            $valid = $false
+          } else {
+            $sessions.Add($existing)
+          }
+        }
+      } else {
+        [void]$sessionIds.Add($registrationId)
+        $sessions.Add([pscustomobject]@{
+            session_id = $registrationId
+            transcript_path = $resolvedRegistrationPath
+            task_list_id = $registrationTaskListId
+            task_list_valid = [bool]$registrationTaskListValid
+            team_name = $registrationTeamName
+            team_name_valid = [bool]$registrationTeamNameValid
+          })
+      }
+    }
+    $completedByReceipt = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($completion in @((Get-ObjectValue $lockedOperations 'completion_receipts' @()))) {
+      $completedId = [string](Get-ObjectValue $completion 'id' '')
+      $receipt = [string](Get-ObjectValue $completion 'receipt' '')
+      if ($completedId.Length -gt 160 -or $completedId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$' -or
+          $receipt -notmatch '^[a-f0-9]{64}$') {
+        $valid = $false
+        continue
+      }
+      [void]$completedByReceipt.Add($completedId)
+      if (-not $terminalReceipts.Add($receipt)) { continue }
+      $terminalReceiptOrder.Add($receipt)
+      if ($completedId -match '^a[a-z0-9]{8}$') {
+        if ($openCounts.ContainsKey($completedId)) {
+          $nextCount = [int]$openCounts[$completedId] - 1
+          if ($nextCount -le 0) {
+            [void]$openCounts.Remove($completedId)
+            [void]$ids.Remove($completedId)
+          } else {
+            $openCounts[$completedId] = $nextCount
+          }
+        }
+      } else {
+        [void]$ids.Remove($completedId)
+      }
+      if ($completedId -match '^s[a-z0-9]{8}$') {
+        if ($closedIds.Contains($completedId)) { [void]$closedIdOrder.Remove($completedId) }
+        [void]$closedIds.Add($completedId)
+        $closedIdOrder.Add($completedId)
+      }
+    }
+    foreach ($completedId in @((Get-ObjectValue $lockedOperations 'completed' @()))) {
+      if ($completedId -is [string] -and $completedId.Length -le 160 -and $completedId -match '^[A-Za-z0-9][A-Za-z0-9._:-]*$') {
+        if ($completedByReceipt.Contains($completedId)) { continue }
+        if ($completedId -match '^a[a-z0-9]{8}$' -and $openCounts.ContainsKey($completedId)) {
+          # Tool completion without a transcript receipt can close only an
+          # unambiguous singleton. Overlapping a-ID incarnations require one
+          # deduped native terminal record per start and otherwise fail closed.
+          if ([int]$openCounts[$completedId] -ne 1) {
+            $valid = $false
+            continue
+          }
+          [void]$openCounts.Remove($completedId)
+        }
+        [void]$ids.Remove($completedId)
+        # Only passively rediscovered Ctrl+B sidechains need tombstones.
+        # Explicit Agent/Bash/Monitor IDs can reopen only through a new trusted
+        # PostToolUse launch, which already removes a matching tombstone.
+        if ($completedId -match '^s[a-z0-9]{8}$') {
+          if ($closedIds.Contains($completedId)) { [void]$closedIdOrder.Remove($completedId) }
+          [void]$closedIds.Add($completedId)
+          $closedIdOrder.Add($completedId)
+        } else {
+          [void]$closedIds.Remove($completedId)
+          [void]$closedIdOrder.Remove($completedId)
+        }
+      } else {
+        $valid = $false
+      }
+    }
+    foreach ($addedId in @((Get-ObjectValue $lockedOperations 'add' @()))) {
+      if ($addedId -is [string] -and $addedId.Length -le 160 -and $addedId -match '^[A-Za-z0-9][A-Za-z0-9._:-]*$') {
+        [void]$closedIds.Remove($addedId)
+        [void]$closedIdOrder.Remove($addedId)
+        $wasPresent = $ids.Contains($addedId)
+        [void]$ids.Add($addedId)
+        if ($addedId -match '^a[a-z0-9]{8}$') {
+          if (-not $wasPresent) { $openCounts[$addedId] = 1 }
+        }
+      } else {
+        $valid = $false
+      }
+    }
+    foreach ($start in @((Get-ObjectValue $lockedOperations 'starts' @()))) {
+      $startId = [string](Get-ObjectValue $start 'id' '')
+      $receipt = [string](Get-ObjectValue $start 'receipt' '')
+      if ($startId -notmatch '^a[a-z0-9]{8}$' -or $receipt -notmatch '^[a-f0-9]{64}$') {
+        $valid = $false
+        continue
+      }
+      if (-not $startReceipts.Add($receipt)) { continue }
+      $startReceiptOrder.Add($receipt)
+      [void]$closedIds.Remove($startId)
+      [void]$closedIdOrder.Remove($startId)
+      $count = if ($openCounts.ContainsKey($startId)) { [int]$openCounts[$startId] } else { 0 }
+      if ($count -ge 4096) {
+        $valid = $false
+        continue
+      }
+      if ($count -gt 0) {
+        # AudnCode can overwrite a same-ID task before the delayed terminal of
+        # the prior lifecycle is enqueued. That old terminal may then suppress
+        # the new one, so overlap is permanently ambiguous in public builds.
+        $localAgentUiUncertain = $true
+      }
+      $openCounts[$startId] = $count + 1
+      [void]$ids.Add($startId)
+    }
+    foreach ($observedId in @((Get-ObjectValue $lockedOperations 'observed' @()))) {
+      if ($observedId -is [string] -and $observedId.Length -le 160 -and $observedId -match '^[A-Za-z0-9][A-Za-z0-9._:-]*$') {
+        if (-not $closedIds.Contains($observedId)) { [void]$ids.Add($observedId) }
+      } else {
+        $valid = $false
+      }
+    }
+    if ([bool](Get-ObjectValue $lockedOperations 'mark_local_agent_ui_uncertain' $false)) {
+      # Public AudnCode SendMessage delivery is AppState-RAM-only and has no
+      # consumed-message proof. Same-ID lifecycle overlap has an equivalent
+      # missing-terminal ambiguity. Keep this separate from registry corruption
+      # so diagnostics can identify the unsupported evidence boundary precisely.
+      $localAgentUiUncertain = $true
+    }
+    if ($closedIds.Count -gt 512) {
+      # Prune only tombstones whose sidechain evidence no longer exists in any
+      # retained logical session. Existing evidence keeps its exact tombstone,
+      # so compaction cannot resurrect completed work.
+      $presentSidechains = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+      try {
+        foreach ($session in $sessions) {
+          $projectDir = Split-Path -Parent ([string]$session.transcript_path)
+          $sidechainRoot = Join-Path $projectDir ([string]$session.session_id)
+          if (-not (Test-Path -LiteralPath $sidechainRoot -PathType Container)) { continue }
+          $sidechainFiles = @(Get-ChildItem -LiteralPath $sidechainRoot -Recurse -Filter 'agent-s*.jsonl' -File -ErrorAction Stop | Select-Object -First 4097)
+          if ($sidechainFiles.Count -gt 4096) { throw 'too many sidechain files for safe compaction' }
+          foreach ($file in $sidechainFiles) {
+            if ($file.BaseName -match '^agent-(?<id>s[a-z0-9]{8})$') { [void]$presentSidechains.Add([string]$Matches['id']) }
+          }
+        }
+        foreach ($closedId in @($closedIdOrder.ToArray())) {
+          if (-not $presentSidechains.Contains($closedId)) {
+            [void]$closedIds.Remove($closedId)
+            [void]$closedIdOrder.Remove($closedId)
+          }
+        }
+      } catch {
+        $valid = $false
+      }
+    }
+    if ($sessions.Count -gt 64 -and $sessions.Count -le 256 -and $ids.Count -eq 0 -and $valid) {
+      # Keep a generous recent window for resume/title provenance, but forget an
+      # old lineage only after every durable finality surface is proven empty.
+      # Missing or concurrently changing evidence simply defers compaction.
+      try {
+        $queueState = Get-AudnCodeQueueState -Sessions @($sessions.ToArray()) -HostStartedUnixMs ([int64]$lockedInfo.started_unix_ms) -HomePath ([string]$lockedInfo.home)
+        if ([string]$queueState.state -eq 'idle') {
+          $dropCount = $sessions.Count - 48
+          $canDrop = $true
+          for ($index = 0; $index -lt $dropCount -and $canDrop; $index++) {
+            $oldSession = $sessions[$index]
+            $oldTeam = Get-AudnCodeTeamState `
+              -SessionId ([string]$oldSession.session_id) `
+              -HomePath ([string]$lockedInfo.home) `
+              -AdditionalTeamName ([string](Get-ObjectValue $oldSession 'team_name' '')) `
+              -AdditionalTeamNameValid ([bool](Get-ObjectValue $oldSession 'team_name_valid' $true))
+            $oldTasks = Get-AudnCodeTaskState `
+              -SessionId ([string]$oldSession.session_id) `
+              -HomePath ([string]$lockedInfo.home) `
+              -AdditionalTaskListId ([string](Get-ObjectValue $oldSession 'task_list_id' '')) `
+              -AdditionalTaskListValid ([bool](Get-ObjectValue $oldSession 'task_list_valid' $true)) `
+              -AdditionalTeamName ([string](Get-ObjectValue $oldSession 'team_name' '')) `
+              -AdditionalTeamNameValid ([bool](Get-ObjectValue $oldSession 'team_name_valid' $true))
+            if ([string]$oldTeam.state -ne 'idle' -or [string]$oldTasks.state -ne 'idle' -or
+                -not (Test-AudnCodeHistoricalSessionSafeToCompact `
+                  -Session $oldSession `
+                  -RuntimeInfo $lockedInfo `
+                  -ClosedIds $closedIds)) { $canDrop = $false }
+          }
+          if ($canDrop) {
+            for ($index = 0; $index -lt $dropCount; $index++) { $sessions.RemoveAt(0) }
+          }
+        }
+      } catch {
+        # A transient writer or a just-created transcript defers compaction;
+        # the larger hard bound below remains fail closed.
+      }
+    }
+    if ($ids.Count -gt 4096 -or $closedIds.Count -gt 65536 -or $sessions.Count -gt 256 -or
+        $openCounts.Count -gt 4096 -or $startReceipts.Count -gt 16384 -or
+        $terminalReceipts.Count -gt 16384 -or $lockedInvalidate) { $valid = $false }
+    $openCountState = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($countId in @($openCounts.Keys | Sort-Object)) {
+      $openCountState.Add([pscustomobject]@{ id = [string]$countId; count = [int]$openCounts[$countId] })
+    }
+    $closedIdsForState = @()
+    $closedIdsCompact = ''
+    $closedIdsCompactHash = ''
+    if ($valid -and $closedIds.Count -gt 512) {
+      try {
+        $closedIdsCompact = ConvertTo-AudnCodeClosedIdArchive -Ids @($closedIds)
+        $closedIdsCompactHash = Get-Sha256Hex ("audn-closed/v1|$closedIdsCompact")
+      } catch {
+        $valid = $false
+      }
+    } else {
+      $closedIdsForState = @($closedIdOrder.ToArray())
+    }
+    $closedIdsFingerprint = if ($valid) {
+      Get-Sha256Hex ('audn-closed-set/v1|' + ((@($closedIds) | Sort-Object) -join "`n"))
+    } else { '' }
+    $state = [ordered]@{
+      schema = 1
+      kind = 'audncode-runtime'
+      audncode_home = [string]$lockedInfo.home
+      host_pid = [int]$lockedInfo.pid
+      host_started_unix_ms = [int64]$lockedInfo.started_unix_ms
+      registry_valid = [bool]$valid
+      background_ids = @($ids)
+      background_open_counts = @($openCountState.ToArray())
+      background_start_receipts = @($startReceiptOrder.ToArray())
+      background_terminal_receipts = @($terminalReceiptOrder.ToArray())
+      local_agent_ui_uncertain = [bool]$localAgentUiUncertain
+      closed_ids = @($closedIdsForState)
+      closed_ids_compact = $closedIdsCompact
+      closed_ids_compact_sha256 = $closedIdsCompactHash
+      closed_ids_fingerprint = $closedIdsFingerprint
+      sessions = @($sessions.ToArray())
+      updated_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    }
+    Write-JsonAtomic -Path $lockedInfo.path -Value $state
+    return [pscustomobject]$state
+  } -Arguments @($RuntimeInfo, $operations, [bool]$Invalidate)
+}
+
+function Read-AudnCodeRuntimeBackgroundState {
+  param([object]$RuntimeInfo)
+
+  if ($null -eq $RuntimeInfo -or -not (Test-Path -LiteralPath $RuntimeInfo.path -PathType Leaf)) { return $null }
+  return Invoke-WithClaudeSessionLock -Info $RuntimeInfo -Action {
+    param($lockedInfo)
+    try {
+      $state = Read-JsonFile -Path $lockedInfo.path
+      if ([string](Get-ObjectValue $state 'kind' '') -ne 'audncode-runtime' -or
+          -not [string]::Equals([string](Get-ObjectValue $state 'audncode_home' ''), [string]$lockedInfo.home, [StringComparison]::OrdinalIgnoreCase) -or
+          [int](Get-ObjectValue $state 'host_pid' 0) -ne [int]$lockedInfo.pid -or
+          [int64](Get-ObjectValue $state 'host_started_unix_ms' 0) -ne [int64]$lockedInfo.started_unix_ms) {
+        return $null
+      }
+      $active = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+      $closed = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+      foreach ($id in @((Get-ObjectValue $state 'background_ids' @()))) {
+        if ($id -isnot [string] -or $id.Length -gt 160 -or $id -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$' -or -not $active.Add($id)) {
+          return $null
+        }
+      }
+      $countProperty = $state.PSObject.Properties['background_open_counts']
+      if ($null -ne $countProperty) {
+        if ($countProperty.Value -isnot [array]) { return $null }
+        $countIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($countRecord in @($countProperty.Value)) {
+          $countId = [string](Get-ObjectValue $countRecord 'id' '')
+          $valueProperty = if ($null -ne $countRecord) { $countRecord.PSObject.Properties['count'] } else { $null }
+          if ($countId -notmatch '^a[a-z0-9]{8}$' -or -not $countIds.Add($countId) -or
+              -not $active.Contains($countId) -or $null -eq $valueProperty -or
+              ($valueProperty.Value -isnot [int] -and $valueProperty.Value -isnot [long]) -or
+              [int64]$valueProperty.Value -lt 1 -or [int64]$valueProperty.Value -gt 4096) { return $null }
+        }
+        foreach ($activeId in @($active)) {
+          if ($activeId -match '^a[a-z0-9]{8}$' -and -not $countIds.Contains($activeId)) { return $null }
+        }
+      }
+      foreach ($receiptPropertyName in @('background_start_receipts', 'background_terminal_receipts')) {
+        $receiptProperty = $state.PSObject.Properties[$receiptPropertyName]
+        if ($null -eq $receiptProperty) { continue }
+        if ($receiptProperty.Value -isnot [array] -or @($receiptProperty.Value).Count -gt 16384) { return $null }
+        $receiptSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($receipt in @($receiptProperty.Value)) {
+          if ($receipt -isnot [string] -or $receipt -notmatch '^[a-f0-9]{64}$' -or -not $receiptSet.Add($receipt)) { return $null }
+        }
+      }
+      $uiUncertainProperty = $state.PSObject.Properties['local_agent_ui_uncertain']
+      if ($null -eq $uiUncertainProperty -or $uiUncertainProperty.Value -isnot [bool]) { return $null }
+      foreach ($id in @((Get-ObjectValue $state 'closed_ids' @()))) {
+        if ($id -isnot [string] -or $id.Length -gt 160 -or $id -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$') { return $null }
+        # Releases before the sidechain proof index also persisted terminal
+        # Agent/Bash ids here.  They are migration-only (never tombstones):
+        # retain exact sidechain ids and deliberately discard the legacy ids.
+        if ($id -match '^s[a-z0-9]{8}$') {
+          if ($active.Contains($id) -or -not $closed.Add($id)) { return $null }
+        }
+      }
+      $closedArchive = [string](Get-ObjectValue $state 'closed_ids_compact' '')
+      $closedArchiveHash = [string](Get-ObjectValue $state 'closed_ids_compact_sha256' '')
+      if (-not [string]::IsNullOrEmpty($closedArchive)) {
+        if ($closedArchiveHash -notmatch '^[a-f0-9]{64}$' -or
+            $closedArchiveHash -ne (Get-Sha256Hex ("audn-closed/v1|$closedArchive"))) { return $null }
+        try {
+          foreach ($id in @(ConvertFrom-AudnCodeClosedIdArchive -Archive $closedArchive)) {
+            if ($active.Contains($id) -or -not $closed.Add($id)) { return $null }
+          }
+        } catch { return $null }
+      } elseif (-not [string]::IsNullOrEmpty($closedArchiveHash)) {
+        return $null
+      }
+      if ($active.Count -gt 4096 -or $closed.Count -gt 65536) { return $null }
+      $closedFingerprint = [string](Get-ObjectValue $state 'closed_ids_fingerprint' '')
+      if (-not [string]::IsNullOrEmpty($closedFingerprint) -and
+          ($closedFingerprint -notmatch '^[a-f0-9]{64}$' -or
+           $closedFingerprint -ne (Get-Sha256Hex ('audn-closed-set/v1|' + ((@($closed) | Sort-Object) -join "`n"))))) {
+        return $null
+      }
+      $sessionIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+      $sessions = @((Get-ObjectValue $state 'sessions' @()))
+      if ($sessions.Count -eq 0 -or $sessions.Count -gt 256) { return $null }
+      foreach ($session in $sessions) {
+        $sessionId = [string](Get-ObjectValue $session 'session_id' '')
+        $transcriptPath = [string](Get-ObjectValue $session 'transcript_path' '')
+        $taskListId = [string](Get-ObjectValue $session 'task_list_id' '')
+        $teamName = [string](Get-ObjectValue $session 'team_name' '')
+        $taskListValidProperty = $session.PSObject.Properties['task_list_valid']
+        $teamNameValidProperty = $session.PSObject.Properties['team_name_valid']
+        $parsedSession = [Guid]::Empty
+        try {
+          $resolvedTranscript = [IO.Path]::GetFullPath($transcriptPath)
+          $projectsPrefix = [IO.Path]::GetFullPath((Join-Path $lockedInfo.home 'projects')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        } catch { return $null }
+        if (-not [Guid]::TryParse($sessionId, [ref]$parsedSession) -or
+            -not $resolvedTranscript.StartsWith($projectsPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([IO.Path]::GetFileNameWithoutExtension($resolvedTranscript), $sessionId, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $sessionIds.Add($sessionId) -or
+            ($null -ne $taskListValidProperty -and $taskListValidProperty.Value -isnot [bool]) -or
+            ($null -ne $teamNameValidProperty -and $teamNameValidProperty.Value -isnot [bool]) -or
+            (-not [string]::IsNullOrWhiteSpace($taskListId) -and ($taskListId.Length -gt 200 -or $taskListId -notmatch '^[A-Za-z0-9_-]+$')) -or
+            (-not [string]::IsNullOrWhiteSpace($teamName) -and ($teamName.Length -gt 200 -or $teamName -notmatch '^[A-Za-z0-9_-]+$'))) {
+          return $null
+        }
+      }
+      return $state
+    } catch {
+      return $null
+    }
+  } -Arguments @($RuntimeInfo)
+}
+
+function Test-AudnCodeTranscriptCorrelation {
+  param(
+    [object]$SessionState,
+    [string]$TranscriptPath
+  )
+
+  if ($null -eq $SessionState -or [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+    return $false
+  }
+  $stateTranscript = [string](Get-ObjectValue $SessionState 'transcript_path' '')
+  return -not [string]::IsNullOrWhiteSpace($stateTranscript) -and
+    [string]::Equals($stateTranscript, $TranscriptPath, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-AudnCodePathHasNoReparseComponents {
+  param(
+    [string]$RootPath,
+    [string]$TargetPath
+  )
+
+  try {
+    $root = [IO.Path]::GetFullPath($RootPath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $target = [IO.Path]::GetFullPath($TargetPath)
+    $rootPrefix = $root + [IO.Path]::DirectorySeparatorChar
+    if (-not $target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return $false }
+    $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    $relative = $target.Substring($rootPrefix.Length)
+    $current = $root
+    foreach ($part in @($relative -split '[\\/]+')) {
+      if ([string]::IsNullOrWhiteSpace($part)) { return $false }
+      $current = Join-Path $current $part
+      if (-not (Test-Path -LiteralPath $current)) { break }
+      $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+      if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Test-AudnCodeTranscriptPath {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [switch]$AllowMissing,
+    [string]$HomePath = $AudnCodeHome
+  )
+
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or
+      [string]::IsNullOrWhiteSpace($SessionId) -or
+      [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+    return $false
+  }
+  $parsedSession = [Guid]::Empty
+  if (-not [Guid]::TryParse($SessionId, [ref]$parsedSession)) { return $false }
+  try {
+    $resolvedTranscript = [IO.Path]::GetFullPath($TranscriptPath)
+    $projectsRootBase = [IO.Path]::GetFullPath((Join-Path $HomePath 'projects')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $projectsRoot = $projectsRootBase + [IO.Path]::DirectorySeparatorChar
+    $shapeIsValid = [IO.Path]::GetExtension($resolvedTranscript) -eq '.jsonl' -and
+      [string]::Equals([IO.Path]::GetFileNameWithoutExtension($resolvedTranscript), $SessionId, [StringComparison]::OrdinalIgnoreCase) -and
+      $resolvedTranscript.StartsWith($projectsRoot, [StringComparison]::OrdinalIgnoreCase)
+    if (-not $shapeIsValid -or
+        -not (Test-AudnCodePathHasNoReparseComponents -RootPath $projectsRootBase -TargetPath $resolvedTranscript)) { return $false }
+    if (Test-Path -LiteralPath $resolvedTranscript) {
+      return Test-Path -LiteralPath $resolvedTranscript -PathType Leaf
+    }
+    return [bool]$AllowMissing
+  } catch {
+    return $false
+  }
+}
+
+function Get-AudnCodeSubagentStartResumeProof {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$AgentId,
+    [string]$AgentType,
+    [string]$HomePath = $AudnCodeHome
+  )
+
+  $invalid = [pscustomobject]@{ ok = $false; resume = $false; agent_id = ''; receipt = ''; reason = 'audncode-subagent-start-unverifiable' }
+  if ($AgentId -notmatch '^a[a-z0-9]{8}$' -or [string]::IsNullOrWhiteSpace($AgentType) -or
+      $AgentType.Length -gt 256 -or
+      -not (Test-AudnCodeTranscriptPath -SessionId $SessionId -TranscriptPath $TranscriptPath -HomePath $HomePath)) {
+    return $invalid
+  }
+  try {
+    $canonicalHome = [IO.Path]::GetFullPath($HomePath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $projectsRoot = [IO.Path]::GetFullPath((Join-Path $canonicalHome 'projects')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $projectDirectory = [IO.Path]::GetFullPath((Split-Path -Parent $TranscriptPath))
+    $subagentsDirectory = [IO.Path]::GetFullPath((Join-Path (Join-Path $projectDirectory $SessionId) 'subagents'))
+    $agentTranscript = [IO.Path]::GetFullPath((Join-Path $subagentsDirectory ("agent-$AgentId.jsonl")))
+    if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $projectsRoot -TargetPath $agentTranscript)) {
+      return $invalid
+    }
+    if (-not (Test-Path -LiteralPath $agentTranscript)) {
+      # runAgent executes this awaited hook before creating a fresh agent's
+      # transcript. Absence is therefore the authoritative fresh-start shape,
+      # while a pre-existing exact a-ID transcript proves a resume lifecycle.
+      return [pscustomobject]@{ ok = $true; resume = $false; agent_id = $AgentId; receipt = ''; reason = 'audncode-subagent-fresh-start' }
+    }
+    if (-not (Test-Path -LiteralPath $agentTranscript -PathType Leaf)) { return $invalid }
+    $before = Get-Item -LiteralPath $agentTranscript -Force -ErrorAction Stop
+    if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [int64]$before.Length -lt 0 -or [int64]$before.Length -gt 512MB) { return $invalid }
+    $stream = $null
+    try {
+      $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+      $stream = [IO.File]::Open($agentTranscript, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+      if ([int64]$stream.Length -ne [int64]$before.Length) { return $invalid }
+      $sampleSize = [int][Math]::Min([int64]4096, [int64]$stream.Length)
+      $head = New-Object byte[] $sampleSize
+      $headRead = 0
+      while ($headRead -lt $sampleSize) {
+        $readNow = $stream.Read($head, $headRead, $sampleSize - $headRead)
+        if ($readNow -le 0) { return $invalid }
+        $headRead += $readNow
+      }
+      $tail = New-Object byte[] $sampleSize
+      if ($sampleSize -gt 0) {
+        [void]$stream.Seek([Math]::Max([int64]0, [int64]$stream.Length - $sampleSize), [IO.SeekOrigin]::Begin)
+        $tailRead = 0
+        while ($tailRead -lt $sampleSize) {
+          $readNow = $stream.Read($tail, $tailRead, $sampleSize - $tailRead)
+          if ($readNow -le 0) { return $invalid }
+          $tailRead += $readNow
+        }
+      }
+    } finally {
+      if ($null -ne $stream) { $stream.Dispose() }
+    }
+    $after = Get-Item -LiteralPath $agentTranscript -Force -ErrorAction Stop
+    if (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [int64]$before.Length -ne [int64]$after.Length -or
+        [int64]$before.CreationTimeUtc.Ticks -ne [int64]$after.CreationTimeUtc.Ticks -or
+        [int64]$before.LastWriteTimeUtc.Ticks -ne [int64]$after.LastWriteTimeUtc.Ticks -or
+        -not (Test-AudnCodePathHasNoReparseComponents -RootPath $projectsRoot -TargetPath $agentTranscript)) {
+      return $invalid
+    }
+    $receipt = Get-Sha256Hex (
+      'audncode-subagent-start/v1|' + $SessionId + '|' + $AgentId + '|' +
+      [string][int64]$before.CreationTimeUtc.Ticks + '|' + [string][int64]$before.Length + '|' +
+      [string][int64]$before.LastWriteTimeUtc.Ticks + '|' +
+      (Get-AudnCodeBytesHash -Bytes $head) + '|' + (Get-AudnCodeBytesHash -Bytes $tail)
+    )
+    return [pscustomobject]@{ ok = $true; resume = $true; agent_id = $AgentId; receipt = $receipt; reason = 'audncode-subagent-resume-proven' }
+  } catch {
+    return $invalid
+  }
+}
+
+function Get-AudnCodeAncestorProcessIds {
+  $ids = New-Object 'System.Collections.Generic.List[int]'
+  $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+  $parents = @{}
+  try {
+    # One process-table snapshot is materially faster than one WMI/CIM round
+    # trip per ancestor and gives a consistent parent chain for this hook.
+    $rows = @(if ($null -ne (Get-Command Get-WmiObject -ErrorAction SilentlyContinue)) {
+        Get-WmiObject -Class Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop
+      } else {
+        Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop
+      })
+    if ($rows.Count -eq 0 -or $rows.Count -gt 4096) { return @() }
+    foreach ($row in $rows) {
+      $processId = [int](Get-ObjectValue $row 'ProcessId' 0)
+      $parentId = [int](Get-ObjectValue $row 'ParentProcessId' 0)
+      if ($processId -gt 0) { $parents[$processId] = $parentId }
+    }
+  } catch {
+    return @()
+  }
+  $cursor = [int]$PID
+  for ($depth = 0; $depth -lt 12 -and $cursor -gt 0; $depth++) {
+    if (-not $parents.ContainsKey($cursor)) { break }
+    $parentPid = [int]$parents[$cursor]
+    if ($parentPid -le 0 -or -not $seen.Add($parentPid)) { break }
+    $ids.Add($parentPid)
+    $cursor = $parentPid
+  }
+  return @($ids)
+}
+
+function Get-AudnCodeHostSession {
+  param(
+    [string]$SessionId,
+    [string]$HomePath = $AudnCodeHome,
+    [int]$ExpectedHostPid = 0,
+    [int64]$ExpectedHostStartedUnixMs = 0,
+    [switch]$AllowExitedHost,
+    [int]$MaxWaitMilliseconds = 0
+  )
+
+  $unknown = [pscustomobject]@{
+    ok = $false
+    pid = 0
+    started_unix_ms = [int64]0
+    process_started_unix_ms = [int64]0
+    live = $false
+    reason = 'audncode-host-unverifiable'
+  }
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or [string]::IsNullOrWhiteSpace($SessionId)) {
+    return $unknown
+  }
+  $sessionsRoot = Join-Path $HomePath 'sessions'
+  $boundedWait = [Math]::Max(0, [Math]::Min(2000, $MaxWaitMilliseconds))
+  $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($boundedWait)
+  # Detached workers validate the exact PID/start tuple saved by the already
+  # correlated hook and may run after the host exits; they neither need nor
+  # can prove a live parent chain.
+  $ancestorPids = if ($AllowExitedHost -and $ExpectedHostPid -gt 0) {
+    @()
+  } else {
+    @(Get-AudnCodeAncestorProcessIds)
+  }
+  if (-not $AllowExitedHost -and $ExpectedHostPid -gt 0 -and $ExpectedHostPid -notin $ancestorPids) {
+    # A synchronous hook must be a descendant of the AudnCode process whose
+    # marker it is about to trust. A saved PID by itself is not correlation:
+    # two live windows can legitimately expose the same logical session UUID.
+    return $unknown
+  }
+  $candidatePids = @(if ($ExpectedHostPid -gt 0) {
+      $ExpectedHostPid
+    } else {
+      $ancestorPids
+    })
+  if ($candidatePids.Count -eq 0) { return $unknown }
+  do {
+    $allHostMarkers = New-Object 'System.Collections.Generic.List[object]'
+    $hostMatches = New-Object 'System.Collections.Generic.List[object]'
+    try {
+      if (Test-Path -LiteralPath $sessionsRoot -PathType Container) {
+        # Marker filenames are the owning PID. Read only the expected host or
+        # this hook's bounded ancestor chain, so stale/unrelated files cannot
+        # exhaust a global directory cap and hide the one relevant marker.
+        foreach ($candidatePid in $candidatePids) {
+          $markerPath = Join-Path $sessionsRoot (([string][int]$candidatePid) + '.json')
+          if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { continue }
+          $marker = $null
+          try { $marker = Read-JsonFile -Path $markerPath } catch { continue }
+          $markerPid = 0
+          $markerStarted = [int64]0
+          try {
+            $markerPid = [int](Get-ObjectValue $marker 'pid' 0)
+            $markerStarted = [int64](Get-ObjectValue $marker 'startedAt' 0)
+          } catch { continue }
+          if ($markerPid -le 0 -or $markerStarted -le 0 -or
+              $markerPid -ne [int]$candidatePid) { continue }
+          if ($ExpectedHostPid -gt 0 -and $markerPid -ne $ExpectedHostPid) { continue }
+          $process = Get-Process -Id $markerPid -ErrorAction SilentlyContinue
+          $isLive = $null -ne $process
+          $processStarted = [int64]0
+          if ($isLive) {
+            try {
+              $processStarted = ([DateTimeOffset]$process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+              # The marker start belongs to the AudnCode process lifetime.
+              # Reject stale markers and a PID that Windows already reused.
+              if ($markerStarted -lt $processStarted -or
+                  ($markerStarted - $processStarted) -gt 120000) { continue }
+            } catch { continue }
+          } elseif (-not $AllowExitedHost) {
+            continue
+          }
+          $hostMarker = [pscustomobject]@{
+            pid = $markerPid
+            started_unix_ms = $markerStarted
+            process_started_unix_ms = $processStarted
+            session_id = [string](Get-ObjectValue $marker 'sessionId' '')
+            live = [bool]$isLive
+          }
+          $allHostMarkers.Add($hostMarker)
+          if ([string]$hostMarker.session_id -eq $SessionId) { $hostMatches.Add($hostMarker) }
+        }
+      }
+    } catch { }
+
+    if ($hostMatches.Count -eq 1) {
+      return [pscustomobject]@{
+        ok = $true
+        pid = [int]$hostMatches[0].pid
+        started_unix_ms = [int64]$hostMatches[0].started_unix_ms
+        process_started_unix_ms = [int64]$hostMatches[0].process_started_unix_ms
+        live = [bool]$hostMatches[0].live
+        reason = 'audncode-host-current'
+      }
+    }
+
+    if ([DateTimeOffset]::UtcNow -lt $deadline) {
+      # onSessionSwitch() intentionally updates sessions/<pid>.json without
+      # awaiting it. A bounded retry bridges /clear and /resume without ever
+      # accepting another live AudnCode window's marker.
+      Start-Sleep -Milliseconds 50
+      continue
+    }
+
+    if ($hostMatches.Count -eq 0 -and $ExpectedHostPid -le 0) {
+      $transitionMatches = @($allHostMarkers | Where-Object { [bool]$_.live })
+      if ($transitionMatches.Count -eq 1) {
+        return [pscustomobject]@{
+          ok = $true
+          pid = [int]$transitionMatches[0].pid
+          started_unix_ms = [int64]$transitionMatches[0].started_unix_ms
+          process_started_unix_ms = [int64]$transitionMatches[0].process_started_unix_ms
+          live = $true
+          reason = 'audncode-host-session-transition'
+        }
+      }
+    }
+    if ($AllowExitedHost -and $ExpectedHostPid -gt 0 -and $ExpectedHostStartedUnixMs -gt 0) {
+      # AudnCode removes sessions/<pid>.json during a clean shutdown. Detached
+      # workers can still prove that the exact host tuple previously committed
+      # by UserPromptSubmit has ended when its PID no longer exists. Never use
+      # this fallback while any process owns that PID: a missing marker for a
+      # live or rapidly reused PID is unverifiable, not proof of completion.
+      $expectedProcess = Get-Process -Id $ExpectedHostPid -ErrorAction SilentlyContinue
+      if ($null -eq $expectedProcess) {
+        return [pscustomobject]@{
+          ok = $true
+          pid = [int]$ExpectedHostPid
+          started_unix_ms = [int64]$ExpectedHostStartedUnixMs
+          process_started_unix_ms = [int64]0
+          live = $false
+          reason = 'audncode-host-exited'
+        }
+      }
+      try {
+        $replacementStartedUnixMs = ([DateTimeOffset]$expectedProcess.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+        # AudnCode writes startedAt from inside the already-running process, so
+        # that marker timestamp cannot precede the owning process StartTime. A
+        # process with the reused PID that started later than the saved marker
+        # is definitive evidence that the original lifetime ended.
+        if ($replacementStartedUnixMs -gt $ExpectedHostStartedUnixMs) {
+          return [pscustomobject]@{
+            ok = $true
+            pid = [int]$ExpectedHostPid
+            started_unix_ms = [int64]$ExpectedHostStartedUnixMs
+            process_started_unix_ms = [int64]$replacementStartedUnixMs
+            live = $false
+            reason = 'audncode-host-pid-reused'
+          }
+        }
+      } catch { }
+    }
+    return $unknown
+  } while ($true)
+}
+
+function Get-AudnCodeBusyEventRank {
+  param([AllowNull()][object]$Record)
+
+  if ($null -eq $Record -or [int64](Get-ObjectValue $Record 'busy_hook_start_ticks' 0) -le 0) {
+    return 0
+  }
+  $propertyName = if ([bool](Get-ObjectValue $Record 'audncode_prompt_prearm_pending' $false)) {
+    'audncode_prompt_prearm_event_rank'
+  } else {
+    'audncode_busy_event_rank'
+  }
+  $rankProperty = $Record.PSObject.Properties[$propertyName]
+  if ($null -ne $rankProperty -and
+      ($rankProperty.Value -is [int] -or $rankProperty.Value -is [long])) {
+    $rank = [int]$rankProperty.Value
+    if ($rank -in @($AudnCodeSessionStartBusyEventRank, $AudnCodeUserPromptBusyEventRank)) {
+      return $rank
+    }
+  }
+  # A state written by an older notifier has no rank. Treat it as the strongest
+  # known synchronous event so an equal-tick hook cannot replace it fail-open.
+  return $AudnCodeUserPromptBusyEventRank
+}
+
+function Compare-AudnCodeBusyEventOrder {
+  param(
+    [int64]$LeftHookStartTicks,
+    [int]$LeftEventRank,
+    [int64]$RightHookStartTicks,
+    [int]$RightEventRank
+  )
+
+  if ($LeftHookStartTicks -lt $RightHookStartTicks) { return -1 }
+  if ($LeftHookStartTicks -gt $RightHookStartTicks) { return 1 }
+  if ($LeftEventRank -lt $RightEventRank) { return -1 }
+  if ($LeftEventRank -gt $RightEventRank) { return 1 }
+  return 0
+}
+
+function Get-AudnCodeSessionHostLifetimeState {
+  param(
+    [string]$SessionId,
+    [object[]]$Lifetimes = @(),
+    [string]$CurrentHome = '',
+    [int]$CurrentPid = 0,
+    [int64]$CurrentStartedUnixMs = 0,
+    [bool]$StickyConflict = $false,
+    [switch]$ResetConflict,
+    [switch]$PruneExited
+  )
+
+  $unknown = [pscustomobject]@{
+    state = 'unknown'
+    reason = 'audncode-host-lifetimes-unverifiable'
+    lifetimes = @()
+    conflict = $true
+  }
+  if ([string]::IsNullOrWhiteSpace($SessionId)) { return $unknown }
+  $byKey = @{}
+  foreach ($entry in @($Lifetimes)) {
+    if ($null -eq $entry -or $entry -isnot [System.Management.Automation.PSCustomObject]) { return $unknown }
+    $homeProperty = $entry.PSObject.Properties['home']
+    $pidProperty = $entry.PSObject.Properties['pid']
+    $startedProperty = $entry.PSObject.Properties['started_unix_ms']
+    if ($null -eq $homeProperty -or $homeProperty.Value -isnot [string] -or
+        $null -eq $pidProperty -or
+        ($pidProperty.Value -isnot [int] -and $pidProperty.Value -isnot [long]) -or
+        $null -eq $startedProperty -or
+        ($startedProperty.Value -isnot [int] -and $startedProperty.Value -isnot [long])) { return $unknown }
+    try { $entryHome = [IO.Path]::GetFullPath([string]$homeProperty.Value) } catch { return $unknown }
+    $entryPid = [int]$pidProperty.Value
+    $entryStarted = [int64]$startedProperty.Value
+    if ([string]::IsNullOrWhiteSpace($entryHome) -or $entryPid -le 0 -or $entryStarted -le 0) { return $unknown }
+    $key = $entryHome.ToLowerInvariant() + '|' + $entryPid + '|' + $entryStarted
+    $byKey[$key] = [pscustomobject]@{ home = $entryHome; pid = $entryPid; started_unix_ms = $entryStarted }
+  }
+  $currentKey = ''
+  if ($CurrentPid -gt 0 -or $CurrentStartedUnixMs -gt 0 -or -not [string]::IsNullOrWhiteSpace($CurrentHome)) {
+    if ($CurrentPid -le 0 -or $CurrentStartedUnixMs -le 0 -or [string]::IsNullOrWhiteSpace($CurrentHome)) {
+      return $unknown
+    }
+    try { $canonicalCurrentHome = [IO.Path]::GetFullPath($CurrentHome) } catch { return $unknown }
+    $currentKey = $canonicalCurrentHome.ToLowerInvariant() + '|' + $CurrentPid + '|' + $CurrentStartedUnixMs
+    $byKey[$currentKey] = [pscustomobject]@{
+      home = $canonicalCurrentHome
+      pid = [int]$CurrentPid
+      started_unix_ms = [int64]$CurrentStartedUnixMs
+    }
+  }
+  if ($byKey.Count -eq 0 -or $byKey.Count -gt $AudnCodeSessionMaxHostLifetimes) { return $unknown }
+
+  $retained = New-Object 'System.Collections.Generic.List[object]'
+  $liveKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $unknownKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  foreach ($key in @($byKey.Keys | Sort-Object)) {
+    $entry = $byKey[$key]
+    $hostSession = Get-AudnCodeHostSession `
+      -SessionId $SessionId `
+      -HomePath ([string]$entry.home) `
+      -ExpectedHostPid ([int]$entry.pid) `
+      -ExpectedHostStartedUnixMs ([int64]$entry.started_unix_ms) `
+      -AllowExitedHost
+    if (-not [bool](Get-ObjectValue $hostSession 'ok' $false)) {
+      [void]$retained.Add($entry)
+      [void]$unknownKeys.Add([string]$key)
+      continue
+    }
+    if ([int]$hostSession.pid -ne [int]$entry.pid -or
+        [int64]$hostSession.started_unix_ms -ne [int64]$entry.started_unix_ms) {
+      return $unknown
+    }
+    if ([bool](Get-ObjectValue $hostSession 'live' $false)) {
+      [void]$retained.Add($entry)
+      [void]$liveKeys.Add([string]$key)
+    } elseif (-not $PruneExited) {
+      # A process exit does not prove that its detached work is finished. Keep
+      # the exact tuple reachable until Refresh validates host-bound finality or
+      # the trusted Stop + idle retirement path removes it explicitly.
+      [void]$retained.Add($entry)
+      [void]$unknownKeys.Add([string]$key)
+    }
+  }
+  if ($retained.Count -gt $AudnCodeSessionMaxHostLifetimes) { return $unknown }
+  if ($retained.Count -eq 0) {
+    return [pscustomobject]@{
+      state = 'clear'
+      reason = 'audncode-all-session-hosts-exited'
+      lifetimes = @()
+      conflict = $false
+    }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($currentKey) -and -not $liveKeys.Contains($currentKey)) {
+    # The caller's exact target is the authorization boundary for a lifetime
+    # mutation. Reject its TOCTOU exit even when another retained tuple would
+    # otherwise make the aggregate envelope look like an ordinary conflict.
+    return [pscustomobject]@{
+      state = 'unknown'
+      reason = 'audncode-host-lifetimes-unverifiable'
+      lifetimes = @($retained.ToArray())
+      conflict = $true
+    }
+  }
+  $conflict = if ($ResetConflict) { $retained.Count -gt 1 } else { $StickyConflict -or $retained.Count -gt 1 }
+  if ($conflict) {
+    return [pscustomobject]@{
+      state = 'conflict'
+      reason = 'audncode-multi-host-session-active'
+      lifetimes = @($retained.ToArray())
+      conflict = $true
+    }
+  }
+  if ($unknownKeys.Count -gt 0) {
+    return [pscustomobject]@{
+      state = 'unknown'
+      reason = 'audncode-host-lifetimes-unverifiable'
+      lifetimes = @($retained.ToArray())
+      conflict = $true
+    }
+  }
+  return [pscustomobject]@{
+    state = 'clear'
+    reason = 'audncode-single-session-host-current'
+    lifetimes = @($retained.ToArray())
+    conflict = $false
+  }
+}
+
+function Refresh-AudnCodeSessionHostLifetimes {
+  param(
+    [string]$SessionId,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs
+  )
+
+  $failed = [pscustomobject]@{ ok = $false; conflict = $true }
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or [string]::IsNullOrWhiteSpace($HomePath) -or
+      $HostPid -le 0 -or $HostStartedUnixMs -le 0) { return $failed }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $failed }
+  return Invoke-WithClaudeSessionLock -Info $info -Action {
+    param($lockedInfo, $lockedSessionId, $lockedHome, $lockedPid, $lockedStarted)
+    try { $state = Read-JsonFile -Path $lockedInfo.path } catch { return [pscustomobject]@{ ok = $false; conflict = $true } }
+    $conflictProperty = $state.PSObject.Properties['audncode_multi_host_conflict']
+    $lifetimesProperty = $state.PSObject.Properties['audncode_host_lifetimes']
+    if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+        [bool](Get-ObjectValue $state 'audncode_prompt_prearm_pending' $true) -or
+        [int](Get-ObjectValue $state 'audncode_host_pid' 0) -ne [int]$lockedPid -or
+        [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0) -ne [int64]$lockedStarted -or
+        -not [string]::Equals(
+          [string](Get-ObjectValue $state 'audncode_home' ''),
+          $lockedHome,
+          [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        ($null -ne $conflictProperty -and $conflictProperty.Value -isnot [bool]) -or
+        ($null -ne $lifetimesProperty -and $lifetimesProperty.Value -isnot [array])) {
+      return [pscustomobject]@{ ok = $false; conflict = $true }
+    }
+    $lifetimes = if ($null -eq $lifetimesProperty) { @() } else { @($lifetimesProperty.Value) }
+    $lifetimeState = Get-AudnCodeSessionHostLifetimeState `
+      -SessionId $lockedSessionId `
+      -Lifetimes $lifetimes `
+      -CurrentHome $lockedHome `
+      -CurrentPid ([int]$lockedPid) `
+      -CurrentStartedUnixMs ([int64]$lockedStarted) `
+      -StickyConflict ([bool](Get-ObjectValue $state 'audncode_multi_host_conflict' $false)) `
+      -ResetConflict `
+      -PruneExited
+    if ([string](Get-ObjectValue $lifetimeState 'state' 'unknown') -eq 'unknown') {
+      return [pscustomobject]@{ ok = $false; conflict = $true }
+    }
+    $retainedKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($retainedLifetime in @((Get-ObjectValue $lifetimeState 'lifetimes' @()))) {
+      $retainedKey = ([string](Get-ObjectValue $retainedLifetime 'home' '')).ToLowerInvariant() + '|' +
+        ([int](Get-ObjectValue $retainedLifetime 'pid' 0)).ToString() + '|' +
+        ([int64](Get-ObjectValue $retainedLifetime 'started_unix_ms' 0)).ToString()
+      [void]$retainedKeys.Add($retainedKey)
+    }
+    foreach ($priorLifetime in @($lifetimes)) {
+      try { $priorHome = [IO.Path]::GetFullPath([string](Get-ObjectValue $priorLifetime 'home' '')) } catch {
+        return [pscustomobject]@{ ok = $false; conflict = $true }
+      }
+      $priorPid = [int](Get-ObjectValue $priorLifetime 'pid' 0)
+      $priorStarted = [int64](Get-ObjectValue $priorLifetime 'started_unix_ms' 0)
+      $priorKey = $priorHome.ToLowerInvariant() + '|' + $priorPid.ToString() + '|' + $priorStarted.ToString()
+      if ($retainedKeys.Contains($priorKey)) { continue }
+      # Process exit is not terminal proof for detached Agent/Bash work. Before
+      # ResetConflict can persist a pruned envelope, bind the removed tuple back
+      # to its host-specific runtime and require the same comprehensive exited
+      # finality gate used for a completion whose current owner has exited.
+      if ($priorPid -eq [int]$lockedPid -and $priorStarted -eq [int64]$lockedStarted -and
+          [string]::Equals($priorHome, $lockedHome, [StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ ok = $false; conflict = $true }
+      }
+      $exitedFinality = Get-AudnCodeExitedHostLifetimeFinalityState `
+        -SessionState $state `
+        -HomePath $priorHome `
+        -HostPid $priorPid `
+        -HostStartedUnixMs $priorStarted `
+        -LockedSessionState $state
+      if ([string](Get-ObjectValue $exitedFinality 'state' 'unknown') -ne 'idle') {
+        return [pscustomobject]@{ ok = $false; conflict = $true }
+      }
+    }
+    Set-RecordValue -Record $state -Name 'audncode_host_lifetimes' -Value @((Get-ObjectValue $lifetimeState 'lifetimes' @()))
+    Set-RecordValue -Record $state -Name 'audncode_multi_host_conflict' -Value ([bool](Get-ObjectValue $lifetimeState 'conflict' $true))
+    Write-JsonAtomic -Path $lockedInfo.path -Value $state
+    return [pscustomobject]@{
+      ok = $true
+      conflict = [bool](Get-ObjectValue $lifetimeState 'conflict' $true)
+    }
+  } -Arguments @($info, $SessionId, $HomePath, $HostPid, $HostStartedUnixMs)
+}
+
+function Register-AudnCodeSupersededPromptHostLifetime {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs,
+    [int64]$HookStartTicks,
+    [int]$BusyEventRank
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or
+      [string]::IsNullOrWhiteSpace($TranscriptPath) -or
+      [string]::IsNullOrWhiteSpace($HomePath) -or
+      $HostPid -le 0 -or $HostStartedUnixMs -le 0 -or $HookStartTicks -le 0 -or
+      $BusyEventRank -notin @($AudnCodeSessionStartBusyEventRank, $AudnCodeUserPromptBusyEventRank)) {
+    return $false
+  }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $false }
+  return [bool](Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedInfo, $lockedSessionId, $lockedTranscriptPath, $lockedHome, $lockedPid, $lockedStarted, $lockedHookTicks, $lockedEventRank)
+      try { $state = Read-JsonFile -Path $lockedInfo.path } catch { return $false }
+      $stateName = [string](Get-ObjectValue $state 'state' '')
+      $stateEventOrder = Compare-AudnCodeBusyEventOrder `
+        -LeftHookStartTicks ([int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)) `
+        -LeftEventRank (Get-AudnCodeBusyEventRank -Record $state) `
+        -RightHookStartTicks ([int64]$lockedHookTicks) `
+        -RightEventRank ([int]$lockedEventRank)
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          $stateName -notin @('busy', 'idle') -or
+          $stateEventOrder -lt 0 -or
+          -not [string]::Equals(
+            [string](Get-ObjectValue $state 'transcript_path' ''),
+            $lockedTranscriptPath,
+            [StringComparison]::OrdinalIgnoreCase
+          ) -or
+          -not [string]::Equals(
+            [string](Get-ObjectValue $state 'audncode_home' ''),
+            $lockedHome,
+            [StringComparison]::OrdinalIgnoreCase
+          )) { return $false }
+
+      $isPrearmed = [bool](Get-ObjectValue $state 'audncode_prompt_prearm_pending' $false)
+      $propertyName = if ($isPrearmed) {
+        'audncode_prompt_previous_host_lifetimes'
+      } else {
+        'audncode_host_lifetimes'
+      }
+      $lifetimesProperty = $state.PSObject.Properties[$propertyName]
+      if ($null -eq $lifetimesProperty -or $lifetimesProperty.Value -isnot [array]) { return $false }
+      $lifetimeState = Get-AudnCodeSessionHostLifetimeState `
+        -SessionId $lockedSessionId `
+        -Lifetimes @($lifetimesProperty.Value) `
+        -CurrentHome $lockedHome `
+        -CurrentPid ([int]$lockedPid) `
+        -CurrentStartedUnixMs ([int64]$lockedStarted) `
+        -StickyConflict $(if ($isPrearmed) { $false } else { [bool](Get-ObjectValue $state 'audncode_multi_host_conflict' $false) })
+      if ([string](Get-ObjectValue $lifetimeState 'state' 'unknown') -eq 'unknown') { return $false }
+      Set-RecordValue -Record $state -Name $propertyName -Value @((Get-ObjectValue $lifetimeState 'lifetimes' @()))
+      if (-not $isPrearmed) {
+        Set-RecordValue -Record $state -Name 'audncode_multi_host_conflict' -Value ([bool](Get-ObjectValue $lifetimeState 'conflict' $true))
+      }
+      Write-JsonAtomic -Path $lockedInfo.path -Value $state
+      return $true
+    } -Arguments @($info, $SessionId, $TranscriptPath, $HomePath, $HostPid, $HostStartedUnixMs, $HookStartTicks, $BusyEventRank))
+}
+
+function Register-AudnCodeObservedHostLifetime {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or
+      [string]::IsNullOrWhiteSpace($TranscriptPath) -or
+      [string]::IsNullOrWhiteSpace($HomePath) -or
+      $HostPid -le 0 -or $HostStartedUnixMs -le 0) { return $false }
+  try {
+    if (-not [IO.Path]::IsPathRooted($TranscriptPath) -or -not [IO.Path]::IsPathRooted($HomePath)) { return $false }
+    $canonicalTranscript = [IO.Path]::GetFullPath($TranscriptPath)
+    $canonicalHome = [IO.Path]::GetFullPath($HomePath)
+  } catch { return $false }
+  $hostSession = Get-AudnCodeHostSession `
+    -SessionId $SessionId `
+    -HomePath $canonicalHome `
+    -ExpectedHostPid $HostPid `
+    -ExpectedHostStartedUnixMs $HostStartedUnixMs `
+    -AllowExitedHost
+  if (-not [bool](Get-ObjectValue $hostSession 'ok' $false) -or
+      -not [bool](Get-ObjectValue $hostSession 'live' $false) -or
+      [int](Get-ObjectValue $hostSession 'pid' 0) -ne $HostPid -or
+      [int64](Get-ObjectValue $hostSession 'started_unix_ms' 0) -ne $HostStartedUnixMs) { return $false }
+
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $false }
+  return [bool](Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedInfo, $lockedSessionId, $lockedTranscript, $lockedHome, $lockedPid, $lockedStarted)
+      try { $state = Read-JsonFile -Path $lockedInfo.path } catch { return $false }
+      $isPrearmed = [bool](Get-ObjectValue $state 'audncode_prompt_prearm_pending' $false)
+      $propertyName = if ($isPrearmed) {
+        'audncode_prompt_previous_host_lifetimes'
+      } else {
+        'audncode_host_lifetimes'
+      }
+      $lifetimesProperty = $state.PSObject.Properties[$propertyName]
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $state 'state' '') -notin @('busy', 'idle') -or
+          -not [string]::Equals(
+            [string](Get-ObjectValue $state 'transcript_path' ''),
+            $lockedTranscript,
+            [StringComparison]::OrdinalIgnoreCase
+          ) -or
+          $null -eq $lifetimesProperty -or $lifetimesProperty.Value -isnot [array]) { return $false }
+
+      $lifetimes = @($lifetimesProperty.Value)
+      if (-not $isPrearmed) {
+        $currentPid = [int](Get-ObjectValue $state 'audncode_host_pid' 0)
+        $currentStarted = [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0)
+        try { $currentHome = [IO.Path]::GetFullPath([string](Get-ObjectValue $state 'audncode_home' '')) } catch { return $false }
+        if ($currentPid -le 0 -or $currentStarted -le 0 -or [string]::IsNullOrWhiteSpace($currentHome)) { return $false }
+        $lifetimes = @($lifetimes) + @([pscustomobject]@{
+            home = $currentHome
+            pid = $currentPid
+            started_unix_ms = $currentStarted
+          })
+      }
+      $lifetimeState = Get-AudnCodeSessionHostLifetimeState `
+        -SessionId $lockedSessionId `
+        -Lifetimes $lifetimes `
+        -CurrentHome $lockedHome `
+        -CurrentPid $lockedPid `
+        -CurrentStartedUnixMs $lockedStarted `
+        -StickyConflict $(if ($isPrearmed) { $false } else { [bool](Get-ObjectValue $state 'audncode_multi_host_conflict' $false) })
+      if ([string](Get-ObjectValue $lifetimeState 'state' 'unknown') -eq 'unknown') { return $false }
+      [object[]]$resolvedLifetimes = @((Get-ObjectValue $lifetimeState 'lifetimes' @()))
+      [object[]]$matchingRegisteredLifetimes = @($resolvedLifetimes | Where-Object {
+          [string]::Equals(
+            [string](Get-ObjectValue $_ 'home' ''),
+            $lockedHome,
+            [StringComparison]::OrdinalIgnoreCase
+          ) -and
+          [int](Get-ObjectValue $_ 'pid' 0) -eq [int]$lockedPid -and
+          [int64](Get-ObjectValue $_ 'started_unix_ms' 0) -eq [int64]$lockedStarted
+        })
+      if ($matchingRegisteredLifetimes.Count -ne 1) { return $false }
+      Set-RecordValue -Record $state -Name $propertyName -Value $resolvedLifetimes
+      if (-not $isPrearmed) {
+        Set-RecordValue -Record $state -Name 'audncode_multi_host_conflict' -Value ([bool](Get-ObjectValue $lifetimeState 'conflict' $true))
+      }
+      Write-JsonAtomic -Path $lockedInfo.path -Value $state
+      return $true
+    } -Arguments @($info, $SessionId, $canonicalTranscript, $canonicalHome, $HostPid, $HostStartedUnixMs))
+}
+
+function Get-AudnCodeHostRetirementGuardSet {
+  param(
+    [string]$SessionId,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or [string]::IsNullOrWhiteSpace($HomePath) -or
+      $HostPid -le 0 -or $HostStartedUnixMs -le 0) { return $null }
+  $hostSession = Get-AudnCodeHostSession `
+    -SessionId $SessionId `
+    -HomePath $HomePath `
+    -ExpectedHostPid $HostPid `
+    -ExpectedHostStartedUnixMs $HostStartedUnixMs `
+    -AllowExitedHost
+  if (-not [bool](Get-ObjectValue $hostSession 'ok' $false) -or
+      -not [bool](Get-ObjectValue $hostSession 'live' $false) -or
+      [int](Get-ObjectValue $hostSession 'pid' 0) -ne $HostPid -or
+      [int64](Get-ObjectValue $hostSession 'started_unix_ms' 0) -ne $HostStartedUnixMs) { return $null }
+  $backgroundRuntime = Get-AudnCodeRuntimeStateInfo `
+    -HomePath $HomePath `
+    -HostPid $HostPid `
+    -HostStartedUnixMs $HostStartedUnixMs
+  $cronMarker = Get-AudnCodeCronObservationMarker `
+    -HomePath $HomePath `
+    -HostStartedUnixMs $HostStartedUnixMs `
+    -HostProcessStartedUnixMs ([int64](Get-ObjectValue $hostSession 'process_started_unix_ms' 0))
+  if ($null -eq $backgroundRuntime -or
+      -not [bool](Get-ObjectValue $cronMarker 'ok' $false) -or
+      -not [bool](Get-ObjectValue $cronMarker 'host_observable' $false)) { return $null }
+  $cronRuntime = Get-AudnCodeCronRuntimeStateInfo `
+    -HomePath $HomePath `
+    -HostPid $HostPid `
+    -HostStartedUnixMs $HostStartedUnixMs `
+    -HookGeneration ([string](Get-ObjectValue $cronMarker 'generation' '')) `
+    -HookInstalledUnixMs ([int64](Get-ObjectValue $cronMarker 'installed_unix_ms' 0)) `
+    -ObservationAllowed $true
+  if ($null -eq $cronRuntime) { return $null }
+  $ingressGuard = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $backgroundRuntime -RegistryKind 'ingress'
+  $backgroundGuard = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $backgroundRuntime -RegistryKind 'background'
+  $cronGuard = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $cronRuntime -RegistryKind 'cron'
+  if ($null -eq $ingressGuard -or $null -eq $backgroundGuard -or $null -eq $cronGuard) { return $null }
+  return [pscustomobject]@{
+    home = [string]$backgroundRuntime.home
+    host_pid = [int]$HostPid
+    host_started_unix_ms = [int64]$HostStartedUnixMs
+    host_process_started_unix_ms = [int64](Get-ObjectValue $hostSession 'process_started_unix_ms' 0)
+    background_runtime = $backgroundRuntime
+    cron_runtime = $cronRuntime
+    cron_generation = [string](Get-ObjectValue $cronMarker 'generation' '')
+    cron_installed_unix_ms = [int64](Get-ObjectValue $cronMarker 'installed_unix_ms' 0)
+    ingress = $ingressGuard
+    background = $backgroundGuard
+    cron = $cronGuard
+  }
+}
+
+function Get-AudnCodeHostRetirementFinalityState {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [object]$GuardSet
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; reason = 'audncode-retirement-runtime-unverifiable' }
+  if ($null -eq $GuardSet -or [string]::IsNullOrWhiteSpace($SessionId) -or
+      [string]::IsNullOrWhiteSpace($TranscriptPath)) { return $unknown }
+  foreach ($guardName in @('ingress', 'background', 'cron')) {
+    $guardState = Get-AudnCodeLifecycleGuardState -GuardInfo (Get-ObjectValue $GuardSet $guardName)
+    if ([string](Get-ObjectValue $guardState 'state' 'unknown') -ne 'clear') {
+      return [pscustomobject]@{ state = 'unknown'; reason = "audncode-retirement-$guardName-guard-unverifiable" }
+    }
+  }
+  $ingressFallback = Get-AudnCodeIngressFallbackState `
+    -HomePath ([string](Get-ObjectValue $GuardSet 'home' '')) `
+    -HostStartedUnixMs ([int64](Get-ObjectValue $GuardSet 'host_started_unix_ms' 0))
+  if ([string](Get-ObjectValue $ingressFallback 'state' 'unknown') -ne 'clear') {
+    return [pscustomobject]@{ state = 'unknown'; reason = [string](Get-ObjectValue $ingressFallback 'reason' 'audncode-ingress-fallback-unverifiable') }
+  }
+
+  $runtimeState = Read-AudnCodeRuntimeBackgroundState -RuntimeInfo (Get-ObjectValue $GuardSet 'background_runtime')
+  if ($null -eq $runtimeState -or -not [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)) { return $unknown }
+  $matchingLineage = @(@((Get-ObjectValue $runtimeState 'sessions' @())) | Where-Object {
+      [string](Get-ObjectValue $_ 'session_id' '') -eq $SessionId -and
+      [string]::Equals(
+        [string](Get-ObjectValue $_ 'transcript_path' ''),
+        $TranscriptPath,
+        [StringComparison]::OrdinalIgnoreCase
+      )
+    })
+  if ($matchingLineage.Count -ne 1) { return $unknown }
+  if (@((Get-ObjectValue $runtimeState 'background_ids' @())).Count -gt 0) {
+    return [pscustomobject]@{ state = 'busy'; reason = 'audncode-retirement-background-active' }
+  }
+  if ([bool](Get-ObjectValue $runtimeState 'local_agent_ui_uncertain' $false)) {
+    return [pscustomobject]@{ state = 'busy'; reason = 'audncode-retirement-background-unverifiable' }
+  }
+  $cronState = Get-AudnCodeCronFinalityState `
+    -SessionId $SessionId `
+    -HomePath ([string](Get-ObjectValue $GuardSet 'home' '')) `
+    -HostPid ([int](Get-ObjectValue $GuardSet 'host_pid' 0)) `
+    -HostStartedUnixMs ([int64](Get-ObjectValue $GuardSet 'host_started_unix_ms' 0)) `
+    -HostProcessStartedUnixMs ([int64](Get-ObjectValue $GuardSet 'host_process_started_unix_ms' 0)) `
+    -ExpectedRuntimeKey ([string](Get-ObjectValue (Get-ObjectValue $GuardSet 'cron_runtime') 'key' '')) `
+    -ExpectedHookGeneration ([string](Get-ObjectValue $GuardSet 'cron_generation' '')) `
+    -ExpectedHookInstalledUnixMs ([int64](Get-ObjectValue $GuardSet 'cron_installed_unix_ms' 0))
+  if ([string](Get-ObjectValue $cronState 'state' 'unknown') -ne 'idle') {
+    return [pscustomobject]@{
+      state = [string](Get-ObjectValue $cronState 'state' 'unknown')
+      reason = [string](Get-ObjectValue $cronState 'reason' 'audncode-retirement-cron-unverifiable')
+    }
+  }
+  return [pscustomobject]@{ state = 'idle'; reason = 'audncode-retirement-runtime-idle' }
+}
+
+function Invoke-WithAudnCodeHostRetirementGate {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs,
+    [scriptblock]$Action,
+    [object[]]$Arguments = @()
+  )
+
+  $failed = [pscustomobject]@{ state = 'unknown'; reason = 'audncode-retirement-runtime-unverifiable'; value = $null }
+  if ($null -eq $Action) { return $failed }
+  $guardSet = Get-AudnCodeHostRetirementGuardSet `
+    -SessionId $SessionId `
+    -HomePath $HomePath `
+    -HostPid $HostPid `
+    -HostStartedUnixMs $HostStartedUnixMs
+  if ($null -eq $guardSet) { return $failed }
+  $operation = [pscustomobject]@{ action = $Action; arguments = @($Arguments) }
+  return Invoke-WithClaudeSessionLock -Info $guardSet.ingress -Action {
+    param($lockedIngress, $lockedBackground, $lockedCron, $lockedGuardSet, $lockedSessionId, $lockedTranscript, $lockedOperation)
+    return Invoke-WithClaudeSessionLock -Info $lockedBackground -Action {
+      param($lockedIngressInner, $lockedBackgroundInner, $lockedCronInner, $lockedGuardSetInner, $lockedSessionIdInner, $lockedTranscriptInner, $lockedOperationInner)
+      return Invoke-WithClaudeSessionLock -Info $lockedCronInner -Action {
+        param($lockedIngressFinal, $lockedBackgroundFinal, $lockedCronFinal, $lockedGuardSetFinal, $lockedSessionIdFinal, $lockedTranscriptFinal, $lockedOperationFinal)
+        $finality = Get-AudnCodeHostRetirementFinalityState `
+          -SessionId $lockedSessionIdFinal `
+          -TranscriptPath $lockedTranscriptFinal `
+          -GuardSet $lockedGuardSetFinal
+        if ([string](Get-ObjectValue $finality 'state' 'unknown') -ne 'idle') {
+          return [pscustomobject]@{
+            state = [string](Get-ObjectValue $finality 'state' 'unknown')
+            reason = [string](Get-ObjectValue $finality 'reason' 'audncode-retirement-runtime-unverifiable')
+            value = $null
+          }
+        }
+        if ($env:CODEX_NTFY_NO_SPAWN -eq '1') {
+          $markerPath = [string]$env:CODEX_NTFY_TEST_AUDNCODE_RETIREMENT_MARKER
+          $releasePath = [string]$env:CODEX_NTFY_TEST_AUDNCODE_RETIREMENT_RELEASE
+          if (-not [string]::IsNullOrWhiteSpace($markerPath) -and
+              -not [string]::IsNullOrWhiteSpace($releasePath)) {
+            try {
+              [IO.File]::WriteAllText($markerPath, 'checked', [Text.Encoding]::ASCII)
+              $deadline = [DateTimeOffset]::UtcNow.AddSeconds(15)
+              while ([DateTimeOffset]::UtcNow -lt $deadline -and
+                  -not (Test-Path -LiteralPath $releasePath -PathType Leaf)) {
+                Start-Sleep -Milliseconds 25
+              }
+            } catch { }
+          }
+        }
+        $operationAction = Get-ObjectValue $lockedOperationFinal 'action'
+        $operationArguments = @((Get-ObjectValue $lockedOperationFinal 'arguments' @()))
+        $value = & $operationAction @operationArguments
+        return [pscustomobject]@{ state = 'idle'; reason = 'audncode-retirement-runtime-idle'; value = $value }
+      } -Arguments @($lockedIngressInner, $lockedBackgroundInner, $lockedCronInner, $lockedGuardSetInner, $lockedSessionIdInner, $lockedTranscriptInner, $lockedOperationInner)
+    } -Arguments @($lockedIngress, $lockedBackground, $lockedCron, $lockedGuardSet, $lockedSessionId, $lockedTranscript, $lockedOperation)
+  } -Arguments @($guardSet.ingress, $guardSet.background, $guardSet.cron, $guardSet, $SessionId, $TranscriptPath, $operation)
+}
+
+function Get-AudnCodeSupersededHostStopProofState {
+  param([object]$Record)
+
+  if ($null -eq $Record) {
+    return [pscustomobject]@{ valid = $false; proofs = @(); reason = 'record-missing' }
+  }
+  $property = $Record.PSObject.Properties['audncode_superseded_host_stop_proofs']
+  if ($null -eq $property) {
+    # Session shape 1 predates cross-host terminal-pair receipts. Missing data
+    # is an empty proof set, never permission to retire a live lifetime.
+    return [pscustomobject]@{ valid = $true; proofs = @(); reason = 'proofs-missing-migration-empty' }
+  }
+  if ($property.Value -isnot [array]) {
+    return [pscustomobject]@{ valid = $false; proofs = @(); reason = 'proofs-not-array' }
+  }
+
+  $proofs = New-Object 'System.Collections.Generic.List[object]'
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  foreach ($proof in @($property.Value)) {
+    if ($null -eq $proof -or $proof -isnot [System.Management.Automation.PSCustomObject]) {
+      return [pscustomobject]@{ valid = $false; proofs = @(); reason = 'proof-not-object' }
+    }
+    $homeProperty = $proof.PSObject.Properties['home']
+    $pidProperty = $proof.PSObject.Properties['pid']
+    $startedProperty = $proof.PSObject.Properties['started_unix_ms']
+    $stopTicksProperty = $proof.PSObject.Properties['stop_hook_start_ticks']
+    if ($null -eq $homeProperty -or $homeProperty.Value -isnot [string] -or
+        $null -eq $pidProperty -or
+        ($pidProperty.Value -isnot [int] -and $pidProperty.Value -isnot [long]) -or
+        $null -eq $startedProperty -or
+        ($startedProperty.Value -isnot [int] -and $startedProperty.Value -isnot [long]) -or
+        $null -eq $stopTicksProperty -or
+        ($stopTicksProperty.Value -isnot [int] -and $stopTicksProperty.Value -isnot [long])) {
+      return [pscustomobject]@{ valid = $false; proofs = @(); reason = 'proof-property-invalid' }
+    }
+    try { $proofHome = [IO.Path]::GetFullPath([string]$homeProperty.Value) } catch {
+      return [pscustomobject]@{ valid = $false; proofs = @(); reason = 'proof-home-invalid' }
+    }
+    $proofPid = [int]$pidProperty.Value
+    $started = [int64]$startedProperty.Value
+    $stopTicks = [int64]$stopTicksProperty.Value
+    $key = $proofHome.ToLowerInvariant() + '|' + $proofPid.ToString() + '|' + $started.ToString()
+    if ([string]::IsNullOrWhiteSpace($proofHome) -or $proofPid -le 0 -or $started -le 0 -or
+        $stopTicks -le 0 -or -not $seen.Add($key)) {
+      return [pscustomobject]@{ valid = $false; proofs = @(); reason = 'proof-value-invalid-or-duplicate' }
+    }
+    $proofs.Add([pscustomobject]@{
+        home = $proofHome
+        pid = $proofPid
+        started_unix_ms = $started
+        stop_hook_start_ticks = $stopTicks
+      })
+  }
+  if ($proofs.Count -gt $AudnCodeSessionMaxHostLifetimes) {
+    return [pscustomobject]@{ valid = $false; proofs = @(); reason = 'proof-count-exceeded' }
+  }
+  return [pscustomobject]@{ valid = $true; proofs = @($proofs.ToArray()); reason = 'proofs-valid' }
+}
+
+function Register-AudnCodeSupersededHostStopProof {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs,
+    [int64]$HookStartTicks
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or
+      [string]::IsNullOrWhiteSpace($TranscriptPath) -or
+      [string]::IsNullOrWhiteSpace($HomePath) -or
+      $HostPid -le 0 -or $HostStartedUnixMs -le 0 -or $HookStartTicks -le 0) { return $false }
+  try {
+    if (-not [IO.Path]::IsPathRooted($TranscriptPath) -or -not [IO.Path]::IsPathRooted($HomePath)) { return $false }
+    $canonicalTranscript = [IO.Path]::GetFullPath($TranscriptPath)
+    $canonicalHome = [IO.Path]::GetFullPath($HomePath)
+  } catch { return $false }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $false }
+
+  return [bool](Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedInfo, $lockedSessionId, $lockedTranscript, $lockedHome, $lockedPid, $lockedStarted, $lockedHookTicks)
+      try { $state = Read-JsonFile -Path $lockedInfo.path } catch { return $false }
+      $currentPid = [int](Get-ObjectValue $state 'audncode_host_pid' 0)
+      $currentStarted = [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0)
+      $busyTicks = [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)
+      $lifetimesProperty = $state.PSObject.Properties['audncode_host_lifetimes']
+      $proofState = Get-AudnCodeSupersededHostStopProofState -Record $state
+      try { $currentHome = [IO.Path]::GetFullPath([string](Get-ObjectValue $state 'audncode_home' '')) } catch { return $false }
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $state 'state' '') -notin @('busy', 'idle') -or
+          [bool](Get-ObjectValue $state 'audncode_prompt_prearm_pending' $true) -or
+          -not [string]::Equals([string](Get-ObjectValue $state 'transcript_path' ''), $lockedTranscript, [StringComparison]::OrdinalIgnoreCase) -or
+          [string]::IsNullOrWhiteSpace($currentHome) -or
+          $currentPid -le 0 -or $currentStarted -le 0 -or
+          ($currentPid -eq [int]$lockedPid -and $currentStarted -eq [int64]$lockedStarted) -or
+          $busyTicks -le 0 -or [int64]$lockedHookTicks -le $busyTicks -or
+          $null -eq $lifetimesProperty -or $lifetimesProperty.Value -isnot [array] -or
+          -not [bool](Get-ObjectValue $proofState 'valid' $false)) { return $false }
+
+      $lifetimeState = Get-AudnCodeSessionHostLifetimeState `
+        -SessionId $lockedSessionId `
+        -Lifetimes @($lifetimesProperty.Value) `
+        -CurrentHome $currentHome `
+        -CurrentPid $currentPid `
+        -CurrentStartedUnixMs $currentStarted `
+        -StickyConflict ([bool](Get-ObjectValue $state 'audncode_multi_host_conflict' $true))
+      if ([string](Get-ObjectValue $lifetimeState 'state' 'unknown') -ne 'conflict') { return $false }
+      $matchingLifetime = @(@((Get-ObjectValue $lifetimeState 'lifetimes' @())) | Where-Object {
+          [int](Get-ObjectValue $_ 'pid' 0) -eq [int]$lockedPid -and
+          [int64](Get-ObjectValue $_ 'started_unix_ms' 0) -eq [int64]$lockedStarted -and
+          [string]::Equals([string](Get-ObjectValue $_ 'home' ''), $lockedHome, [StringComparison]::OrdinalIgnoreCase)
+        })
+      if ($matchingLifetime.Count -ne 1) { return $false }
+
+      $updatedProofs = New-Object 'System.Collections.Generic.List[object]'
+      foreach ($proof in @((Get-ObjectValue $proofState 'proofs' @()))) {
+        if ([string]::Equals([string](Get-ObjectValue $proof 'home' ''), $lockedHome, [StringComparison]::OrdinalIgnoreCase) -and
+            [int](Get-ObjectValue $proof 'pid' 0) -eq [int]$lockedPid -and
+            [int64](Get-ObjectValue $proof 'started_unix_ms' 0) -eq [int64]$lockedStarted) { continue }
+        $updatedProofs.Add($proof)
+      }
+      $updatedProofs.Add([pscustomobject]@{
+          home = $lockedHome
+          pid = [int]$lockedPid
+          started_unix_ms = [int64]$lockedStarted
+          stop_hook_start_ticks = [int64]$lockedHookTicks
+        })
+      if ($updatedProofs.Count -gt $AudnCodeSessionMaxHostLifetimes) { return $false }
+      Set-RecordValue -Record $state -Name 'audncode_host_lifetimes' -Value @((Get-ObjectValue $lifetimeState 'lifetimes' @()))
+      Set-RecordValue -Record $state -Name 'audncode_multi_host_conflict' -Value $true
+      Set-RecordValue -Record $state -Name 'audncode_superseded_host_stop_proofs' -Value @($updatedProofs.ToArray())
+      Write-JsonAtomic -Path $lockedInfo.path -Value $state
+      return $true
+    } -Arguments @($info, $SessionId, $canonicalTranscript, $canonicalHome, $HostPid, $HostStartedUnixMs, $HookStartTicks))
+}
+
+function Complete-AudnCodeSupersededHostIdleProof {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs,
+    [int64]$HookStartTicks
+  )
+
+  $failed = [pscustomobject]@{ ok = $false; retired = $false; conflict = $true; reason = 'invalid-arguments' }
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or
+      [string]::IsNullOrWhiteSpace($TranscriptPath) -or
+      [string]::IsNullOrWhiteSpace($HomePath) -or
+      $HostPid -le 0 -or $HostStartedUnixMs -le 0 -or $HookStartTicks -le 0) { return $failed }
+  try {
+    if (-not [IO.Path]::IsPathRooted($TranscriptPath) -or -not [IO.Path]::IsPathRooted($HomePath)) { return $failed }
+    $canonicalTranscript = [IO.Path]::GetFullPath($TranscriptPath)
+    $canonicalHome = [IO.Path]::GetFullPath($HomePath)
+  } catch { return $failed }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $failed }
+
+  return Invoke-WithClaudeSessionLock -Info $info -Action {
+    param($lockedInfo, $lockedSessionId, $lockedTranscript, $lockedHome, $lockedPid, $lockedStarted, $lockedHookTicks)
+    try { $state = Read-JsonFile -Path $lockedInfo.path } catch {
+      return [pscustomobject]@{ ok = $false; retired = $false; conflict = $true; reason = 'session-state-unreadable' }
+    }
+    $currentPid = [int](Get-ObjectValue $state 'audncode_host_pid' 0)
+    $currentStarted = [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0)
+    $lifetimesProperty = $state.PSObject.Properties['audncode_host_lifetimes']
+    $proofState = Get-AudnCodeSupersededHostStopProofState -Record $state
+    try { $currentHome = [IO.Path]::GetFullPath([string](Get-ObjectValue $state 'audncode_home' '')) } catch {
+      return [pscustomobject]@{ ok = $false; retired = $false; conflict = $true; reason = 'current-home-invalid' }
+    }
+    $bindingFailureReason = if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId) {
+      'session-id-mismatch'
+    } elseif ([string](Get-ObjectValue $state 'state' '') -notin @('busy', 'idle')) {
+      'session-not-active'
+    } elseif ([bool](Get-ObjectValue $state 'audncode_prompt_prearm_pending' $true)) {
+      'prompt-prearm-pending'
+    } elseif (-not [string]::Equals([string](Get-ObjectValue $state 'transcript_path' ''), $lockedTranscript, [StringComparison]::OrdinalIgnoreCase)) {
+      'transcript-mismatch'
+    } elseif ([string]::IsNullOrWhiteSpace($currentHome) -or $currentPid -le 0 -or $currentStarted -le 0) {
+      'current-host-binding-invalid'
+    } elseif ($currentPid -eq [int]$lockedPid -and $currentStarted -eq [int64]$lockedStarted) {
+      'host-is-current-owner'
+    } elseif ($null -eq $lifetimesProperty -or $lifetimesProperty.Value -isnot [array]) {
+      'host-lifetime-envelope-invalid'
+    } elseif (-not [bool](Get-ObjectValue $proofState 'valid' $false)) {
+      'stop-proof-' + [string](Get-ObjectValue $proofState 'reason' 'envelope-invalid')
+    } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($bindingFailureReason)) {
+      return [pscustomobject]@{ ok = $false; retired = $false; conflict = $true; reason = $bindingFailureReason }
+    }
+
+    $matchingProof = @(@((Get-ObjectValue $proofState 'proofs' @())) | Where-Object {
+        [string]::Equals([string](Get-ObjectValue $_ 'home' ''), $lockedHome, [StringComparison]::OrdinalIgnoreCase) -and
+        [int](Get-ObjectValue $_ 'pid' 0) -eq [int]$lockedPid -and
+        [int64](Get-ObjectValue $_ 'started_unix_ms' 0) -eq [int64]$lockedStarted -and
+        [int64](Get-ObjectValue $_ 'stop_hook_start_ticks' 0) -gt 0 -and
+        [int64](Get-ObjectValue $_ 'stop_hook_start_ticks' 0) -lt [int64]$lockedHookTicks
+      })
+    if ($matchingProof.Count -ne 1) {
+      return [pscustomobject]@{ ok = $false; retired = $false; conflict = $true; reason = 'ordered-stop-proof-missing' }
+    }
+
+    $remainingLifetimes = New-Object 'System.Collections.Generic.List[object]'
+    $removed = 0
+    foreach ($lifetime in @($lifetimesProperty.Value)) {
+      $isTarget = [int](Get-ObjectValue $lifetime 'pid' 0) -eq [int]$lockedPid -and
+        [int64](Get-ObjectValue $lifetime 'started_unix_ms' 0) -eq [int64]$lockedStarted -and
+        [string]::Equals([string](Get-ObjectValue $lifetime 'home' ''), $lockedHome, [StringComparison]::OrdinalIgnoreCase)
+      if ($isTarget) { $removed++; continue }
+      $remainingLifetimes.Add($lifetime)
+    }
+    if ($removed -ne 1) {
+      return [pscustomobject]@{ ok = $false; retired = $false; conflict = $true; reason = 'exact-host-lifetime-missing' }
+    }
+
+    $lifetimeState = Get-AudnCodeSessionHostLifetimeState `
+      -SessionId $lockedSessionId `
+      -Lifetimes @($remainingLifetimes.ToArray()) `
+      -CurrentHome $currentHome `
+      -CurrentPid $currentPid `
+      -CurrentStartedUnixMs $currentStarted `
+      -ResetConflict
+    if ([string](Get-ObjectValue $lifetimeState 'state' 'unknown') -eq 'unknown') {
+      return [pscustomobject]@{ ok = $false; retired = $false; conflict = $true; reason = 'remaining-host-lifetimes-unverifiable' }
+    }
+    $retainedLifetimeKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($lifetime in @((Get-ObjectValue $lifetimeState 'lifetimes' @()))) {
+      [void]$retainedLifetimeKeys.Add(
+        ([string](Get-ObjectValue $lifetime 'home' '')).ToLowerInvariant() + '|' +
+        ([int](Get-ObjectValue $lifetime 'pid' 0)).ToString() + '|' +
+        ([int64](Get-ObjectValue $lifetime 'started_unix_ms' 0)).ToString()
+      )
+    }
+    $remainingProofs = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($proof in @((Get-ObjectValue $proofState 'proofs' @()))) {
+      $proofKey = ([string](Get-ObjectValue $proof 'home' '')).ToLowerInvariant() + '|' +
+        ([int](Get-ObjectValue $proof 'pid' 0)).ToString() + '|' +
+        ([int64](Get-ObjectValue $proof 'started_unix_ms' 0)).ToString()
+      if ($retainedLifetimeKeys.Contains($proofKey)) { $remainingProofs.Add($proof) }
+    }
+    $mutation = [pscustomobject]@{
+      state = $state
+      lifetime_state = $lifetimeState
+      proofs = @($remainingProofs.ToArray())
+      path = [string]$lockedInfo.path
+    }
+    $retirement = Invoke-WithAudnCodeHostRetirementGate `
+      -SessionId $lockedSessionId `
+      -TranscriptPath $lockedTranscript `
+      -HomePath $lockedHome `
+      -HostPid $lockedPid `
+      -HostStartedUnixMs $lockedStarted `
+      -Action {
+        param($lockedMutation)
+        $lockedState = Get-ObjectValue $lockedMutation 'state'
+        $lockedLifetimeState = Get-ObjectValue $lockedMutation 'lifetime_state'
+        Set-RecordValue -Record $lockedState -Name 'audncode_host_lifetimes' -Value @((Get-ObjectValue $lockedLifetimeState 'lifetimes' @()))
+        Set-RecordValue -Record $lockedState -Name 'audncode_multi_host_conflict' -Value ([bool](Get-ObjectValue $lockedLifetimeState 'conflict' $true))
+        Set-RecordValue -Record $lockedState -Name 'audncode_superseded_host_stop_proofs' -Value @((Get-ObjectValue $lockedMutation 'proofs' @()))
+        Write-JsonAtomic -Path ([string](Get-ObjectValue $lockedMutation 'path' '')) -Value $lockedState
+        return [pscustomobject]@{
+          ok = $true
+          retired = $true
+          conflict = [bool](Get-ObjectValue $lockedLifetimeState 'conflict' $true)
+          reason = 'superseded-host-terminal-pair-complete'
+        }
+      } `
+      -Arguments @($mutation)
+    if ([string](Get-ObjectValue $retirement 'state' 'unknown') -ne 'idle') {
+      return [pscustomobject]@{
+        ok = $false
+        retired = $false
+        conflict = $true
+        reason = [string](Get-ObjectValue $retirement 'reason' 'audncode-retirement-runtime-unverifiable')
+      }
+    }
+    return Get-ObjectValue $retirement 'value'
+  } -Arguments @($info, $SessionId, $canonicalTranscript, $canonicalHome, $HostPid, $HostStartedUnixMs, $HookStartTicks)
+}
+
+function Get-AudnCodeBackgroundIdsFromToolEvent {
+  param([object]$HookInput)
+
+  $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $response = Get-ObjectValue $HookInput 'tool_response'
+  $candidates = New-Object 'System.Collections.Generic.List[object]'
+  if ($null -ne $response) {
+    $candidates.Add($response)
+    $data = Get-ObjectValue $response 'data'
+    if ($null -ne $data) { $candidates.Add($data) }
+  }
+  $toolName = ([string](Get-ObjectValue $HookInput 'tool_name' '')).Trim()
+  foreach ($candidate in $candidates) {
+    $status = ([string](Get-ObjectValue $candidate 'status' '')).Trim().ToLowerInvariant()
+    $rawIds = New-Object 'System.Collections.Generic.List[string]'
+    $backgroundTaskId = [string](Get-ObjectValue $candidate 'backgroundTaskId' '')
+    if (-not [string]::IsNullOrWhiteSpace($backgroundTaskId)) { $rawIds.Add($backgroundTaskId) }
+    if ($status -eq 'async_launched') {
+      $agentId = [string](Get-ObjectValue $candidate 'agentId' '')
+      if (-not [string]::IsNullOrWhiteSpace($agentId)) { $rawIds.Add($agentId) }
+    }
+    if ($status -eq 'remote_launched') {
+      $taskId = [string](Get-ObjectValue $candidate 'taskId' '')
+      if (-not [string]::IsNullOrWhiteSpace($taskId)) { $rawIds.Add($taskId) }
+    }
+    if ($toolName -eq 'Monitor') {
+      $monitorTaskId = [string](Get-ObjectValue $candidate 'taskId' '')
+      if (-not [string]::IsNullOrWhiteSpace($monitorTaskId)) { $rawIds.Add($monitorTaskId) }
+    }
+    foreach ($rawId in $rawIds) {
+      $id = $rawId.Trim()
+      if ($id.Length -le 160 -and $id -match '^[A-Za-z0-9][A-Za-z0-9._:-]*$') {
+        [void]$ids.Add($id)
+      }
+    }
+  }
+  return @($ids)
+}
+
+function Get-AudnCodeCompletedBackgroundIdsFromToolEvent {
+  param([object]$HookInput)
+
+  $toolName = ([string](Get-ObjectValue $HookInput 'tool_name' '')).Trim()
+  if ($toolName -notin @('TaskStop', 'KillShell')) { return @() }
+  $response = Get-ObjectValue $HookInput 'tool_response'
+  $data = Get-ObjectValue $response 'data'
+  if ($null -eq $data) { $data = $response }
+  $taskType = ([string](Get-ObjectValue $data 'task_type' '')).Trim().ToLowerInvariant()
+  if ($toolName -eq 'KillShell' -and $taskType -ne 'local_bash') { return @() }
+  if ($toolName -eq 'TaskStop' -and [string]::IsNullOrWhiteSpace($taskType)) { return @() }
+  $taskId = ([string](Get-ObjectValue $data 'task_id' '')).Trim()
+  if ($taskId.Length -le 160 -and $taskId -match '^[A-Za-z0-9][A-Za-z0-9._:-]*$') { return @($taskId) }
+  return @()
+}
+
+function Get-AudnCodeCronObservationMarker {
+  param(
+    [string]$HomePath,
+    [int64]$HostStartedUnixMs,
+    [int64]$HostProcessStartedUnixMs = 0
+  )
+
+  $invalid = [pscustomobject]@{
+    ok = $false
+    generation = ''
+    installed_unix_ms = [int64]0
+    host_observable = $false
+    reason = 'audncode-cron-observation-marker-unverifiable'
+  }
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or $HostStartedUnixMs -le 0) { return $invalid }
+  try {
+    $canonicalHome = [IO.Path]::GetFullPath($HomePath)
+    $markerPath = Join-Path $canonicalHome $AudnCodeHookObservationMarkerName
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { return $invalid }
+    $marker = Read-JsonFile -Path $markerPath
+    $schemaProperty = $marker.PSObject.Properties['schema']
+    $versionProperty = $marker.PSObject.Properties['notifier_version']
+    $shapeProperty = $marker.PSObject.Properties['hook_shape_version']
+    $generationProperty = $marker.PSObject.Properties['generation']
+    $installedProperty = $marker.PSObject.Properties['installed_unix_ms']
+    $homeProperty = $marker.PSObject.Properties['audncode_home']
+    if ([string](Get-ObjectValue $marker 'kind' '') -ne 'codex-ntfy-audncode-hooks' -or
+        $null -eq $schemaProperty -or
+        ($schemaProperty.Value -isnot [int] -and $schemaProperty.Value -isnot [long]) -or
+        [int64]$schemaProperty.Value -ne 1 -or
+        $null -eq $versionProperty -or $versionProperty.Value -isnot [string] -or [string]$versionProperty.Value -ne $ScriptVersion -or
+        $null -eq $shapeProperty -or
+        ($shapeProperty.Value -isnot [int] -and $shapeProperty.Value -isnot [long]) -or
+        [int64]$shapeProperty.Value -ne $AudnCodeHookShapeVersion -or
+        $null -eq $generationProperty -or $generationProperty.Value -isnot [string] -or
+        [string]$generationProperty.Value -notmatch '^[a-f0-9]{32}$' -or
+        $null -eq $installedProperty -or
+        ($installedProperty.Value -isnot [int] -and $installedProperty.Value -isnot [long]) -or
+        [int64]$installedProperty.Value -le 0 -or
+        $null -eq $homeProperty -or $homeProperty.Value -isnot [string] -or
+        -not [string]::Equals([IO.Path]::GetFullPath([string]$homeProperty.Value), $canonicalHome, [StringComparison]::OrdinalIgnoreCase)) {
+      return $invalid
+    }
+    $installedUnixMs = [int64]$installedProperty.Value
+    return [pscustomobject]@{
+      ok = $true
+      generation = [string]$generationProperty.Value
+      installed_unix_ms = $installedUnixMs
+      # AudnCode may write sessions/<pid>.json.startedAt after awaited startup
+      # work. Only Windows Process.StartTime proves that the process itself was
+      # born after the installer committed the observation marker.
+      host_observable = $HostProcessStartedUnixMs -gt $installedUnixMs
+      reason = if ($HostProcessStartedUnixMs -gt $installedUnixMs) {
+        'audncode-cron-observation-complete'
+      } elseif ($HostProcessStartedUnixMs -le 0) {
+        'audncode-cron-host-start-unverifiable'
+      } else {
+        'audncode-cron-host-predates-hooks'
+      }
+    }
+  } catch {
+    return $invalid
+  }
+}
+
+function Get-AudnCodeStopFailurePayloadHash {
+  param(
+    [string]$ErrorName,
+    [bool]$ErrorDetailsPresent,
+    [string]$ErrorDetails,
+    [string]$LastAssistantMessage
+  )
+
+  return Get-Sha256Hex ('audncode-stop-failure-payload/v1|' + (ConvertTo-CompactJson ([ordered]@{
+          error = $ErrorName
+          error_details_present = [bool]$ErrorDetailsPresent
+          error_details = if ($ErrorDetailsPresent) { $ErrorDetails } else { '' }
+          last_assistant_message = $LastAssistantMessage
+        })))
+}
+
+function Get-AudnCodeStopFailureHookPayloadBinding {
+  param([object]$HookInput)
+
+  $invalid = [pscustomobject]@{ ok = $false; reason = 'audncode-stop-failure-payload-unverifiable' }
+  if ($null -eq $HookInput -or $HookInput -isnot [System.Management.Automation.PSCustomObject]) { return $invalid }
+  $errorProperty = $HookInput.PSObject.Properties['error']
+  $messageProperty = $HookInput.PSObject.Properties['last_assistant_message']
+  $detailsProperty = $HookInput.PSObject.Properties['error_details']
+  if ($null -eq $errorProperty -or $errorProperty.Value -isnot [string] -or
+      [string]::IsNullOrWhiteSpace([string]$errorProperty.Value) -or
+      $null -eq $messageProperty -or $messageProperty.Value -isnot [string] -or
+      [string]::IsNullOrWhiteSpace([string]$messageProperty.Value) -or
+      -not [string]::Equals(
+        [string]$messageProperty.Value,
+        ([string]$messageProperty.Value).Trim(),
+        [StringComparison]::Ordinal
+      ) -or
+      ($null -ne $detailsProperty -and $detailsProperty.Value -isnot [string])) {
+    return $invalid
+  }
+  $errorName = [string]$errorProperty.Value
+  $lastAssistantMessage = [string]$messageProperty.Value
+  $detailsPresent = $null -ne $detailsProperty
+  $details = if ($detailsPresent) { [string]$detailsProperty.Value } else { '' }
+  return [pscustomobject]@{
+    ok = $true
+    error = $errorName
+    error_details_present = [bool]$detailsPresent
+    error_details = $details
+    last_assistant_message = $lastAssistantMessage
+    payload_hash = Get-AudnCodeStopFailurePayloadHash `
+      -ErrorName $errorName `
+      -ErrorDetailsPresent ([bool]$detailsPresent) `
+      -ErrorDetails $details `
+      -LastAssistantMessage $lastAssistantMessage
+  }
+}
+
+function Get-AudnCodeTranscriptCursorSnapshot {
+  param(
+    [string]$TranscriptPath,
+    [string]$SessionId,
+    [string]$HomePath
+  )
+
+  $invalid = [pscustomobject]@{
+    ok = $false
+    file_existed = $false
+    cursor = [int64]0
+    at_boundary = $false
+    creation_ticks = [int64]0
+    anchor_offset = [int64]0
+    anchor_hash = ''
+  }
+  try { $canonicalPath = [IO.Path]::GetFullPath($TranscriptPath) } catch { return $invalid }
+  for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    if (-not (Test-AudnCodeTranscriptPath -SessionId $SessionId -TranscriptPath $canonicalPath -HomePath $HomePath -AllowMissing)) {
+      return $invalid
+    }
+    if (-not (Test-Path -LiteralPath $canonicalPath -PathType Leaf)) {
+      return [pscustomobject]@{
+        ok = $true
+        file_existed = $false
+        cursor = [int64]0
+        at_boundary = $true
+        creation_ticks = [int64]0
+        anchor_offset = [int64]0
+        anchor_hash = Get-Sha256HexBytes ([byte[]]@())
+      }
+    }
+    $stream = $null
+    try {
+      $before = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+      if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $invalid }
+      $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+      $stream = [IO.File]::Open($canonicalPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+      $cursor = [int64]$stream.Length
+      $atBoundary = $true
+      if ($cursor -gt 0) {
+        [void]$stream.Seek(-1, [IO.SeekOrigin]::End)
+        $atBoundary = $stream.ReadByte() -eq 10
+      }
+      $anchorLength = [int][Math]::Min([int64]$AudnCodeStopFailureAnchorBytes, $cursor)
+      $anchorOffset = $cursor - $anchorLength
+      [byte[]]$anchorBytes = New-Object byte[] $anchorLength
+      if ($anchorLength -gt 0) {
+        [void]$stream.Seek($anchorOffset, [IO.SeekOrigin]::Begin)
+        $read = 0
+        while ($read -lt $anchorLength) {
+          $count = $stream.Read($anchorBytes, $read, $anchorLength - $read)
+          if ($count -le 0) { return $invalid }
+          $read += $count
+        }
+      }
+      $streamLengthAfterRead = [int64]$stream.Length
+      $stream.Dispose()
+      $stream = $null
+      $after = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+      if ($streamLengthAfterRead -ne $cursor -or [int64]$before.Length -ne $cursor -or
+          [int64]$after.Length -ne $cursor -or
+          $before.CreationTimeUtc.Ticks -ne $after.CreationTimeUtc.Ticks -or
+          $before.LastWriteTimeUtc.Ticks -ne $after.LastWriteTimeUtc.Ticks) {
+        continue
+      }
+      if (-not (Test-AudnCodeTranscriptPath -SessionId $SessionId -TranscriptPath $canonicalPath -HomePath $HomePath)) {
+        return $invalid
+      }
+      return [pscustomobject]@{
+        ok = [bool]$atBoundary
+        file_existed = $true
+        cursor = $cursor
+        at_boundary = [bool]$atBoundary
+        creation_ticks = [int64]$before.CreationTimeUtc.Ticks
+        anchor_offset = [int64]$anchorOffset
+        anchor_hash = Get-Sha256HexBytes $anchorBytes
+      }
+    } catch {
+      if ($attempt -ge 2) { return $invalid }
+    } finally {
+      if ($null -ne $stream) { $stream.Dispose() }
+    }
+  }
+  return $invalid
+}
+
+function Get-AudnCodeStopFailureTranscriptProof {
+  param(
+    [object]$SessionState,
+    [string]$SessionId,
+    [int64]$SessionEpoch,
+    [string]$TranscriptPath,
+    [string]$ExpectedPayloadHash,
+    [string]$ExpectedUuid = '',
+    [string]$ExpectedLineHash = ''
+  )
+
+  $unknown = [pscustomobject]@{ ok = $false; reason = 'audncode-stop-failure-proof-unverifiable' }
+  $ambiguousProof = [pscustomobject]@{ ok = $false; reason = 'audncode-stop-failure-proof-ambiguous' }
+  if ($null -eq $SessionState -or $SessionState -isnot [System.Management.Automation.PSCustomObject] -or
+      [string]::IsNullOrWhiteSpace($SessionId) -or $SessionEpoch -le 0 -or
+      $ExpectedPayloadHash -notmatch '^[a-f0-9]{64}$') { return $unknown }
+  $cursorValidProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_valid']
+  $cursorProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor']
+  $boundaryProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_at_boundary']
+  $existedProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_file_existed']
+  $creationProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_creation_ticks']
+  $anchorOffsetProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_anchor_offset']
+  $anchorHashProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_anchor_hash']
+  if ($null -eq $cursorValidProperty -or $cursorValidProperty.Value -isnot [bool] -or
+      -not [bool]$cursorValidProperty.Value -or
+      $null -eq $boundaryProperty -or $boundaryProperty.Value -isnot [bool] -or
+      -not [bool]$boundaryProperty.Value -or
+      $null -eq $existedProperty -or $existedProperty.Value -isnot [bool] -or
+      $null -eq $cursorProperty -or
+      ($cursorProperty.Value -isnot [int] -and $cursorProperty.Value -isnot [long]) -or
+      [int64]$cursorProperty.Value -lt 0 -or
+      $null -eq $creationProperty -or
+      ($creationProperty.Value -isnot [int] -and $creationProperty.Value -isnot [long]) -or
+      [int64]$creationProperty.Value -lt 0 -or
+      $null -eq $anchorOffsetProperty -or
+      ($anchorOffsetProperty.Value -isnot [int] -and $anchorOffsetProperty.Value -isnot [long]) -or
+      [int64]$anchorOffsetProperty.Value -lt 0 -or
+      $null -eq $anchorHashProperty -or $anchorHashProperty.Value -isnot [string] -or
+      [string]$anchorHashProperty.Value -notmatch '^[a-f0-9]{64}$') { return $unknown }
+
+  $cursor = [int64]$cursorProperty.Value
+  $anchorOffset = [int64]$anchorOffsetProperty.Value
+  $anchorHash = [string]$anchorHashProperty.Value
+  $cursorFileExisted = [bool]$existedProperty.Value
+  $cursorCreationTicks = [int64]$creationProperty.Value
+  if ([string](Get-ObjectValue $SessionState 'session_id' '') -ne $SessionId -or
+      [int64](Get-ObjectValue $SessionState 'epoch' 0) -ne $SessionEpoch -or
+      [string](Get-ObjectValue $SessionState 'state' '') -notin @('busy', 'idle') -or
+      [bool](Get-ObjectValue $SessionState 'audncode_prompt_prearm_pending' $true) -or
+      -not [string]::Equals(
+        [string](Get-ObjectValue $SessionState 'transcript_path' ''),
+        $TranscriptPath,
+        [StringComparison]::OrdinalIgnoreCase
+      ) -or
+      [int64](Get-ObjectValue $SessionState 'busy_unix_ms' 0) -le 0 -or
+      $anchorOffset -gt $cursor -or
+      ($cursor - $anchorOffset) -gt $AudnCodeStopFailureAnchorBytes) { return $unknown }
+  if (-not $cursorFileExisted -and ($cursor -ne 0 -or $cursorCreationTicks -ne 0 -or $anchorOffset -ne 0)) {
+    return $unknown
+  }
+
+  $stream = $null
+  try {
+    $canonicalPath = [IO.Path]::GetFullPath($TranscriptPath)
+    $proofHomePath = [string](Get-ObjectValue $SessionState 'audncode_home' '')
+    if (-not (Test-AudnCodeTranscriptPath `
+          -SessionId $SessionId `
+          -TranscriptPath $canonicalPath `
+          -HomePath $proofHomePath)) { return $unknown }
+    $before = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$before.Length -lt $cursor) {
+      return $unknown
+    }
+    if ($cursorFileExisted -and $before.CreationTimeUtc.Ticks -ne $cursorCreationTicks) { return $unknown }
+    $tailLength = [int64]$before.Length - $cursor
+    if ($tailLength -le 0 -or $tailLength -gt $AudnCodeStopFailureMaxTailBytes) { return $unknown }
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($canonicalPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    if ([int64]$stream.Length -ne [int64]$before.Length) { return $unknown }
+
+    $anchorLength = [int]($cursor - $anchorOffset)
+    [byte[]]$anchorBytes = New-Object byte[] $anchorLength
+    if ($anchorLength -gt 0) {
+      [void]$stream.Seek($anchorOffset, [IO.SeekOrigin]::Begin)
+      $anchorRead = 0
+      while ($anchorRead -lt $anchorLength) {
+        $count = $stream.Read($anchorBytes, $anchorRead, $anchorLength - $anchorRead)
+        if ($count -le 0) { return $unknown }
+        $anchorRead += $count
+      }
+    }
+    if ((Get-Sha256HexBytes $anchorBytes) -ne $anchorHash) { return $unknown }
+
+    [byte[]]$tailBytes = New-Object byte[] ([int]$tailLength)
+    [void]$stream.Seek($cursor, [IO.SeekOrigin]::Begin)
+    $tailRead = 0
+    while ($tailRead -lt $tailBytes.Length) {
+      $count = $stream.Read($tailBytes, $tailRead, $tailBytes.Length - $tailRead)
+      if ($count -le 0) { return $unknown }
+      $tailRead += $count
+    }
+    if ($tailBytes[$tailBytes.Length - 1] -ne 10 -or [int64]$stream.Length -ne [int64]$before.Length) {
+      return $unknown
+    }
+    $stream.Dispose()
+    $stream = $null
+    $after = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    if ([int64]$after.Length -ne [int64]$before.Length -or
+        $after.CreationTimeUtc.Ticks -ne $before.CreationTimeUtc.Ticks -or
+        $after.LastWriteTimeUtc.Ticks -ne $before.LastWriteTimeUtc.Ticks) { return $unknown }
+    if (-not (Test-AudnCodeTranscriptPath `
+          -SessionId $SessionId `
+          -TranscriptPath $canonicalPath `
+          -HomePath $proofHomePath)) { return $unknown }
+
+    try { $tailText = $Utf8StrictNoBom.GetString($tailBytes) } catch { return $unknown }
+    $lines = [regex]::Split($tailText, "`n")
+    if ($lines.Count -le 1 -or ($lines.Count - 1) -gt $AudnCodeStopFailureMaxRecords -or
+        -not [string]::IsNullOrEmpty($lines[$lines.Count - 1])) { return $unknown }
+    $entriesByUuid = @{}
+    $seenUuids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $apiErrors = New-Object 'System.Collections.Generic.List[object]'
+    $parsedEntries = New-Object 'System.Collections.Generic.List[object]'
+    for ($index = 0; $index -lt $lines.Count - 1; $index++) {
+      $line = [string]$lines[$index]
+      if ($line.EndsWith("`r", [StringComparison]::Ordinal)) { $line = $line.Substring(0, $line.Length - 1) }
+      if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -gt $AudnCodeStopFailureMaxLineChars) { return $unknown }
+      try { $entry = ConvertFrom-StrictJsonText -Text $line } catch { return $unknown }
+      if ($null -eq $entry -or $entry -isnot [System.Management.Automation.PSCustomObject]) { return $unknown }
+      $entryType = [string](Get-ObjectValue $entry 'type' '')
+      $parsedEntries.Add([pscustomobject]@{ index = $index; entry = $entry; line = $line })
+      if ($entryType -notin @('user', 'assistant', 'attachment', 'system')) { continue }
+      $uuidProperty = $entry.PSObject.Properties['uuid']
+      $sessionProperty = $entry.PSObject.Properties['sessionId']
+      $sidechainProperty = $entry.PSObject.Properties['isSidechain']
+      $parsedUuid = [Guid]::Empty
+      if ($null -eq $uuidProperty -or $uuidProperty.Value -isnot [string] -or
+          -not [Guid]::TryParseExact([string]$uuidProperty.Value, 'D', [ref]$parsedUuid) -or
+          $null -eq $sessionProperty -or $sessionProperty.Value -isnot [string] -or
+          [string]$sessionProperty.Value -ne $SessionId -or
+          $null -eq $sidechainProperty -or $sidechainProperty.Value -isnot [bool]) { return $unknown }
+      $canonicalUuid = $parsedUuid.ToString('D')
+      if (-not $seenUuids.Add($canonicalUuid)) { return $ambiguousProof }
+      $entriesByUuid[$canonicalUuid] = $entry
+      $agentProperty = $entry.PSObject.Properties['agentId']
+      $isRoot = -not [bool]$sidechainProperty.Value -and $null -eq $agentProperty
+      if ($entryType -eq 'user') {
+        $metaProperty = $entry.PSObject.Properties['isMeta']
+        if ($null -ne $metaProperty -and $metaProperty.Value -isnot [bool]) { return $unknown }
+        if ($isRoot) {
+          $rootUserKind = Get-AudnCodeRootUserKind -Entry $entry -SessionId $SessionId
+          if ($rootUserKind -eq 'invalid') { return $unknown }
+        }
+      }
+      if ($entryType -ne 'assistant') { continue }
+      $apiErrorProperty = $entry.PSObject.Properties['isApiErrorMessage']
+      # Ordinary assistant/tool-use rows omit this optional property. Treat
+      # absence as false, but reject a present non-boolean value.
+      if ($null -eq $apiErrorProperty) { continue }
+      if ($apiErrorProperty.Value -isnot [bool]) { return $unknown }
+      if (-not [bool]$apiErrorProperty.Value) { continue }
+      $apiErrors.Add([pscustomobject]@{
+          index = $index
+          entry = $entry
+          line = $line
+          uuid = $canonicalUuid
+          is_root = [bool]$isRoot
+        })
+    }
+    $evaluateApiError = {
+      param($candidateError)
+
+      $invalid = [pscustomobject]@{ state = 'invalid' }
+      $nonCandidate = [pscustomobject]@{ state = 'noncandidate' }
+      if (-not [bool]$candidateError.is_root) { return $nonCandidate }
+      $assistant = $candidateError.entry
+      $timestampProperty = $assistant.PSObject.Properties['timestamp']
+      $messageProperty = $assistant.PSObject.Properties['message']
+      $parentProperty = $assistant.PSObject.Properties['parentUuid']
+      $timestamp = [DateTimeOffset]::MinValue
+      $parentUuid = [Guid]::Empty
+      $timestampValid = $false
+      if ($null -ne $timestampProperty) {
+        if ($timestampProperty.Value -is [string]) {
+          $timestampValid = [DateTimeOffset]::TryParse(
+            [string]$timestampProperty.Value,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$timestamp
+          )
+        } elseif ($timestampProperty.Value -is [DateTimeOffset]) {
+          $timestamp = ([DateTimeOffset]$timestampProperty.Value).ToUniversalTime()
+          $timestampValid = $true
+        } elseif ($timestampProperty.Value -is [DateTime]) {
+          $dateTimeValue = [DateTime]$timestampProperty.Value
+          if ($dateTimeValue.Kind -ne [DateTimeKind]::Unspecified) {
+            $timestamp = [DateTimeOffset]$dateTimeValue.ToUniversalTime()
+            $timestampValid = $true
+          }
+        }
+      }
+      if (-not $timestampValid -or
+          $null -eq $parentProperty -or $parentProperty.Value -isnot [string] -or
+          -not [Guid]::TryParseExact([string]$parentProperty.Value, 'D', [ref]$parentUuid) -or
+          $null -eq $messageProperty -or
+          $messageProperty.Value -isnot [System.Management.Automation.PSCustomObject]) {
+        return $invalid
+      }
+      if ($timestamp.ToUniversalTime().ToUnixTimeMilliseconds() -le
+          [int64](Get-ObjectValue $SessionState 'busy_unix_ms' 0)) { return $nonCandidate }
+
+      $roleProperty = $messageProperty.Value.PSObject.Properties['role']
+      $contentProperty = $messageProperty.Value.PSObject.Properties['content']
+      if ($null -eq $roleProperty -or $roleProperty.Value -isnot [string] -or
+          [string]$roleProperty.Value -ne 'assistant' -or
+          $null -eq $contentProperty -or $contentProperty.Value -isnot [System.Array]) { return $invalid }
+      $content = @($contentProperty.Value)
+      if ($content.Count -ne 1 -or
+          $content[0] -isnot [System.Management.Automation.PSCustomObject]) { return $invalid }
+      $contentTypeProperty = $content[0].PSObject.Properties['type']
+      $contentTextProperty = $content[0].PSObject.Properties['text']
+      if ($null -eq $contentTypeProperty -or $contentTypeProperty.Value -isnot [string] -or
+          [string]$contentTypeProperty.Value -ne 'text' -or
+          $null -eq $contentTextProperty -or $contentTextProperty.Value -isnot [string]) { return $invalid }
+      $lastAssistantMessage = ([string]$contentTextProperty.Value).Trim()
+      if ([string]::IsNullOrWhiteSpace($lastAssistantMessage)) { return $invalid }
+      $errorProperty = $assistant.PSObject.Properties['error']
+      $detailsProperty = $assistant.PSObject.Properties['errorDetails']
+      if (($null -ne $errorProperty -and ($errorProperty.Value -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$errorProperty.Value))) -or
+          ($null -ne $detailsProperty -and $detailsProperty.Value -isnot [string])) { return $invalid }
+      $errorName = if ($null -eq $errorProperty) { 'unknown' } else { [string]$errorProperty.Value }
+      $detailsPresent = $null -ne $detailsProperty
+      $details = if ($detailsPresent) { [string]$detailsProperty.Value } else { '' }
+      $payloadHash = Get-AudnCodeStopFailurePayloadHash `
+        -ErrorName $errorName `
+        -ErrorDetailsPresent ([bool]$detailsPresent) `
+        -ErrorDetails $details `
+        -LastAssistantMessage $lastAssistantMessage
+      if ($payloadHash -ne $ExpectedPayloadHash) { return $nonCandidate }
+
+      foreach ($parsed in @($parsedEntries.ToArray())) {
+        if ([int]$parsed.index -le [int]$candidateError.index) { continue }
+        $later = $parsed.entry
+        if ([string](Get-ObjectValue $later 'type' '') -ne 'user') { continue }
+        $laterSidechain = $later.PSObject.Properties['isSidechain']
+        $laterAgent = $later.PSObject.Properties['agentId']
+        if ($null -eq $laterSidechain -or $laterSidechain.Value -isnot [bool]) { return $invalid }
+        if (-not [bool]$laterSidechain.Value -and $null -eq $laterAgent) {
+          $laterKind = Get-AudnCodeRootUserKind -Entry $later -SessionId $SessionId
+          if ($laterKind -eq 'invalid') { return $invalid }
+          # Any later root string prompt, including a native task-notification
+          # or meta tick, is a newer query. Mid-turn task notifications are
+          # attachments and therefore do not enter this veto.
+          if ($laterKind -ne 'non-prompt') { return $nonCandidate }
+        }
+      }
+
+      $chainReachedPrompt = $false
+      $visitedParents = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+      $nextParent = $parentUuid.ToString('D')
+      while ($entriesByUuid.ContainsKey($nextParent)) {
+        if (-not $visitedParents.Add($nextParent)) { return $invalid }
+        $parentEntry = $entriesByUuid[$nextParent]
+        if ([string](Get-ObjectValue $parentEntry 'type' '') -eq 'user') {
+          $parentSidechain = $parentEntry.PSObject.Properties['isSidechain']
+          $parentAgent = $parentEntry.PSObject.Properties['agentId']
+          if ($null -eq $parentSidechain -or $parentSidechain.Value -isnot [bool]) { return $invalid }
+          if (-not [bool]$parentSidechain.Value -and $null -eq $parentAgent) {
+            $parentKind = Get-AudnCodeRootUserKind -Entry $parentEntry -SessionId $SessionId
+            if ($parentKind -eq 'invalid') { return $invalid }
+            if ($parentKind -ne 'non-prompt') {
+              # The cursor places the complete tail after UserPromptSubmit;
+              # ancestry, not row order, selects the prompt owning this error.
+              $chainReachedPrompt = $true
+              break
+            }
+          }
+        }
+        $nextProperty = $parentEntry.PSObject.Properties['parentUuid']
+        if ($null -eq $nextProperty -or $null -eq $nextProperty.Value) { break }
+        $nextGuid = [Guid]::Empty
+        if ($nextProperty.Value -isnot [string] -or
+            -not [Guid]::TryParseExact([string]$nextProperty.Value, 'D', [ref]$nextGuid)) { return $invalid }
+        $nextParent = $nextGuid.ToString('D')
+      }
+      if (-not $chainReachedPrompt) { return $nonCandidate }
+      return [pscustomobject]@{
+        state = 'candidate'
+        error = $candidateError
+        payload_hash = $payloadHash
+        line_hash = Get-Sha256Hex ('audncode-stop-failure-line/v1|' + [string]$candidateError.line)
+      }
+    }
+
+    $matchingCandidates = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($apiError in @($apiErrors.ToArray())) {
+      $evaluation = & $evaluateApiError $apiError
+      if ([string](Get-ObjectValue $evaluation 'state' '') -eq 'invalid') { return $unknown }
+      if ([string](Get-ObjectValue $evaluation 'state' '') -eq 'candidate') {
+        $matchingCandidates.Add($evaluation)
+      }
+    }
+    if ($matchingCandidates.Count -gt 1) { return $ambiguousProof }
+    if ($matchingCandidates.Count -ne 1) { return $unknown }
+    $matched = $matchingCandidates[0]
+    $apiError = $matched.error
+    $payloadHash = [string]$matched.payload_hash
+    $lineHash = [string]$matched.line_hash
+    if ((-not [string]::IsNullOrWhiteSpace($ExpectedUuid) -and
+          -not [string]::Equals([string]$apiError.uuid, $ExpectedUuid, [StringComparison]::OrdinalIgnoreCase)) -or
+        (-not [string]::IsNullOrWhiteSpace($ExpectedLineHash) -and $lineHash -ne $ExpectedLineHash)) {
+      return $unknown
+    }
+
+    $candidateIdentity = Get-Sha256Hex ('audncode-stop-failure-candidate/v1|' + [string]$apiError.uuid + '|' + $payloadHash)
+    return [pscustomobject]@{
+      ok = $true
+      reason = 'audncode-stop-failure-proof-complete'
+      uuid = [string]$apiError.uuid
+      payload_hash = $payloadHash
+      line_hash = $lineHash
+      candidate_identity = $candidateIdentity
+      proof_hash = Get-Sha256Hex ('audncode-stop-failure-proof/v1|' +
+        [string]$apiError.uuid + '|' + $payloadHash + '|' + $lineHash + '|' +
+        $SessionId + '|' + $SessionEpoch + '|' + $cursor + '|' + $anchorHash)
+    }
+  } catch {
+    return $unknown
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
+function Test-AudnCodeStopFailureRecordProof {
+  param(
+    [object]$Record,
+    [object]$SessionState,
+    [switch]$MarkAmbiguous
+  )
+
+  $invalid = [pscustomobject]@{ ok = $false; reason = 'audncode-stop-failure-record-proof-unverifiable' }
+  if ($null -eq $Record -or [string](Get-ObjectValue $Record 'candidate_kind' '') -ne 'audncode_stop_failure') {
+    return $invalid
+  }
+  $candidateAmbiguous = $Record.PSObject.Properties['audncode_stop_failure_ambiguous']
+  $sessionAmbiguous = if ($null -ne $SessionState) {
+    $SessionState.PSObject.Properties['audncode_stop_failure_ambiguous']
+  } else { $null }
+  $registeredIdentity = if ($null -ne $SessionState) {
+    $SessionState.PSObject.Properties['audncode_stop_failure_identity']
+  } else { $null }
+  if ($null -eq $candidateAmbiguous -or $candidateAmbiguous.Value -isnot [bool] -or
+      [bool]$candidateAmbiguous.Value -or
+      ($null -ne $sessionAmbiguous -and
+        ($sessionAmbiguous.Value -isnot [bool] -or [bool]$sessionAmbiguous.Value)) -or
+      $null -eq $registeredIdentity -or $registeredIdentity.Value -isnot [string]) {
+    return $invalid
+  }
+  $uuid = [string](Get-ObjectValue $Record 'audncode_stop_failure_uuid' '')
+  $payloadHash = [string](Get-ObjectValue $Record 'audncode_stop_failure_payload_hash' '')
+  $lineHash = [string](Get-ObjectValue $Record 'audncode_stop_failure_line_hash' '')
+  $proofHash = [string](Get-ObjectValue $Record 'audncode_stop_failure_proof_hash' '')
+  $candidateIdentity = [string](Get-ObjectValue $Record 'candidate_identity' '')
+  if ($uuid -notmatch '^(?i:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$' -or
+      $payloadHash -notmatch '^[a-f0-9]{64}$' -or $lineHash -notmatch '^[a-f0-9]{64}$' -or
+      $proofHash -notmatch '^[a-f0-9]{64}$' -or $candidateIdentity -notmatch '^[a-f0-9]{64}$' -or
+      $candidateIdentity -ne (Get-Sha256Hex ('audncode-stop-failure-candidate/v1|' + $uuid.ToLowerInvariant() + '|' + $payloadHash)) -or
+      -not [string]::Equals([string]$registeredIdentity.Value, $candidateIdentity, [StringComparison]::Ordinal)) {
+    return $invalid
+  }
+  $sessionId = [string](Get-ObjectValue $Record 'thread_id' '')
+  $homePath = [string](Get-ObjectValue $SessionState 'audncode_home' '')
+  $hostPid = [int](Get-ObjectValue $SessionState 'audncode_host_pid' 0)
+  $hostStartedUnixMs = [int64](Get-ObjectValue $SessionState 'audncode_host_started_unix_ms' 0)
+  $hostSession = Get-AudnCodeHostSession `
+    -SessionId $sessionId `
+    -HomePath $homePath `
+    -ExpectedHostPid $hostPid `
+    -ExpectedHostStartedUnixMs $hostStartedUnixMs `
+    -AllowExitedHost
+  $marker = Get-AudnCodeCronObservationMarker `
+    -HomePath $homePath `
+    -HostStartedUnixMs $hostStartedUnixMs `
+    -HostProcessStartedUnixMs ([int64](Get-ObjectValue $SessionState 'audncode_host_process_started_unix_ms' 0))
+  if (-not [bool](Get-ObjectValue $hostSession 'ok' $false) -or [int]$hostSession.pid -ne $hostPid -or
+      [int64]$hostSession.started_unix_ms -ne $hostStartedUnixMs -or
+      -not [bool](Get-ObjectValue $marker 'ok' $false) -or
+      -not [bool](Get-ObjectValue $marker 'host_observable' $false) -or
+      [string](Get-ObjectValue $marker 'generation' '') -ne
+        [string](Get-ObjectValue $SessionState 'audncode_cron_hook_generation' '') -or
+      [int64](Get-ObjectValue $marker 'installed_unix_ms' 0) -ne
+        [int64](Get-ObjectValue $SessionState 'audncode_cron_hook_installed_unix_ms' 0)) {
+    return $invalid
+  }
+  $proof = Get-AudnCodeStopFailureTranscriptProof `
+    -SessionState $SessionState `
+    -SessionId $sessionId `
+    -SessionEpoch ([int64](Get-ObjectValue $Record 'claude_session_epoch' 0)) `
+    -TranscriptPath ([string](Get-ObjectValue $Record 'candidate_rollout_path' '')) `
+    -ExpectedPayloadHash $payloadHash `
+    -ExpectedUuid $uuid `
+    -ExpectedLineHash $lineHash
+  if (-not [bool](Get-ObjectValue $proof 'ok' $false) -and $MarkAmbiguous -and
+      [string](Get-ObjectValue $proof 'reason' '') -eq 'audncode-stop-failure-proof-ambiguous') {
+    $promptId = [string](Get-ObjectValue $Record 'turn_id' '')
+    $recordEpoch = [int64](Get-ObjectValue $Record 'claude_session_epoch' 0)
+    if (Set-AudnCodeStopFailureEpochAmbiguous `
+        -SessionId $sessionId `
+        -SessionEpoch $recordEpoch `
+        -PromptId $promptId) {
+      Set-AudnCodePendingStopFailureAmbiguous `
+        -SessionId $sessionId `
+        -PromptId $promptId `
+        -SessionEpoch $recordEpoch
+    }
+  }
+  if (-not [bool](Get-ObjectValue $proof 'ok' $false) -and
+      [string](Get-ObjectValue $proof 'reason' '') -eq 'audncode-stop-failure-proof-ambiguous') {
+    return $proof
+  }
+  if (-not [bool](Get-ObjectValue $proof 'ok' $false) -or
+      [string](Get-ObjectValue $proof 'proof_hash' '') -ne $proofHash -or
+      [string](Get-ObjectValue $proof 'candidate_identity' '') -ne $candidateIdentity) { return $invalid }
+  return $proof
+}
+
+function Get-AudnCodeRootUserKind {
+  param(
+    [object]$Entry,
+    [string]$SessionId
+  )
+
+  if ($null -eq $Entry) { return 'invalid' }
+  $messageProperty = $Entry.PSObject.Properties['message']
+  if ($null -eq $messageProperty -or
+      $messageProperty.Value -isnot [System.Management.Automation.PSCustomObject]) { return 'invalid' }
+  $roleProperty = $messageProperty.Value.PSObject.Properties['role']
+  $contentProperty = $messageProperty.Value.PSObject.Properties['content']
+  if ($null -eq $roleProperty -or $roleProperty.Value -isnot [string] -or
+      [string]$roleProperty.Value -ne 'user' -or $null -eq $contentProperty) { return 'invalid' }
+  $contentIsArrayPrompt = $false
+  if ($contentProperty.Value -is [System.Array]) {
+    $blocks = @($contentProperty.Value)
+    if ($blocks.Count -eq 0 -or $blocks.Count -gt 64) { return 'invalid' }
+    $toolResultOnly = $true
+    foreach ($block in $blocks) {
+      if ($block -isnot [System.Management.Automation.PSCustomObject]) { return 'invalid' }
+      $blockTypeProperty = $block.PSObject.Properties['type']
+      if ($null -eq $blockTypeProperty -or $blockTypeProperty.Value -isnot [string]) { return 'invalid' }
+      $blockType = [string]$blockTypeProperty.Value
+      if ($blockType -eq 'tool_result') {
+        $toolUseProperty = $block.PSObject.Properties['tool_use_id']
+        if ($null -eq $toolUseProperty -or $toolUseProperty.Value -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$toolUseProperty.Value)) { return 'invalid' }
+        continue
+      }
+      $toolResultOnly = $false
+      if ($blockType -eq 'text') {
+        $textProperty = $block.PSObject.Properties['text']
+        if ($null -eq $textProperty -or $textProperty.Value -isnot [string] -or
+            ([string]$textProperty.Value).Length -gt $AudnCodeStopFailureMaxLineChars) { return 'invalid' }
+      } elseif ($blockType -in @('image', 'document')) {
+        $sourceProperty = $block.PSObject.Properties['source']
+        if ($null -eq $sourceProperty -or
+            $sourceProperty.Value -isnot [System.Management.Automation.PSCustomObject]) { return 'invalid' }
+      } else {
+        return 'invalid'
+      }
+    }
+    if ($toolResultOnly) { return 'non-prompt' }
+    if (@($blocks | Where-Object { [string](Get-ObjectValue $_ 'type' '') -eq 'tool_result' }).Count -gt 0) {
+      # A mixed tool-result/prompt row has ambiguous provenance.
+      return 'invalid'
+    }
+    $contentIsArrayPrompt = $true
+  } elseif ($contentProperty.Value -isnot [string]) {
+    return 'invalid'
+  }
+
+  $originProperty = $Entry.PSObject.Properties['origin']
+  if ($null -eq $originProperty) { return 'ordinary' }
+  if ($null -eq $originProperty.Value -or
+      $originProperty.Value -isnot [System.Management.Automation.PSCustomObject]) { return 'invalid' }
+  $originKindProperty = $originProperty.Value.PSObject.Properties['kind']
+  if ($null -eq $originKindProperty -or $originKindProperty.Value -isnot [string]) { return 'invalid' }
+  if ([string]$originKindProperty.Value -ne 'task-notification') { return 'ordinary' }
+  if ($contentIsArrayPrompt) { return 'invalid' }
+  $content = Get-AudnCodeAcceptedQueuedContent -Entry $Entry -SessionId $SessionId
+  if ([string]::IsNullOrWhiteSpace($content)) { return 'invalid' }
+  return 'task-notification'
+}
+
+function Register-AudnCodeStopFailureIdentity {
+  param(
+    [string]$SessionId,
+    [int64]$SessionEpoch,
+    [string]$PromptId,
+    [string]$CandidateIdentity
+  )
+
+  $invalid = [pscustomobject]@{ ok = $false; ambiguous = $false }
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or $SessionEpoch -le 0 -or
+      [string]::IsNullOrWhiteSpace($PromptId) -or $CandidateIdentity -notmatch '^[a-f0-9]{64}$') {
+    return $invalid
+  }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $invalid }
+  return Invoke-WithClaudeSessionLock -Info $info -Action {
+    param($lockedInfo, $lockedSessionId, $lockedEpoch, $lockedPromptId, $lockedIdentity)
+    try { $state = Read-JsonFile -Path $lockedInfo.path } catch { return [pscustomobject]@{ ok = $false; ambiguous = $false } }
+    if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+        [string](Get-ObjectValue $state 'state' '') -notin @('busy', 'idle') -or
+        [int64](Get-ObjectValue $state 'epoch' 0) -ne [int64]$lockedEpoch -or
+        [string](Get-ObjectValue $state 'prompt_id' '') -ne $lockedPromptId) {
+      return [pscustomobject]@{ ok = $false; ambiguous = $false }
+    }
+    $identityProperty = $state.PSObject.Properties['audncode_stop_failure_identity']
+    $ambiguousProperty = $state.PSObject.Properties['audncode_stop_failure_ambiguous']
+    $storedIdentity = if ($null -ne $identityProperty -and $identityProperty.Value -is [string]) {
+      [string]$identityProperty.Value
+    } else { '' }
+    $ambiguous = $null -ne $ambiguousProperty -and $ambiguousProperty.Value -is [bool] -and
+      [bool]$ambiguousProperty.Value
+    if (($null -ne $identityProperty -and $identityProperty.Value -isnot [string]) -or
+        ($null -ne $ambiguousProperty -and $ambiguousProperty.Value -isnot [bool]) -or
+        (-not [string]::IsNullOrWhiteSpace($storedIdentity) -and $storedIdentity -notmatch '^[a-f0-9]{64}$')) {
+      $ambiguous = $true
+    } elseif ([string]::IsNullOrWhiteSpace($storedIdentity)) {
+      $storedIdentity = $lockedIdentity
+    } elseif (-not [string]::Equals($storedIdentity, $lockedIdentity, [StringComparison]::Ordinal)) {
+      $ambiguous = $true
+    }
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_identity' -Value $storedIdentity
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_ambiguous' -Value ([bool]$ambiguous)
+    Write-JsonAtomic -Path $lockedInfo.path -Value $state
+    return [pscustomobject]@{ ok = -not [bool]$ambiguous; ambiguous = [bool]$ambiguous }
+  } -Arguments @($info, $SessionId, $SessionEpoch, $PromptId, $CandidateIdentity)
+}
+
+function Set-AudnCodeStopFailureEpochAmbiguous {
+  param(
+    [string]$SessionId,
+    [int64]$SessionEpoch,
+    [string]$PromptId
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or $SessionEpoch -le 0 -or
+      [string]::IsNullOrWhiteSpace($PromptId)) { return $false }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $false }
+  return [bool](Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedInfo, $lockedSessionId, $lockedEpoch, $lockedPromptId)
+      try { $state = Read-JsonFile -Path $lockedInfo.path } catch { return $false }
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $state 'state' '') -notin @('busy', 'idle') -or
+          [int64](Get-ObjectValue $state 'epoch' 0) -ne [int64]$lockedEpoch -or
+          [string](Get-ObjectValue $state 'prompt_id' '') -ne $lockedPromptId) { return $false }
+      $ambiguousProperty = $state.PSObject.Properties['audncode_stop_failure_ambiguous']
+      if ($null -ne $ambiguousProperty -and $ambiguousProperty.Value -isnot [bool]) { return $false }
+      Set-RecordValue -Record $state -Name 'audncode_stop_failure_ambiguous' -Value $true
+      Write-JsonAtomic -Path $lockedInfo.path -Value $state
+      return $true
+    } -Arguments @($info, $SessionId, $SessionEpoch, $PromptId))
+}
+
+function Set-AudnCodePendingStopFailureAmbiguous {
+  param(
+    [string]$SessionId,
+    [string]$PromptId,
+    [int64]$SessionEpoch
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or [string]::IsNullOrWhiteSpace($PromptId) -or
+      $SessionEpoch -le 0) { return }
+  $key = Get-StrongEventKey -Provider 'claude' -ThreadId $SessionId -TurnId $PromptId
+  [void](Invoke-WithRecordMutationLock -Key $key -Action {
+      param($lockedKey, $lockedSessionId, $lockedPromptId, $lockedEpoch)
+      $path = Join-Path $PendingDir ($lockedKey + '.json')
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+      try { $record = Read-JsonFile -Path $path } catch { return }
+      if ([string](Get-ObjectValue $record 'provider' '') -ne 'claude' -or
+          [string](Get-ObjectValue $record 'candidate_kind' '') -ne 'audncode_stop_failure' -or
+          [string](Get-ObjectValue $record 'thread_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $record 'turn_id' '') -ne $lockedPromptId -or
+          [int64](Get-ObjectValue $record 'claude_session_epoch' 0) -ne [int64]$lockedEpoch) { return }
+      Set-RecordValue -Record $record -Name 'audncode_stop_failure_ambiguous' -Value $true
+      Set-RecordValue -Record $record -Name 'candidate_revision' -Value ([Guid]::NewGuid().ToString('N'))
+      Write-JsonAtomic -Path $path -Value $record
+    } -Arguments @($key, $SessionId, $PromptId, $SessionEpoch))
+}
+
+function Get-AudnCodeCronRuntimeStateInfo {
+  param(
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs,
+    [string]$HookGeneration,
+    [int64]$HookInstalledUnixMs,
+    [bool]$ObservationAllowed
+  )
+
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or $HostPid -le 0 -or $HostStartedUnixMs -le 0 -or
+      $HookGeneration -notmatch '^[a-f0-9]{32}$' -or $HookInstalledUnixMs -le 0) { return $null }
+  try { $canonicalHome = [IO.Path]::GetFullPath($HomePath) } catch { return $null }
+  $key = Get-Sha256Hex ("codex-ntfy/v2|audn-cron-runtime|$canonicalHome|$HostPid|$HostStartedUnixMs|$HookGeneration")
+  return [pscustomobject]@{
+    key = $key
+    path = Join-Path $ClaudeSessionsDir ('audn-cron-' + $key + '.json')
+    lock_path = Join-Path $ClaudeSessionsDir ('audn-cron-' + $key + '.lock')
+    home = $canonicalHome
+    pid = $HostPid
+    started_unix_ms = $HostStartedUnixMs
+    hook_generation = $HookGeneration
+    hook_installed_unix_ms = $HookInstalledUnixMs
+    observation_allowed = [bool]$ObservationAllowed
+  }
+}
+
+function Get-AudnCodeCronProjectLockInfo {
+  param(
+    [string]$HomePath,
+    [string]$ProjectRoot
+  )
+
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or [string]::IsNullOrWhiteSpace($ProjectRoot) -or
+      $HomePath.Length -gt 32768 -or $ProjectRoot.Length -gt 32768) { return $null }
+  try {
+    if (-not [IO.Path]::IsPathRooted($HomePath) -or -not [IO.Path]::IsPathRooted($ProjectRoot)) { return $null }
+    $canonicalHome = [IO.Path]::GetFullPath($HomePath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $canonicalProjectRoot = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  } catch { return $null }
+  $key = Get-Sha256Hex ("codex-ntfy/v1|audn-cron-project-lock|$canonicalHome|$canonicalProjectRoot")
+  return [pscustomobject]@{
+    key = "audn-cron-project-$key"
+    path = Join-Path $ClaudeSessionsDir ("audn-cron-project-$key.json")
+    lock_path = Join-Path $ClaudeSessionsDir ("audn-cron-project-$key.lock")
+    home = $canonicalHome
+    project_root = $canonicalProjectRoot
+  }
+}
+
+function Get-AudnCodeLifecycleGuardInfo {
+  param(
+    [object]$RuntimeInfo,
+    [ValidateSet('background', 'cron', 'ingress')]
+    [string]$RegistryKind
+  )
+
+  if ($null -eq $RuntimeInfo -or [string]$RuntimeInfo.key -notmatch '^[a-f0-9]{64}$' -or
+      [string]::IsNullOrWhiteSpace([string]$RuntimeInfo.home) -or [int]$RuntimeInfo.pid -le 0 -or
+      [int64]$RuntimeInfo.started_unix_ms -le 0) { return $null }
+  $name = "audn-lifecycle-$RegistryKind-$([string]$RuntimeInfo.key)"
+  return [pscustomobject]@{
+    key = $name
+    path = Join-Path $ClaudeSessionsDir ($name + '.json')
+    lock_path = Join-Path $ClaudeSessionsDir ($name + '.lock')
+    registry_kind = $RegistryKind
+    runtime_key = [string]$RuntimeInfo.key
+    home = [string]$RuntimeInfo.home
+    pid = [int]$RuntimeInfo.pid
+    started_unix_ms = [int64]$RuntimeInfo.started_unix_ms
+  }
+}
+
+function Get-AudnCodeLifecycleGuardInfoFromCorrelation {
+  param(
+    [object]$Correlation,
+    [ValidateSet('background', 'cron')]
+    [string]$RegistryKind
+  )
+
+  if ($null -eq $Correlation) { return $null }
+  $homePath = [string](Get-ObjectValue $Correlation 'home' '')
+  $hostPid = [int](Get-ObjectValue $Correlation 'host_pid' 0)
+  $hostStartedUnixMs = [int64](Get-ObjectValue $Correlation 'host_started_unix_ms' 0)
+  if ($RegistryKind -eq 'background') {
+    $runtimeInfo = Get-AudnCodeRuntimeStateInfo `
+      -HomePath $homePath `
+      -HostPid $hostPid `
+      -HostStartedUnixMs $hostStartedUnixMs
+    $expectedRuntimeKey = [string](Get-ObjectValue $Correlation 'runtime_key' '')
+  } else {
+    $runtimeInfo = Get-AudnCodeCronRuntimeStateInfo `
+      -HomePath $homePath `
+      -HostPid $hostPid `
+      -HostStartedUnixMs $hostStartedUnixMs `
+      -HookGeneration ([string](Get-ObjectValue $Correlation 'hook_generation' '')) `
+      -HookInstalledUnixMs ([int64](Get-ObjectValue $Correlation 'hook_installed_unix_ms' 0)) `
+      -ObservationAllowed $true
+    $expectedRuntimeKey = [string](Get-ObjectValue $Correlation 'cron_key' '')
+  }
+  if ($null -eq $runtimeInfo -or $expectedRuntimeKey -notmatch '^[a-f0-9]{64}$' -or
+      [string]$runtimeInfo.key -ne $expectedRuntimeKey) { return $null }
+  return Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $runtimeInfo -RegistryKind $RegistryKind
+}
+
+function Get-AudnCodeLifecyclePendingTokenState {
+  param(
+    [object]$Record,
+    [string]$ArrayPropertyName,
+    [string]$LegacyPropertyName,
+    [int]$Schema = 2
+  )
+
+  $tokens = New-Object 'System.Collections.Generic.List[string]'
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $valid = $true
+  $arrayProperty = if ($null -ne $Record) { $Record.PSObject.Properties[$ArrayPropertyName] } else { $null }
+  if ($Schema -ge 2 -or $null -ne $arrayProperty) {
+    if ($null -eq $arrayProperty -or $arrayProperty.Value -isnot [array]) {
+      $valid = $false
+    } else {
+      foreach ($tokenValue in @($arrayProperty.Value)) {
+        if ($tokenValue -isnot [string] -or [string]$tokenValue -notmatch '^[a-f0-9]{32}$' -or
+            -not $seen.Add([string]$tokenValue)) {
+          $valid = $false
+        } else {
+          $tokens.Add([string]$tokenValue)
+        }
+      }
+    }
+  } else {
+    $legacyProperty = if ($null -ne $Record) { $Record.PSObject.Properties[$LegacyPropertyName] } else { $null }
+    if ($null -eq $legacyProperty -or $legacyProperty.Value -isnot [string]) {
+      $valid = $false
+    } elseif (-not [string]::IsNullOrEmpty([string]$legacyProperty.Value)) {
+      if ([string]$legacyProperty.Value -notmatch '^[a-f0-9]{32}$') {
+        $valid = $false
+      } else {
+        [void]$seen.Add([string]$legacyProperty.Value)
+        $tokens.Add([string]$legacyProperty.Value)
+      }
+    }
+  }
+  if ($tokens.Count -gt $AudnCodeLifecycleMaxPendingTokens) { $valid = $false }
+  return [pscustomobject]@{
+    valid = [bool]$valid
+    tokens = @($tokens.ToArray())
+  }
+}
+
+function Get-AudnCodeSessionLifecyclePendingTokenState {
+  param(
+    [object]$Record,
+    [ValidateSet('background', 'cron')]
+    [string]$RegistryKind
+  )
+
+  $arrayName = "audncode_${RegistryKind}_lifecycle_pending_tokens"
+  $legacyName = "audncode_${RegistryKind}_lifecycle_pending_token"
+  if ($null -ne $Record -and $null -eq $Record.PSObject.Properties[$arrayName] -and
+      $null -eq $Record.PSObject.Properties[$legacyName]) {
+    # Session schema 1 predates the diagnostic pending-token fields. The
+    # host-wide guard remains authoritative, so absence means the legacy empty
+    # state rather than corruption.
+    return [pscustomobject]@{ valid = $true; tokens = @() }
+  }
+  return Get-AudnCodeLifecyclePendingTokenState `
+    -Record $Record `
+    -ArrayPropertyName $arrayName `
+    -LegacyPropertyName $legacyName `
+    -Schema 1
+}
+
+function Set-AudnCodeSessionLifecyclePendingTokens {
+  param(
+    [object]$Record,
+    [ValidateSet('background', 'cron')]
+    [string]$RegistryKind,
+    [string[]]$Tokens
+  )
+
+  $normalized = @($Tokens | Where-Object { $_ -is [string] } | Select-Object -Unique)
+  if ($normalized.Count -gt $AudnCodeLifecycleMaxPendingTokens -or
+      @($normalized | Where-Object { $_ -notmatch '^[a-f0-9]{32}$' }).Count -gt 0) {
+    return $false
+  }
+  Set-RecordValue -Record $Record -Name ("audncode_${RegistryKind}_lifecycle_pending_tokens") -Value @($normalized)
+  $legacyToken = if ($normalized.Count -eq 1) { [string]$normalized[0] } else { '' }
+  Set-RecordValue -Record $Record -Name ("audncode_${RegistryKind}_lifecycle_pending_token") -Value $legacyToken
+  return $true
+}
+
+function Wait-AudnCodeLifecycleArmTestBarrier {
+  param(
+    [ValidateSet('background', 'cron')]
+    [string]$RegistryKind,
+    [string]$Token
+  )
+
+  $markerDirectory = [string]$env:CODEX_NTFY_TEST_LIFECYCLE_ARM_MARKER_DIR
+  $releasePath = [string]$env:CODEX_NTFY_TEST_LIFECYCLE_ARM_RELEASE
+  $waitMilliseconds = 0
+  if ([string]::IsNullOrWhiteSpace($markerDirectory) -or
+      [string]::IsNullOrWhiteSpace($releasePath) -or
+      $Token -notmatch '^[a-f0-9]{32}$' -or
+      -not [int]::TryParse([string]$env:CODEX_NTFY_TEST_LIFECYCLE_ARM_WAIT_MS, [ref]$waitMilliseconds) -or
+      $waitMilliseconds -le 0) { return }
+  $waitMilliseconds = [Math]::Min(180000, $waitMilliseconds)
+  [IO.Directory]::CreateDirectory($markerDirectory) | Out-Null
+  [IO.File]::WriteAllText((Join-Path $markerDirectory ("$RegistryKind-$Token.marker")), $Token, $Utf8NoBom)
+  $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($waitMilliseconds)
+  while (-not (Test-Path -LiteralPath $releasePath -PathType Leaf) -and [DateTimeOffset]::UtcNow -lt $deadline) {
+    Start-Sleep -Milliseconds 25
+  }
+}
+
+function Update-AudnCodeLifecycleGuard {
+  param(
+    [object]$GuardInfo,
+    [ValidateSet('arm', 'commit', 'fail')]
+    [string]$Operation,
+    [string]$Token = '',
+    [switch]$ForceLost
+  )
+
+  if ($null -eq $GuardInfo -or
+      ($Operation -in @('arm', 'commit') -and $Token -notmatch '^[a-f0-9]{32}$')) { return $null }
+  return Invoke-WithClaudeSessionLock -Info $GuardInfo -Action {
+    param($lockedInfo, $lockedOperation, $lockedToken, $lockedForceLost)
+    $previous = $null
+    $previousExists = Test-Path -LiteralPath $lockedInfo.path -PathType Leaf
+    try { if ($previousExists) { $previous = Read-JsonFile -Path $lockedInfo.path } } catch { $previous = $null }
+    $lost = [bool]$lockedForceLost
+    $pendingTokens = New-Object 'System.Collections.Generic.List[string]'
+    $operationCommitted = $false
+    if ($previousExists) {
+      $schemaProperty = if ($null -ne $previous) { $previous.PSObject.Properties['schema'] } else { $null }
+      $lostProperty = if ($null -ne $previous) { $previous.PSObject.Properties['lost'] } else { $null }
+      $schema = if ($null -ne $schemaProperty -and
+          ($schemaProperty.Value -is [int] -or $schemaProperty.Value -is [long])) {
+        [int64]$schemaProperty.Value
+      } else { [int64]0 }
+      $pendingState = Get-AudnCodeLifecyclePendingTokenState `
+        -Record $previous `
+        -ArrayPropertyName 'pending_tokens' `
+        -LegacyPropertyName 'pending_token' `
+        -Schema $schema
+      $valid = $null -ne $previous -and
+        $schema -in @(1, 2) -and
+        [string](Get-ObjectValue $previous 'kind' '') -eq 'audncode-lifecycle-guard' -and
+        [string](Get-ObjectValue $previous 'registry_kind' '') -eq [string]$lockedInfo.registry_kind -and
+        [string](Get-ObjectValue $previous 'runtime_key' '') -eq [string]$lockedInfo.runtime_key -and
+        [string]::Equals([string](Get-ObjectValue $previous 'audncode_home' ''), [string]$lockedInfo.home, [StringComparison]::OrdinalIgnoreCase) -and
+        [int](Get-ObjectValue $previous 'host_pid' 0) -eq [int]$lockedInfo.pid -and
+        [int64](Get-ObjectValue $previous 'host_started_unix_ms' 0) -eq [int64]$lockedInfo.started_unix_ms -and
+        $null -ne $lostProperty -and $lostProperty.Value -is [bool] -and
+        [bool](Get-ObjectValue $pendingState 'valid' $false)
+      if (-not $valid) {
+        $lost = $true
+      } else {
+        $lost = $lost -or [bool]$lostProperty.Value
+        foreach ($pendingToken in @((Get-ObjectValue $pendingState 'tokens' @()))) {
+          $pendingTokens.Add([string]$pendingToken)
+        }
+      }
+    }
+    if ($lockedOperation -eq 'arm') {
+      if (-not $pendingTokens.Contains($lockedToken)) {
+        if ($pendingTokens.Count -ge $AudnCodeLifecycleMaxPendingTokens) {
+          $lost = $true
+        } else {
+          $pendingTokens.Add($lockedToken)
+        }
+      }
+    } elseif ($lockedOperation -eq 'commit') {
+      if (-not $pendingTokens.Remove($lockedToken)) {
+        $lost = $true
+      } else {
+        $operationCommitted = -not $lost
+      }
+    } else {
+      $lost = $true
+      if ($lockedToken -match '^[a-f0-9]{32}$') {
+        [void]$pendingTokens.Remove($lockedToken)
+      }
+    }
+    $pendingTokenValues = @($pendingTokens.ToArray())
+    $state = [ordered]@{
+      schema = 2
+      kind = 'audncode-lifecycle-guard'
+      registry_kind = [string]$lockedInfo.registry_kind
+      runtime_key = [string]$lockedInfo.runtime_key
+      audncode_home = [string]$lockedInfo.home
+      host_pid = [int]$lockedInfo.pid
+      host_started_unix_ms = [int64]$lockedInfo.started_unix_ms
+      lost = [bool]$lost
+      pending_tokens = $pendingTokenValues
+      pending_token = $(if ($pendingTokenValues.Count -eq 1) { [string]$pendingTokenValues[0] } else { '' })
+      operation_committed = [bool]$operationCommitted
+      safe_to_finalize = -not [bool]$lost -and $pendingTokenValues.Count -eq 0
+      updated_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    }
+    Write-JsonAtomic -Path $lockedInfo.path -Value $state
+    return [pscustomobject]$state
+  } -Arguments @($GuardInfo, $Operation, $Token, [bool]$ForceLost)
+}
+
+function Get-AudnCodeLifecycleGuardState {
+  param([object]$GuardInfo)
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; reason = 'audncode-lifecycle-guard-unverifiable' }
+  if ($null -eq $GuardInfo) { return $unknown }
+  if (-not (Test-Path -LiteralPath $GuardInfo.path -PathType Leaf)) {
+    return [pscustomobject]@{ state = 'clear'; reason = 'audncode-lifecycle-guard-clear' }
+  }
+  try {
+    $guard = Read-JsonFile -Path $GuardInfo.path
+    $schemaProperty = $guard.PSObject.Properties['schema']
+    $lostProperty = $guard.PSObject.Properties['lost']
+    $schema = if ($null -ne $schemaProperty -and
+        ($schemaProperty.Value -is [int] -or $schemaProperty.Value -is [long])) {
+      [int64]$schemaProperty.Value
+    } else { [int64]0 }
+    $pendingState = Get-AudnCodeLifecyclePendingTokenState `
+      -Record $guard `
+      -ArrayPropertyName 'pending_tokens' `
+      -LegacyPropertyName 'pending_token' `
+      -Schema $schema
+    $valid = $schema -in @(1, 2) -and
+      [string](Get-ObjectValue $guard 'kind' '') -eq 'audncode-lifecycle-guard' -and
+      [string](Get-ObjectValue $guard 'registry_kind' '') -eq [string]$GuardInfo.registry_kind -and
+      [string](Get-ObjectValue $guard 'runtime_key' '') -eq [string]$GuardInfo.runtime_key -and
+      [string]::Equals([string](Get-ObjectValue $guard 'audncode_home' ''), [string]$GuardInfo.home, [StringComparison]::OrdinalIgnoreCase) -and
+      [int](Get-ObjectValue $guard 'host_pid' 0) -eq [int]$GuardInfo.pid -and
+      [int64](Get-ObjectValue $guard 'host_started_unix_ms' 0) -eq [int64]$GuardInfo.started_unix_ms -and
+      $null -ne $lostProperty -and $lostProperty.Value -is [bool] -and
+      [bool](Get-ObjectValue $pendingState 'valid' $false)
+    if (-not $valid -or [bool]$lostProperty.Value -or @((Get-ObjectValue $pendingState 'tokens' @())).Count -gt 0) {
+      return $unknown
+    }
+    return [pscustomobject]@{ state = 'clear'; reason = 'audncode-lifecycle-guard-clear' }
+  } catch {
+    return $unknown
+  }
+}
+
+function Get-AudnCodeIngressHostIdentity {
+  param(
+    [string]$HomePath = $AudnCodeHome,
+    [int]$MaxWaitMilliseconds = 0
+  )
+
+  $unknown = [pscustomobject]@{
+    ok = $false
+    pid = 0
+    started_unix_ms = [int64]0
+    process_started_unix_ms = [int64]0
+    reason = 'audncode-ingress-host-unverifiable'
+  }
+  if ([string]::IsNullOrWhiteSpace($HomePath)) { return $unknown }
+  try { $canonicalHome = [IO.Path]::GetFullPath($HomePath) } catch { return $unknown }
+  $ancestorPids = @(Get-AudnCodeAncestorProcessIds)
+  if ($ancestorPids.Count -eq 0) { return $unknown }
+  $boundedWait = [Math]::Max(0, [Math]::Min(2000, $MaxWaitMilliseconds))
+  $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($boundedWait)
+  do {
+    $matches = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($ancestorPid in $ancestorPids) {
+      $markerPath = Join-Path (Join-Path $canonicalHome 'sessions') (([string][int]$ancestorPid) + '.json')
+      if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { continue }
+      try {
+        $marker = Read-JsonFile -Path $markerPath
+        $markerPid = [int](Get-ObjectValue $marker 'pid' 0)
+        $markerStartedUnixMs = [int64](Get-ObjectValue $marker 'startedAt' 0)
+        if ($markerPid -ne [int]$ancestorPid -or $markerStartedUnixMs -le 0) { continue }
+        $process = Get-Process -Id $markerPid -ErrorAction Stop
+        $processStartedUnixMs = ([DateTimeOffset]$process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+        if ($markerStartedUnixMs -lt $processStartedUnixMs -or
+            ($markerStartedUnixMs - $processStartedUnixMs) -gt 120000) { continue }
+        $matches.Add([pscustomobject]@{
+            pid = $markerPid
+            started_unix_ms = $markerStartedUnixMs
+            process_started_unix_ms = $processStartedUnixMs
+          })
+      } catch { continue }
+    }
+    if ($matches.Count -eq 1) {
+      return [pscustomobject]@{
+        ok = $true
+        pid = [int]$matches[0].pid
+        started_unix_ms = [int64]$matches[0].started_unix_ms
+        process_started_unix_ms = [int64]$matches[0].process_started_unix_ms
+        reason = 'audncode-ingress-host-current'
+      }
+    }
+    # More than one live ancestor marker is intrinsically ambiguous; waiting
+    # cannot make selecting either process lifetime safe. A missing marker can
+    # be a short startup race, so SessionStart gets one bounded retry window
+    # without repeating the potentially expensive ancestry query.
+    if ($matches.Count -gt 1 -or [DateTimeOffset]::UtcNow -ge $deadline) { return $unknown }
+    Start-Sleep -Milliseconds 50
+  } while ($true)
+}
+
+function Get-AudnCodeIngressFallbackInfo {
+  param([string]$HomePath = $AudnCodeHome)
+
+  if ([string]::IsNullOrWhiteSpace($HomePath)) { return $null }
+  try { $canonicalHome = [IO.Path]::GetFullPath($HomePath) } catch { return $null }
+  $key = Get-Sha256Hex ("codex-ntfy/v1|audn-ingress-fallback|$canonicalHome")
+  return [pscustomobject]@{
+    key = "audn-ingress-fallback-$key"
+    path = Join-Path $ClaudeSessionsDir ("audn-ingress-fallback-$key.json")
+    lock_path = Join-Path $ClaudeSessionsDir ("audn-ingress-fallback-$key.lock")
+    home = $canonicalHome
+  }
+}
+
+function Update-AudnCodeIngressFallback {
+  param(
+    [string]$HomePath = $AudnCodeHome,
+    [int64]$HookStartTicks = $HookProcessStartUtcTicks,
+    [ValidateSet('arm', 'commit', 'fail')]
+    [string]$Operation,
+    [string]$Token,
+    [string]$Reason = 'audncode-ingress-host-unverifiable'
+  )
+
+  $info = Get-AudnCodeIngressFallbackInfo -HomePath $HomePath
+  if ($null -eq $info -or $HookStartTicks -le 0 -or
+      ($Operation -in @('arm', 'commit') -and $Token -notmatch '^[a-f0-9]{32}$')) { return $null }
+  try {
+    return Invoke-WithClaudeSessionLock -Info $info -Action {
+        param($lockedInfo, $lockedHookStartTicks, $lockedOperation, $lockedToken, $lockedReason)
+        $pending = New-Object 'System.Collections.Generic.List[object]'
+        $lostHookStartTicks = [int64]0
+        $valid = $true
+        if (Test-Path -LiteralPath $lockedInfo.path -PathType Leaf) {
+          try {
+            $previous = Read-JsonFile -Path $lockedInfo.path
+            if ([int](Get-ObjectValue $previous 'schema' 0) -ne 2 -or
+                [string](Get-ObjectValue $previous 'kind' '') -ne 'audncode-ingress-fallback' -or
+                -not [string]::Equals([string](Get-ObjectValue $previous 'audncode_home' ''), [string]$lockedInfo.home, [StringComparison]::OrdinalIgnoreCase)) {
+              $valid = $false
+            } else {
+              $lostHookStartTicks = [int64](Get-ObjectValue $previous 'lost_hook_start_ticks' 0)
+              $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+              foreach ($entry in @((Get-ObjectValue $previous 'pending' @()))) {
+                $entryToken = [string](Get-ObjectValue $entry 'token' '')
+                $entryTicks = [int64](Get-ObjectValue $entry 'hook_start_ticks' 0)
+                if ($entryToken -notmatch '^[a-f0-9]{32}$' -or $entryTicks -le 0 -or -not $seen.Add($entryToken)) {
+                  $valid = $false
+                  break
+                }
+                $pending.Add([pscustomobject]@{ token = $entryToken; hook_start_ticks = $entryTicks })
+              }
+              if ($pending.Count -gt $AudnCodeLifecycleMaxPendingTokens -or $lostHookStartTicks -lt 0) { $valid = $false }
+            }
+          } catch {
+            $valid = $false
+          }
+        }
+        if (-not $valid) {
+          $pending.Clear()
+          $lostHookStartTicks = [int64]::MaxValue
+        }
+        $operationCommitted = $false
+        $matching = @($pending | Where-Object { [string]$_.token -eq $lockedToken })
+        if ($lockedOperation -eq 'arm') {
+          if ($matching.Count -eq 0) {
+            if ($pending.Count -ge $AudnCodeLifecycleMaxPendingTokens) {
+              $lostHookStartTicks = [int64]::MaxValue
+            } else {
+              $pending.Add([pscustomobject]@{
+                  token = $lockedToken
+                  hook_start_ticks = [int64]$lockedHookStartTicks
+                })
+            }
+          } elseif ($matching.Count -ne 1 -or [int64]$matching[0].hook_start_ticks -ne [int64]$lockedHookStartTicks) {
+            $lostHookStartTicks = [int64]::MaxValue
+          }
+        } elseif ($lockedOperation -eq 'commit') {
+          if ($matching.Count -eq 1 -and [int64]$matching[0].hook_start_ticks -eq [int64]$lockedHookStartTicks) {
+            [void]$pending.Remove($matching[0])
+            $operationCommitted = $true
+          } else {
+            $lostHookStartTicks = [Math]::Max([int64]$lostHookStartTicks, [int64]$lockedHookStartTicks)
+          }
+        } else {
+          if ($matching.Count -eq 1) { [void]$pending.Remove($matching[0]) }
+          $lostHookStartTicks = [Math]::Max([int64]$lostHookStartTicks, [int64]$lockedHookStartTicks)
+        }
+        Write-JsonAtomic -Path $lockedInfo.path -Value ([ordered]@{
+            schema = 2
+            kind = 'audncode-ingress-fallback'
+            audncode_home = [string]$lockedInfo.home
+            pending = @($pending.ToArray())
+            lost_hook_start_ticks = [int64]$lostHookStartTicks
+            operation_committed = [bool]$operationCommitted
+            reason = Sanitize-NotificationText -Text $lockedReason -MaxLength 120
+            updated_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          })
+        return [pscustomobject]@{
+          pending = @($pending.ToArray())
+          lost_hook_start_ticks = [int64]$lostHookStartTicks
+          operation_committed = [bool]$operationCommitted
+        }
+      } -Arguments @($info, $HookStartTicks, $Operation, $Token, $Reason)
+  } catch {
+    return $null
+  }
+}
+
+function Set-AudnCodeIngressFallbackLost {
+  param(
+    [string]$HomePath = $AudnCodeHome,
+    [int64]$HookStartTicks = $HookProcessStartUtcTicks,
+    [string]$Reason = 'audncode-ingress-host-unverifiable'
+  )
+
+  return $null -ne (Update-AudnCodeIngressFallback `
+      -HomePath $HomePath `
+      -HookStartTicks $HookStartTicks `
+      -Operation 'fail' `
+      -Token '' `
+      -Reason $Reason)
+}
+
+function Get-AudnCodeIngressFallbackState {
+  param(
+    [string]$HomePath,
+    [int64]$HostStartedUnixMs
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-unverifiable' }
+  $info = Get-AudnCodeIngressFallbackInfo -HomePath $HomePath
+  if ($null -eq $info -or $HostStartedUnixMs -le 0) { return $unknown }
+  try {
+    return Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedInfo, $lockedHostStartedUnixMs)
+      if (-not (Test-Path -LiteralPath $lockedInfo.path -PathType Leaf)) {
+        return [pscustomobject]@{ state = 'clear'; reason = 'audncode-ingress-fallback-clear' }
+      }
+      try { $state = Read-JsonFile -Path $lockedInfo.path } catch {
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-unverifiable' }
+      }
+      $schemaProperty = $state.PSObject.Properties['schema']
+      $lostProperty = $state.PSObject.Properties['lost_hook_start_ticks']
+      $pendingProperty = $state.PSObject.Properties['pending']
+      if ($null -eq $schemaProperty -or
+          ($schemaProperty.Value -isnot [int] -and $schemaProperty.Value -isnot [long]) -or
+          [int64]$schemaProperty.Value -ne 2 -or
+          [string](Get-ObjectValue $state 'kind' '') -ne 'audncode-ingress-fallback' -or
+          -not [string]::Equals([string](Get-ObjectValue $state 'audncode_home' ''), [string]$lockedInfo.home, [StringComparison]::OrdinalIgnoreCase) -or
+          $null -eq $lostProperty -or
+          ($lostProperty.Value -isnot [int] -and $lostProperty.Value -isnot [long]) -or
+          [int64]$lostProperty.Value -lt 0 -or
+          $null -eq $pendingProperty -or $pendingProperty.Value -isnot [array]) {
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-unverifiable' }
+      }
+      $hostStartedTicks = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$lockedHostStartedUnixMs).UtcDateTime.Ticks
+      if ([int64]$lostProperty.Value -ge $hostStartedTicks) {
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-lost' }
+      }
+      $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+      $pendingCount = 0
+      foreach ($entry in @($pendingProperty.Value)) {
+        $entryToken = [string](Get-ObjectValue $entry 'token' '')
+        $entryTicks = [int64](Get-ObjectValue $entry 'hook_start_ticks' 0)
+        if ($entryToken -notmatch '^[a-f0-9]{32}$' -or $entryTicks -le 0 -or -not $seen.Add($entryToken)) {
+          return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-unverifiable' }
+        }
+        $pendingCount++
+        if ($entryTicks -ge $hostStartedTicks) {
+          return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-pending' }
+        }
+      }
+      if ($pendingCount -gt $AudnCodeLifecycleMaxPendingTokens) {
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-unverifiable' }
+      }
+      return [pscustomobject]@{ state = 'clear'; reason = 'audncode-ingress-fallback-clear' }
+    } -Arguments @($info, $HostStartedUnixMs)
+  } catch {
+    return $unknown
+  }
+}
+
+function Start-AudnCodeIngressMutation {
+  param(
+    [ValidateSet('SessionStart', 'UserPromptSubmit', 'PostToolUse', 'SubagentStart')]
+    [string]$ExpectedEvent,
+    [string]$HomePath = $AudnCodeHome,
+    [int64]$HookStartTicks = $HookProcessStartUtcTicks
+  )
+
+  $result = [ordered]@{
+    armed = $false
+    token = [Guid]::NewGuid().ToString('N')
+    expected_event = $ExpectedEvent
+    hook_start_ticks = [int64]$HookStartTicks
+    host_pid = 0
+    host_started_unix_ms = [int64]0
+    guard_info = $null
+    fallback_lost = $false
+  }
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or $HookStartTicks -le 0) {
+    return [pscustomobject]$result
+  }
+  # The per-home token is the very first durable action. It intentionally
+  # precedes WMI/CIM ancestry discovery and marker parsing. Once the exact host
+  # guard is armed, this token is removed; until then either token blocks every
+  # host lifetime old enough to have launched this hook.
+  $fallbackArm = Update-AudnCodeIngressFallback `
+    -HomePath $HomePath `
+    -HookStartTicks $HookStartTicks `
+    -Operation 'arm' `
+    -Token ([string]$result.token) `
+    -Reason 'audncode-ingress-discovery-pending'
+  $fallbackEntries = @((Get-ObjectValue $fallbackArm 'pending' @()))
+  if ($null -eq $fallbackArm -or
+      @($fallbackEntries | Where-Object { [string](Get-ObjectValue $_ 'token' '') -eq [string]$result.token }).Count -ne 1) {
+    return [pscustomobject]$result
+  }
+  $hostIdentity = Get-AudnCodeIngressHostIdentity `
+    -HomePath $HomePath `
+    -MaxWaitMilliseconds $(if ($ExpectedEvent -eq 'SessionStart') { 1600 } else { 0 })
+  if (-not [bool]$hostIdentity.ok) {
+    $result.fallback_lost = $null -ne (Update-AudnCodeIngressFallback `
+      -HomePath $HomePath `
+      -HookStartTicks $HookStartTicks `
+      -Operation 'fail' `
+      -Token ([string]$result.token) `
+      -Reason 'audncode-ingress-host-unverifiable-before-parse')
+    return [pscustomobject]$result
+  }
+  $runtimeInfo = Get-AudnCodeRuntimeStateInfo `
+    -HomePath $HomePath `
+    -HostPid ([int]$hostIdentity.pid) `
+    -HostStartedUnixMs ([int64]$hostIdentity.started_unix_ms)
+  $guardInfo = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $runtimeInfo -RegistryKind 'ingress'
+  if ($null -eq $guardInfo) {
+    $result.fallback_lost = $null -ne (Update-AudnCodeIngressFallback `
+      -HomePath $HomePath `
+      -HookStartTicks $HookStartTicks `
+      -Operation 'fail' `
+      -Token ([string]$result.token) `
+      -Reason 'audncode-ingress-guard-unavailable-before-parse')
+    return [pscustomobject]$result
+  }
+  try {
+    $guardState = Update-AudnCodeLifecycleGuard `
+      -GuardInfo $guardInfo `
+      -Operation 'arm' `
+      -Token ([string]$result.token)
+    $pendingState = Get-AudnCodeLifecyclePendingTokenState `
+      -Record $guardState `
+      -ArrayPropertyName 'pending_tokens' `
+      -LegacyPropertyName 'pending_token' `
+      -Schema 2
+    $hostArmed = $null -ne $guardState -and
+      [bool](Get-ObjectValue $pendingState 'valid' $false) -and
+      [string]$result.token -in @((Get-ObjectValue $pendingState 'tokens' @()))
+    $result.host_pid = [int]$hostIdentity.pid
+    $result.host_started_unix_ms = [int64]$hostIdentity.started_unix_ms
+    $result.guard_info = $guardInfo
+    if ($hostArmed) {
+      $fallbackCommit = Update-AudnCodeIngressFallback `
+        -HomePath $HomePath `
+        -HookStartTicks $HookStartTicks `
+        -Operation 'commit' `
+        -Token ([string]$result.token) `
+        -Reason 'audncode-ingress-transferred-to-host-guard'
+      $result.armed = [bool](Get-ObjectValue $fallbackCommit 'operation_committed' $false)
+      if (-not [bool]$result.armed) {
+        [void](Update-AudnCodeLifecycleGuard `
+            -GuardInfo $guardInfo `
+            -Operation 'fail' `
+            -Token ([string]$result.token))
+        $result.fallback_lost = $true
+      }
+    } else {
+      $result.fallback_lost = $null -ne (Update-AudnCodeIngressFallback `
+        -HomePath $HomePath `
+        -HookStartTicks $HookStartTicks `
+        -Operation 'fail' `
+        -Token ([string]$result.token) `
+        -Reason 'audncode-ingress-host-guard-arm-failed')
+    }
+  } catch {
+    $result.fallback_lost = $null -ne (Update-AudnCodeIngressFallback `
+      -HomePath $HomePath `
+      -HookStartTicks $HookStartTicks `
+      -Operation 'fail' `
+      -Token ([string]$result.token) `
+      -Reason 'audncode-ingress-arm-failed-before-parse')
+  }
+  return [pscustomobject]$result
+}
+
+function Complete-AudnCodeIngressMutation {
+  param(
+    [object]$IngressArm,
+    [switch]$Fail
+  )
+
+  if ($null -eq $IngressArm -or -not [bool](Get-ObjectValue $IngressArm 'armed' $false)) {
+    return $false
+  }
+  $guardInfo = Get-ObjectValue $IngressArm 'guard_info'
+  $token = [string](Get-ObjectValue $IngressArm 'token' '')
+  try {
+    $state = Update-AudnCodeLifecycleGuard `
+      -GuardInfo $guardInfo `
+      -Operation $(if ($Fail) { 'fail' } else { 'commit' }) `
+      -Token $token
+    if ($Fail) { return $null -ne $state }
+    return [bool](Get-ObjectValue $state 'operation_committed' $false)
+  } catch {
+    return $false
+  }
+}
+
+function Get-AudnCodeHostProjectRoot {
+  param(
+    [string]$SessionId,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs
+  )
+
+  $unknown = [pscustomobject]@{ ok = $false; project_root = ''; reason = 'audncode-cron-project-unverifiable' }
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or [string]::IsNullOrWhiteSpace($SessionId) -or
+      $HostPid -le 0 -or $HostStartedUnixMs -le 0) { return $unknown }
+  try {
+    $markerPath = Join-Path (Join-Path ([IO.Path]::GetFullPath($HomePath)) 'sessions') (([string]$HostPid) + '.json')
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { return $unknown }
+    $marker = Read-JsonFile -Path $markerPath
+    $cwdProperty = $marker.PSObject.Properties['cwd']
+    $markerPid = [int](Get-ObjectValue $marker 'pid' 0)
+    $markerStarted = [int64](Get-ObjectValue $marker 'startedAt' 0)
+    if ($markerPid -ne $HostPid -or $markerStarted -ne $HostStartedUnixMs -or
+        [string](Get-ObjectValue $marker 'sessionId' '') -ne $SessionId -or
+        $null -eq $cwdProperty -or $cwdProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$cwdProperty.Value) -or
+        ([string]$cwdProperty.Value).Length -gt 32768 -or
+        -not [IO.Path]::IsPathRooted([string]$cwdProperty.Value)) { return $unknown }
+    $projectRoot = [IO.Path]::GetFullPath([string]$cwdProperty.Value).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if ([string]::IsNullOrWhiteSpace($projectRoot)) { return $unknown }
+    return [pscustomobject]@{ ok = $true; project_root = $projectRoot; reason = 'audncode-cron-project-current' }
+  } catch {
+    return $unknown
+  }
+}
+
+function Get-AudnCodeCronDeleteTranscriptProof {
+  param(
+    [object]$SessionState,
+    [string]$SessionId,
+    [int64]$SessionEpoch,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [object]$HookInput
+  )
+
+  $unknown = [pscustomobject]@{ ok = $false; proof_hash = ''; reason = 'audncode-cron-delete-proof-unverifiable' }
+  if ($null -eq $SessionState -or $SessionState -isnot [System.Management.Automation.PSCustomObject] -or
+      [string]::IsNullOrWhiteSpace($SessionId) -or $SessionEpoch -le 0 -or $null -eq $HookInput -or
+      [string](Get-ObjectValue $HookInput 'tool_name' '') -ne 'CronDelete') { return $unknown }
+  $toolUseId = [string](Get-ObjectValue $HookInput 'tool_use_id' '')
+  $toolInput = Get-ObjectValue $HookInput 'tool_input'
+  $inputIdProperty = if ($null -ne $toolInput) { $toolInput.PSObject.Properties['id'] } else { $null }
+  if ([string]::IsNullOrWhiteSpace($toolUseId) -or $toolUseId.Length -gt 512 -or
+      $null -eq $inputIdProperty -or $inputIdProperty.Value -isnot [string]) { return $unknown }
+  $cronId = ([string]$inputIdProperty.Value).Trim().ToLowerInvariant()
+  if ($cronId -notmatch '^[a-f0-9]{8}$') { return $unknown }
+
+  $cursorValidProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_valid']
+  $cursorProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor']
+  $boundaryProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_at_boundary']
+  $existedProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_file_existed']
+  $creationProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_creation_ticks']
+  $anchorOffsetProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_anchor_offset']
+  $anchorHashProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_anchor_hash']
+  if ($null -eq $cursorValidProperty -or $cursorValidProperty.Value -isnot [bool] -or
+      -not [bool]$cursorValidProperty.Value -or
+      $null -eq $boundaryProperty -or $boundaryProperty.Value -isnot [bool] -or
+      -not [bool]$boundaryProperty.Value -or
+      $null -eq $existedProperty -or $existedProperty.Value -isnot [bool] -or
+      $null -eq $cursorProperty -or
+      ($cursorProperty.Value -isnot [int] -and $cursorProperty.Value -isnot [long]) -or
+      [int64]$cursorProperty.Value -lt 0 -or
+      $null -eq $creationProperty -or
+      ($creationProperty.Value -isnot [int] -and $creationProperty.Value -isnot [long]) -or
+      [int64]$creationProperty.Value -lt 0 -or
+      $null -eq $anchorOffsetProperty -or
+      ($anchorOffsetProperty.Value -isnot [int] -and $anchorOffsetProperty.Value -isnot [long]) -or
+      [int64]$anchorOffsetProperty.Value -lt 0 -or
+      $null -eq $anchorHashProperty -or $anchorHashProperty.Value -isnot [string] -or
+      [string]$anchorHashProperty.Value -notmatch '^[a-f0-9]{64}$') { return $unknown }
+
+  $cursor = [int64]$cursorProperty.Value
+  $anchorOffset = [int64]$anchorOffsetProperty.Value
+  $anchorHash = [string]$anchorHashProperty.Value
+  $cursorFileExisted = [bool]$existedProperty.Value
+  $cursorCreationTicks = [int64]$creationProperty.Value
+  if ([string](Get-ObjectValue $SessionState 'session_id' '') -ne $SessionId -or
+      [int64](Get-ObjectValue $SessionState 'epoch' 0) -ne $SessionEpoch -or
+      [string](Get-ObjectValue $SessionState 'state' '') -ne 'busy' -or
+      [bool](Get-ObjectValue $SessionState 'audncode_prompt_prearm_pending' $true) -or
+      -not [string]::Equals([string](Get-ObjectValue $SessionState 'transcript_path' ''), $TranscriptPath, [StringComparison]::OrdinalIgnoreCase) -or
+      -not [string]::Equals([string](Get-ObjectValue $SessionState 'audncode_home' ''), $HomePath, [StringComparison]::OrdinalIgnoreCase) -or
+      [int64](Get-ObjectValue $SessionState 'busy_unix_ms' 0) -le 0 -or
+      $anchorOffset -gt $cursor -or ($cursor - $anchorOffset) -gt $AudnCodeStopFailureAnchorBytes) { return $unknown }
+  if (-not $cursorFileExisted -and ($cursor -ne 0 -or $cursorCreationTicks -ne 0 -or $anchorOffset -ne 0)) {
+    return $unknown
+  }
+
+  $stream = $null
+  try {
+    $canonicalPath = [IO.Path]::GetFullPath($TranscriptPath)
+    if (-not (Test-AudnCodeTranscriptPath -SessionId $SessionId -TranscriptPath $canonicalPath -HomePath $HomePath)) {
+      return $unknown
+    }
+    $before = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$before.Length -lt $cursor) {
+      return $unknown
+    }
+    if ($cursorFileExisted -and $before.CreationTimeUtc.Ticks -ne $cursorCreationTicks) { return $unknown }
+    $tailLength = [int64]$before.Length - $cursor
+    if ($tailLength -le 0 -or $tailLength -gt $AudnCodeStopFailureMaxTailBytes) { return $unknown }
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($canonicalPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    if ([int64]$stream.Length -ne [int64]$before.Length) { return $unknown }
+
+    $anchorLength = [int]($cursor - $anchorOffset)
+    [byte[]]$anchorBytes = New-Object byte[] $anchorLength
+    if ($anchorLength -gt 0) {
+      [void]$stream.Seek($anchorOffset, [IO.SeekOrigin]::Begin)
+      $anchorRead = 0
+      while ($anchorRead -lt $anchorLength) {
+        $count = $stream.Read($anchorBytes, $anchorRead, $anchorLength - $anchorRead)
+        if ($count -le 0) { return $unknown }
+        $anchorRead += $count
+      }
+    }
+    if ((Get-Sha256HexBytes $anchorBytes) -ne $anchorHash) { return $unknown }
+
+    [byte[]]$tailBytes = New-Object byte[] ([int]$tailLength)
+    [void]$stream.Seek($cursor, [IO.SeekOrigin]::Begin)
+    $tailRead = 0
+    while ($tailRead -lt $tailBytes.Length) {
+      $count = $stream.Read($tailBytes, $tailRead, $tailBytes.Length - $tailRead)
+      if ($count -le 0) { return $unknown }
+      $tailRead += $count
+    }
+    if ($tailBytes[$tailBytes.Length - 1] -ne 10 -or [int64]$stream.Length -ne [int64]$before.Length) {
+      return $unknown
+    }
+    $stream.Dispose()
+    $stream = $null
+    $after = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    if ([int64]$after.Length -ne [int64]$before.Length -or
+        $after.CreationTimeUtc.Ticks -ne $before.CreationTimeUtc.Ticks -or
+        $after.LastWriteTimeUtc.Ticks -ne $before.LastWriteTimeUtc.Ticks -or
+        -not (Test-AudnCodeTranscriptPath -SessionId $SessionId -TranscriptPath $canonicalPath -HomePath $HomePath)) {
+      return $unknown
+    }
+
+    try { $tailText = $Utf8StrictNoBom.GetString($tailBytes) } catch { return $unknown }
+    $lines = [regex]::Split($tailText, "`n")
+    if ($lines.Count -le 1 -or ($lines.Count - 1) -gt $AudnCodeStopFailureMaxRecords -or
+        -not [string]::IsNullOrEmpty($lines[$lines.Count - 1])) { return $unknown }
+    $seenUuids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $toolUses = New-Object 'System.Collections.Generic.List[object]'
+    $toolResults = New-Object 'System.Collections.Generic.List[object]'
+    for ($index = 0; $index -lt $lines.Count - 1; $index++) {
+      $line = [string]$lines[$index]
+      if ($line.EndsWith("`r", [StringComparison]::Ordinal)) { $line = $line.Substring(0, $line.Length - 1) }
+      if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -gt $AudnCodeStopFailureMaxLineChars) { return $unknown }
+      try { $entry = ConvertFrom-StrictJsonText -Text $line } catch { return $unknown }
+      if ($null -eq $entry -or $entry -isnot [System.Management.Automation.PSCustomObject]) { return $unknown }
+      $entryType = [string](Get-ObjectValue $entry 'type' '')
+      if ($entryType -notin @('user', 'assistant')) { continue }
+      $uuidProperty = $entry.PSObject.Properties['uuid']
+      $sessionProperty = $entry.PSObject.Properties['sessionId']
+      $sidechainProperty = $entry.PSObject.Properties['isSidechain']
+      $parsedUuid = [Guid]::Empty
+      if ($null -eq $uuidProperty -or $uuidProperty.Value -isnot [string] -or
+          -not [Guid]::TryParseExact([string]$uuidProperty.Value, 'D', [ref]$parsedUuid) -or
+          $null -eq $sessionProperty -or $sessionProperty.Value -isnot [string] -or
+          [string]$sessionProperty.Value -ne $SessionId -or
+          $null -eq $sidechainProperty -or $sidechainProperty.Value -isnot [bool]) { return $unknown }
+      $canonicalUuid = $parsedUuid.ToString('D')
+      if (-not $seenUuids.Add($canonicalUuid)) { return $unknown }
+      if ([bool]$sidechainProperty.Value -or $null -ne $entry.PSObject.Properties['agentId']) { continue }
+      $messageProperty = $entry.PSObject.Properties['message']
+      if ($null -eq $messageProperty -or
+          $messageProperty.Value -isnot [System.Management.Automation.PSCustomObject]) { continue }
+      $roleProperty = $messageProperty.Value.PSObject.Properties['role']
+      $contentProperty = $messageProperty.Value.PSObject.Properties['content']
+      if ($null -eq $roleProperty -or $roleProperty.Value -isnot [string] -or
+          $null -eq $contentProperty -or $contentProperty.Value -isnot [System.Array]) { continue }
+      $blocks = @($contentProperty.Value)
+      if ($blocks.Count -eq 0 -or $blocks.Count -gt 64) { return $unknown }
+      if ($entryType -eq 'assistant' -and [string]$roleProperty.Value -eq 'assistant') {
+        foreach ($block in $blocks) {
+          if ($block -isnot [System.Management.Automation.PSCustomObject] -or
+              [string](Get-ObjectValue $block 'id' '') -ne $toolUseId) { continue }
+          $blockInput = Get-ObjectValue $block 'input'
+          $blockIdProperty = if ($null -ne $blockInput) { $blockInput.PSObject.Properties['id'] } else { $null }
+          if ([string](Get-ObjectValue $block 'type' '') -ne 'tool_use' -or
+              [string](Get-ObjectValue $block 'name' '') -ne 'CronDelete' -or
+              $null -eq $blockIdProperty -or $blockIdProperty.Value -isnot [string] -or
+              -not [string]::Equals(([string]$blockIdProperty.Value).Trim(), $cronId, [StringComparison]::OrdinalIgnoreCase)) {
+            return $unknown
+          }
+          $toolUses.Add([pscustomobject]@{
+              index = $index
+              uuid = $canonicalUuid
+              line_hash = Get-Sha256Hex $line
+            })
+        }
+      } elseif ($entryType -eq 'user' -and [string]$roleProperty.Value -eq 'user') {
+        $parentProperty = $entry.PSObject.Properties['parentUuid']
+        $parsedParent = [Guid]::Empty
+        foreach ($block in $blocks) {
+          if ($block -isnot [System.Management.Automation.PSCustomObject] -or
+              [string](Get-ObjectValue $block 'tool_use_id' '') -ne $toolUseId) { continue }
+          $isErrorProperty = $block.PSObject.Properties['is_error']
+          if ([string](Get-ObjectValue $block 'type' '') -ne 'tool_result' -or
+              ($null -ne $isErrorProperty -and ($isErrorProperty.Value -isnot [bool] -or [bool]$isErrorProperty.Value)) -or
+              $null -eq $parentProperty -or $parentProperty.Value -isnot [string] -or
+              -not [Guid]::TryParseExact([string]$parentProperty.Value, 'D', [ref]$parsedParent)) {
+            return $unknown
+          }
+          $toolResults.Add([pscustomobject]@{
+              index = $index
+              uuid = $canonicalUuid
+              parent_uuid = $parsedParent.ToString('D')
+              line_hash = Get-Sha256Hex $line
+            })
+        }
+      }
+    }
+    if ($toolUses.Count -ne 1 -or $toolResults.Count -ne 1 -or
+        [int]$toolResults[0].index -le [int]$toolUses[0].index -or
+        [string]$toolResults[0].parent_uuid -ne [string]$toolUses[0].uuid) { return $unknown }
+    $proofHash = Get-Sha256Hex (ConvertTo-CompactJson ([ordered]@{
+          schema = 1
+          kind = 'audncode-cron-delete-transcript-proof'
+          session_id = $SessionId
+          epoch = $SessionEpoch
+          cron_id = $cronId
+          tool_use_id_hash = Get-Sha256Hex ("audncode-cron-tool-use/v1|$toolUseId")
+          tool_use_uuid = [string]$toolUses[0].uuid
+          tool_use_line_hash = [string]$toolUses[0].line_hash
+          tool_result_uuid = [string]$toolResults[0].uuid
+          tool_result_line_hash = [string]$toolResults[0].line_hash
+        }))
+    return [pscustomobject]@{ ok = $true; proof_hash = $proofHash; reason = 'audncode-cron-delete-proof-correlated' }
+  } catch {
+    return $unknown
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
+function ConvertFrom-AudnCodeCronToolEvent {
+  param([object]$HookInput)
+
+  $toolName = ([string](Get-ObjectValue $HookInput 'tool_name' '')).Trim()
+  if ($toolName -notin @('CronCreate', 'CronDelete')) { return $null }
+  $invalid = [pscustomobject]@{
+    valid = $false
+    action = ''
+    id = ''
+    recurring = $false
+    durable = $false
+    definition_hash = ''
+    incarnation_hash = ''
+    tool_use_id_hash = ''
+  }
+  try {
+    $response = Get-ObjectValue $HookInput 'tool_response'
+    if ($null -eq $response) { return $invalid }
+    $data = Get-ObjectValue $response 'data'
+    if ($null -eq $data) { $data = $response }
+    if ($null -eq $data) { return $invalid }
+    $idProperty = $data.PSObject.Properties['id']
+    if ($null -eq $idProperty -or $idProperty.Value -isnot [string]) { return $invalid }
+    $id = ([string]$idProperty.Value).Trim().ToLowerInvariant()
+    if ($id -notmatch '^[a-f0-9]{8}$') { return $invalid }
+    $toolUseId = [string](Get-ObjectValue $HookInput 'tool_use_id' '')
+    if ([string]::IsNullOrWhiteSpace($toolUseId) -or $toolUseId.Length -gt 512) { return $invalid }
+    $toolUseIdHash = Get-Sha256Hex ("audncode-cron-tool-use/v1|$toolUseId")
+    if ($toolName -eq 'CronDelete') {
+      $toolInput = Get-ObjectValue $HookInput 'tool_input'
+      $inputIdProperty = if ($null -ne $toolInput) { $toolInput.PSObject.Properties['id'] } else { $null }
+      if ($null -eq $inputIdProperty -or $inputIdProperty.Value -isnot [string] -or
+          -not [string]::Equals(([string]$inputIdProperty.Value).Trim(), $id, [StringComparison]::OrdinalIgnoreCase)) {
+        return $invalid
+      }
+      return [pscustomobject]@{
+        valid = $true
+        action = 'delete'
+        id = $id
+        recurring = $false
+        durable = $false
+        definition_hash = ''
+        incarnation_hash = ''
+        tool_use_id_hash = $toolUseIdHash
+      }
+    }
+    $recurringProperty = $data.PSObject.Properties['recurring']
+    $durableProperty = $data.PSObject.Properties['durable']
+    $toolInput = Get-ObjectValue $HookInput 'tool_input'
+    $inputCronProperty = if ($null -ne $toolInput) { $toolInput.PSObject.Properties['cron'] } else { $null }
+    $inputPromptProperty = if ($null -ne $toolInput) { $toolInput.PSObject.Properties['prompt'] } else { $null }
+    $inputRecurringProperty = if ($null -ne $toolInput) { $toolInput.PSObject.Properties['recurring'] } else { $null }
+    $inputDurableProperty = if ($null -ne $toolInput) { $toolInput.PSObject.Properties['durable'] } else { $null }
+    if ($null -eq $recurringProperty -or $recurringProperty.Value -isnot [bool] -or
+        $null -eq $durableProperty -or $durableProperty.Value -isnot [bool] -or
+        $null -eq $inputCronProperty -or $inputCronProperty.Value -isnot [string] -or
+        $null -eq $inputPromptProperty -or $inputPromptProperty.Value -isnot [string] -or
+        ($null -ne $inputRecurringProperty -and $inputRecurringProperty.Value -isnot [bool]) -or
+        ($null -ne $inputDurableProperty -and $inputDurableProperty.Value -isnot [bool])) { return $invalid }
+    $effectiveInputRecurring = if ($null -ne $inputRecurringProperty) { [bool]$inputRecurringProperty.Value } else { $true }
+    $effectiveInputDurable = if ($null -ne $inputDurableProperty) { [bool]$inputDurableProperty.Value } else { $false }
+    if ($effectiveInputRecurring -ne [bool]$recurringProperty.Value -or
+        (-not $effectiveInputDurable -and [bool]$durableProperty.Value)) { return $invalid }
+    # AudnCode's durable-cron kill switch is evaluated inside CronCreate. A
+    # requested durable task may therefore succeed as session-only; the trusted
+    # response is the effective outcome. Escalation in the opposite direction
+    # (input false, output true) remains invalid.
+    $definitionHash = Get-Sha256Hex (ConvertTo-CompactJson ([ordered]@{
+          schema = 1
+          id = $id
+          cron = [string]$inputCronProperty.Value
+          prompt = [string]$inputPromptProperty.Value
+          recurring = [bool]$recurringProperty.Value
+          durable = [bool]$durableProperty.Value
+        }))
+    return [pscustomobject]@{
+      valid = $true
+      action = 'create'
+      id = $id
+      recurring = [bool]$recurringProperty.Value
+      durable = [bool]$durableProperty.Value
+      definition_hash = $definitionHash
+      incarnation_hash = Get-Sha256Hex ("audncode-cron-tool-incarnation/v1|$definitionHash|$toolUseIdHash")
+      tool_use_id_hash = $toolUseIdHash
+    }
+  } catch {
+    return $invalid
+  }
+}
+
+function Start-AudnCodeCronLifecycleMutation {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [int64]$HookStartTicks
+  )
+
+  $token = [Guid]::NewGuid().ToString('N')
+  $result = [ordered]@{
+    armed = $false
+    token = $token
+    session_id = $SessionId
+    hook_start_ticks = [int64]$HookStartTicks
+    correlation = $null
+    runtime_info = $null
+    guard_info = $null
+  }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info -or $HookStartTicks -le 0) { return [pscustomobject]$result }
+  $correlation = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedTranscriptPath, $lockedHookStartTicks)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $null }
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+          -not [string]::Equals([string](Get-ObjectValue $state 'transcript_path' ''), $lockedTranscriptPath, [StringComparison]::OrdinalIgnoreCase) -or
+          [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0) -le 0 -or
+          $lockedHookStartTicks -le [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)) { return $null }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'cron'
+      $pendingCount = @((Get-ObjectValue $pendingState 'tokens' @())).Count
+      return [pscustomobject]@{
+        epoch = [int64](Get-ObjectValue $state 'epoch' 0)
+        host_pid = [int](Get-ObjectValue $state 'audncode_host_pid' 0)
+        host_started_unix_ms = [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0)
+        home = [string](Get-ObjectValue $state 'audncode_home' '')
+        cron_key = [string](Get-ObjectValue $state 'audncode_cron_runtime_key' '')
+        project_root = [string](Get-ObjectValue $state 'audncode_project_root' '')
+        hook_generation = [string](Get-ObjectValue $state 'audncode_cron_hook_generation' '')
+        hook_installed_unix_ms = [int64](Get-ObjectValue $state 'audncode_cron_hook_installed_unix_ms' 0)
+        prior_loss = -not [bool](Get-ObjectValue $pendingState 'valid' $false) -or
+          ([bool](Get-ObjectValue $state 'audncode_cron_lifecycle_unverifiable' $false) -and $pendingCount -eq 0)
+      }
+    } -Arguments @($info.path, $SessionId, $TranscriptPath, $HookStartTicks)
+  if ($null -eq $correlation) { return [pscustomobject]$result }
+  $result.correlation = $correlation
+
+  $sessionPrearmed = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedEpoch, $lockedCronKey, $lockedToken)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $false }
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [int64](Get-ObjectValue $state 'epoch' 0) -ne [int64]$lockedEpoch -or
+          [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+          [string](Get-ObjectValue $state 'audncode_cron_runtime_key' '') -ne $lockedCronKey) { return $false }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'cron'
+      $pendingTokens = @((Get-ObjectValue $pendingState 'tokens' @()))
+      if (-not [bool](Get-ObjectValue $pendingState 'valid' $false)) { $pendingTokens = @() }
+      if ($lockedToken -notin $pendingTokens) {
+        if ($pendingTokens.Count -ge $AudnCodeLifecycleMaxPendingTokens) { return $false }
+        $pendingTokens += $lockedToken
+      }
+      Set-RecordValue -Record $state -Name 'audncode_cron_registry_valid' -Value $false
+      if (-not (Set-AudnCodeSessionLifecyclePendingTokens -Record $state -RegistryKind 'cron' -Tokens $pendingTokens)) { return $false }
+      Set-RecordValue -Record $state -Name 'audncode_cron_lifecycle_unverifiable' -Value $true
+      Set-RecordValue -Record $state -Name 'audncode_cron_lifecycle_failure_reason' -Value 'audncode-cron-lifecycle-pending'
+      Write-JsonAtomic -Path $lockedPath -Value $state
+      return $true
+    } -Arguments @($info.path, $SessionId, [int64]$correlation.epoch, [string]$correlation.cron_key, $token)
+  if (-not [bool]$sessionPrearmed) { return [pscustomobject]$result }
+
+  # This guard is armed from the identity already committed by
+  # UserPromptSubmit. It deliberately precedes process-tree, marker and
+  # transcript inspection: a hook killed during those slower checks leaves a
+  # durable host-wide pending token and finality stays fail closed.
+  $runtimeInfo = Get-AudnCodeCronRuntimeStateInfo `
+    -HomePath ([string]$correlation.home) `
+    -HostPid ([int]$correlation.host_pid) `
+    -HostStartedUnixMs ([int64]$correlation.host_started_unix_ms) `
+    -HookGeneration ([string]$correlation.hook_generation) `
+    -HookInstalledUnixMs ([int64]$correlation.hook_installed_unix_ms) `
+    -ObservationAllowed $true
+  $guardInfo = if ($null -ne $runtimeInfo -and [string]$runtimeInfo.key -eq [string]$correlation.cron_key) {
+    Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $runtimeInfo -RegistryKind 'cron'
+  } else { $null }
+  $guardState = if ($null -ne $guardInfo) {
+    Update-AudnCodeLifecycleGuard `
+      -GuardInfo $guardInfo `
+      -Operation 'arm' `
+      -Token $token `
+      -ForceLost:([bool]$correlation.prior_loss)
+  } else { $null }
+  $result.runtime_info = $runtimeInfo
+  $result.guard_info = $guardInfo
+  if ($null -ne $guardState) { Wait-AudnCodeLifecycleArmTestBarrier -RegistryKind 'cron' -Token $token }
+  $stickyLoss = $null -eq $guardState -or [bool](Get-ObjectValue $guardState 'lost' $true)
+  $sessionArmed = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedEpoch, $lockedCronKey, $lockedToken, $lockedStickyLoss)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $false }
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [int64](Get-ObjectValue $state 'epoch' 0) -ne [int64]$lockedEpoch -or
+          [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+          [string](Get-ObjectValue $state 'audncode_cron_runtime_key' '') -ne $lockedCronKey) { return $false }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'cron'
+      if (-not [bool](Get-ObjectValue $pendingState 'valid' $false) -or
+          $lockedToken -notin @((Get-ObjectValue $pendingState 'tokens' @()))) { return $false }
+      Set-RecordValue -Record $state -Name 'audncode_cron_registry_valid' -Value $false
+      if ($lockedStickyLoss) {
+        Set-RecordValue -Record $state -Name 'audncode_cron_lifecycle_unverifiable' -Value $true
+        Set-RecordValue -Record $state -Name 'audncode_cron_lifecycle_failure_reason' -Value 'audncode-cron-lifecycle-unverifiable'
+      }
+      Write-JsonAtomic -Path $lockedPath -Value $state
+      return $true
+    } -Arguments @($info.path, $SessionId, [int64]$correlation.epoch, [string]$correlation.cron_key, $token, [bool]$stickyLoss)
+  if (-not [bool]$sessionArmed) {
+    if ($null -ne $guardInfo) {
+      [void](Update-AudnCodeLifecycleGuard -GuardInfo $guardInfo -Operation 'fail' -Token $token)
+    }
+    return [pscustomobject]$result
+  }
+  $result.armed = $null -ne $guardState
+  return [pscustomobject]$result
+}
+
+function Read-AudnCodeStableUtf8FileSnapshot {
+  param(
+    [string]$RootPath,
+    [string]$Path,
+    [int64]$MaxBytes
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; raw = ''; content_hash = ''; reason = 'audncode-file-unverifiable' }
+  try {
+    if ([string]::IsNullOrWhiteSpace($RootPath) -or [string]::IsNullOrWhiteSpace($Path) -or
+        $MaxBytes -le 0 -or -not [IO.Path]::IsPathRooted($RootPath) -or -not [IO.Path]::IsPathRooted($Path)) {
+      return $unknown
+    }
+    $canonicalRoot = [IO.Path]::GetFullPath($RootPath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $canonicalPath = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalRoot -TargetPath $canonicalPath)) { return $unknown }
+    if (-not (Test-Path -LiteralPath $canonicalPath)) {
+      return [pscustomobject]@{
+        state = 'missing'
+        raw = ''
+        content_hash = Get-Sha256Hex 'audncode/missing/v1'
+        length = [int64]0
+        creation_ticks = [int64]0
+        last_write_ticks = [int64]0
+        last_write_unix_ms = [int64]0
+        reason = 'audncode-file-missing'
+      }
+    }
+    if (-not (Test-Path -LiteralPath $canonicalPath -PathType Leaf)) { return $unknown }
+    $before = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [int64]$before.Length -gt $MaxBytes) { return $unknown }
+    $bytes = [IO.File]::ReadAllBytes($canonicalPath)
+    if ([int64]$bytes.LongLength -ne [int64]$before.Length -or [int64]$bytes.LongLength -gt $MaxBytes) { return $unknown }
+    $raw = $Utf8StrictNoBom.GetString($bytes)
+    $after = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    if (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [int64]$before.Length -ne [int64]$after.Length -or
+        [int64]$before.LastWriteTimeUtc.Ticks -ne [int64]$after.LastWriteTimeUtc.Ticks -or
+        [int64]$before.CreationTimeUtc.Ticks -ne [int64]$after.CreationTimeUtc.Ticks -or
+        -not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalRoot -TargetPath $canonicalPath)) {
+      return $unknown
+    }
+    return [pscustomobject]@{
+      state = 'ok'
+      raw = $raw
+      content_hash = Get-Sha256HexBytes $bytes
+      length = [int64]$after.Length
+      creation_ticks = [int64]$after.CreationTimeUtc.Ticks
+      last_write_ticks = [int64]$after.LastWriteTimeUtc.Ticks
+      last_write_unix_ms = ([DateTimeOffset]$after.LastWriteTimeUtc).ToUnixTimeMilliseconds()
+      reason = 'audncode-file-stable'
+    }
+  } catch {
+    return $unknown
+  }
+}
+
+function Read-AudnCodeDurableCronFileState {
+  param([string]$ProjectRoot)
+
+  $unknown = [pscustomobject]@{
+    state = 'unknown'
+    entries = @()
+    snapshot = $null
+    reason = 'audncode-durable-cron-file-unverifiable'
+  }
+  if ([string]::IsNullOrWhiteSpace($ProjectRoot) -or $ProjectRoot.Length -gt 32768) { return $unknown }
+  try {
+    if (-not [IO.Path]::IsPathRooted($ProjectRoot)) { return $unknown }
+    $canonicalProjectRoot = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if (-not (Test-Path -LiteralPath $canonicalProjectRoot)) {
+      return [pscustomobject]@{
+        state = 'ok'
+        entries = @()
+        snapshot = [pscustomobject]@{
+          project_root = $canonicalProjectRoot
+          file_state = 'root-missing'
+          ids = @()
+          content_hash = Get-Sha256Hex 'audncode/root-missing/v1'
+          length = [int64]0
+          creation_ticks = [int64]0
+          last_write_ticks = [int64]0
+          last_write_unix_ms = [int64]0
+          lock_state = 'missing'
+          lock_content_hash = Get-Sha256Hex 'audncode/lock-missing/v1'
+          lock_length = [int64]0
+          lock_creation_ticks = [int64]0
+          lock_last_write_ticks = [int64]0
+          lock_session_id = ''
+          lock_pid = 0
+          lock_acquired_unix_ms = [int64]0
+        }
+        reason = 'audncode-durable-cron-project-missing'
+      }
+    }
+    if (-not (Test-Path -LiteralPath $canonicalProjectRoot -PathType Container)) { return $unknown }
+    $claudeDirectory = [IO.Path]::GetFullPath((Join-Path $canonicalProjectRoot '.claude'))
+    $cronPath = [IO.Path]::GetFullPath((Join-Path $claudeDirectory 'scheduled_tasks.json'))
+    $lockPath = [IO.Path]::GetFullPath((Join-Path $claudeDirectory 'scheduled_tasks.lock'))
+    $lockBefore = Read-AudnCodeStableUtf8FileSnapshot -RootPath $canonicalProjectRoot -Path $lockPath -MaxBytes 64KB
+    if ([string](Get-ObjectValue $lockBefore 'state' 'unknown') -eq 'unknown') { return $unknown }
+    $cronFile = Read-AudnCodeStableUtf8FileSnapshot -RootPath $canonicalProjectRoot -Path $cronPath -MaxBytes 16MB
+    if ([string](Get-ObjectValue $cronFile 'state' 'unknown') -eq 'unknown') { return $unknown }
+    # The scheduler creates its O_EXCL lock before loading/firing tasks. Read it
+    # around the task file so a new owner cannot hide between the two snapshots.
+    $lockAfter = Read-AudnCodeStableUtf8FileSnapshot -RootPath $canonicalProjectRoot -Path $lockPath -MaxBytes 64KB
+    if ([string](Get-ObjectValue $lockAfter 'state' 'unknown') -eq 'unknown' -or
+        [string](Get-ObjectValue $lockBefore 'state' '') -ne [string](Get-ObjectValue $lockAfter 'state' '') -or
+        [string](Get-ObjectValue $lockBefore 'content_hash' '') -ne [string](Get-ObjectValue $lockAfter 'content_hash' '') -or
+        [int64](Get-ObjectValue $lockBefore 'creation_ticks' 0) -ne [int64](Get-ObjectValue $lockAfter 'creation_ticks' 0) -or
+        [int64](Get-ObjectValue $lockBefore 'last_write_ticks' 0) -ne [int64](Get-ObjectValue $lockAfter 'last_write_ticks' 0)) {
+      return $unknown
+    }
+
+    $lockState = [string](Get-ObjectValue $lockAfter 'state' 'missing')
+    $lockSessionId = ''
+    $lockPid = 0
+    $lockAcquiredUnixMs = [int64]0
+    if ($lockState -eq 'ok') {
+      try { $lockDocument = ConvertFrom-StrictJsonText -Text ([string]$lockAfter.raw) } catch { return $unknown }
+      $sessionProperty = if ($null -ne $lockDocument) { $lockDocument.PSObject.Properties['sessionId'] } else { $null }
+      $pidProperty = if ($null -ne $lockDocument) { $lockDocument.PSObject.Properties['pid'] } else { $null }
+      $acquiredProperty = if ($null -ne $lockDocument) { $lockDocument.PSObject.Properties['acquiredAt'] } else { $null }
+      $parsedLockSession = [Guid]::Empty
+      if ($null -eq $sessionProperty -or $sessionProperty.Value -isnot [string] -or
+          -not [Guid]::TryParse([string]$sessionProperty.Value, [ref]$parsedLockSession) -or
+          $null -eq $pidProperty -or ($pidProperty.Value -isnot [int] -and $pidProperty.Value -isnot [long]) -or
+          [int64]$pidProperty.Value -le 0 -or [int64]$pidProperty.Value -gt [int]::MaxValue -or
+          $null -eq $acquiredProperty -or ($acquiredProperty.Value -isnot [int] -and $acquiredProperty.Value -isnot [long]) -or
+          [int64]$acquiredProperty.Value -le 0) {
+        return $unknown
+      }
+      $lockSessionId = [string]$sessionProperty.Value
+      $lockPid = [int]$pidProperty.Value
+      $lockAcquiredUnixMs = [int64]$acquiredProperty.Value
+    }
+
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if ([string](Get-ObjectValue $cronFile 'state' 'missing') -eq 'ok') {
+      try { $document = ConvertFrom-StrictJsonText -Text ([string]$cronFile.raw) } catch { return $unknown }
+      $tasksProperty = if ($null -ne $document) { $document.PSObject.Properties['tasks'] } else { $null }
+      if ($null -eq $tasksProperty -or $null -eq $tasksProperty.Value -or $tasksProperty.Value -isnot [array]) { return $unknown }
+      $tasks = @($tasksProperty.Value)
+      if ($tasks.Count -gt 256) { return $unknown }
+      foreach ($task in $tasks) {
+        if ($null -eq $task -or $task -isnot [System.Management.Automation.PSCustomObject]) { return $unknown }
+        $idProperty = $task.PSObject.Properties['id']
+        $cronProperty = $task.PSObject.Properties['cron']
+        $promptProperty = $task.PSObject.Properties['prompt']
+        $createdProperty = $task.PSObject.Properties['createdAt']
+        $recurringProperty = $task.PSObject.Properties['recurring']
+        $permanentProperty = $task.PSObject.Properties['permanent']
+        $lastFiredProperty = $task.PSObject.Properties['lastFiredAt']
+        $cronId = if ($null -ne $idProperty -and $idProperty.Value -is [string]) {
+          ([string]$idProperty.Value).Trim().ToLowerInvariant()
+        } else { '' }
+        if ($cronId -notmatch '^[a-f0-9]{8}$' -or -not $ids.Add($cronId) -or
+            $null -eq $cronProperty -or $cronProperty.Value -isnot [string] -or
+            $null -eq $promptProperty -or $promptProperty.Value -isnot [string] -or
+            $null -eq $createdProperty -or ($createdProperty.Value -isnot [int] -and $createdProperty.Value -isnot [long]) -or
+            [int64]$createdProperty.Value -lt 0 -or
+            ($null -ne $recurringProperty -and $recurringProperty.Value -isnot [bool]) -or
+            ($null -ne $permanentProperty -and $permanentProperty.Value -isnot [bool]) -or
+            ($null -ne $lastFiredProperty -and $lastFiredProperty.Value -isnot [ValueType])) { return $unknown }
+        $recurring = if ($null -ne $recurringProperty) { [bool]$recurringProperty.Value } else { $false }
+        $permanent = if ($null -ne $permanentProperty) { [bool]$permanentProperty.Value } else { $false }
+        $definitionHash = Get-Sha256Hex (ConvertTo-CompactJson ([ordered]@{
+              schema = 1
+              id = $cronId
+              cron = [string]$cronProperty.Value
+              prompt = [string]$promptProperty.Value
+              recurring = $recurring
+              durable = $true
+            }))
+        $incarnationHash = Get-Sha256Hex (ConvertTo-CompactJson ([ordered]@{
+              domain = 'audncode-cron-incarnation/v1'
+              project_root = $canonicalProjectRoot
+              id = $cronId
+              cron = [string]$cronProperty.Value
+              prompt = [string]$promptProperty.Value
+              created_at = [int64]$createdProperty.Value
+              recurring = $recurring
+              permanent = $permanent
+              durable = $true
+            }))
+        $entries.Add([pscustomobject]@{
+            id = $cronId
+            project_root = $canonicalProjectRoot
+            recurring = $recurring
+            durable = $true
+            definition_hash = $definitionHash
+            incarnation_hash = $incarnationHash
+          })
+      }
+    }
+    $snapshot = [pscustomobject]@{
+      project_root = $canonicalProjectRoot
+      file_state = [string](Get-ObjectValue $cronFile 'state' 'missing')
+      ids = @($ids | Sort-Object)
+      content_hash = [string](Get-ObjectValue $cronFile 'content_hash' '')
+      length = [int64](Get-ObjectValue $cronFile 'length' 0)
+      creation_ticks = [int64](Get-ObjectValue $cronFile 'creation_ticks' 0)
+      last_write_ticks = [int64](Get-ObjectValue $cronFile 'last_write_ticks' 0)
+      last_write_unix_ms = [int64](Get-ObjectValue $cronFile 'last_write_unix_ms' 0)
+      lock_state = $lockState
+      lock_content_hash = [string](Get-ObjectValue $lockAfter 'content_hash' '')
+      lock_length = [int64](Get-ObjectValue $lockAfter 'length' 0)
+      lock_creation_ticks = [int64](Get-ObjectValue $lockAfter 'creation_ticks' 0)
+      lock_last_write_ticks = [int64](Get-ObjectValue $lockAfter 'last_write_ticks' 0)
+      lock_session_id = $lockSessionId
+      lock_pid = $lockPid
+      lock_acquired_unix_ms = $lockAcquiredUnixMs
+    }
+    return [pscustomobject]@{
+      state = 'ok'
+      entries = @($entries.ToArray())
+      snapshot = $snapshot
+      reason = 'audncode-durable-cron-file-valid'
+    }
+  } catch {
+    return $unknown
+  }
+}
+
+function ConvertTo-AudnCodeCronProjectSnapshot {
+  param([object]$Snapshot)
+
+  if ($null -eq $Snapshot -or $Snapshot -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+  try {
+    $projectRoot = [string](Get-ObjectValue $Snapshot 'project_root' '')
+    if ([string]::IsNullOrWhiteSpace($projectRoot) -or $projectRoot.Length -gt 32768 -or
+        -not [IO.Path]::IsPathRooted($projectRoot)) { return $null }
+    $projectRoot = [IO.Path]::GetFullPath($projectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $fileState = [string](Get-ObjectValue $Snapshot 'file_state' '')
+    $lockState = [string](Get-ObjectValue $Snapshot 'lock_state' '')
+    $contentHash = [string](Get-ObjectValue $Snapshot 'content_hash' '')
+    $lockContentHash = [string](Get-ObjectValue $Snapshot 'lock_content_hash' '')
+    if ($fileState -notin @('ok', 'missing', 'root-missing') -or $lockState -notin @('ok', 'missing') -or
+        $contentHash -notmatch '^[a-f0-9]{64}$' -or $lockContentHash -notmatch '^[a-f0-9]{64}$') { return $null }
+    $numericNames = @(
+      'length', 'creation_ticks', 'last_write_ticks', 'last_write_unix_ms',
+      'lock_length', 'lock_creation_ticks', 'lock_last_write_ticks', 'lock_acquired_unix_ms'
+    )
+    $numbers = @{}
+    foreach ($numericName in $numericNames) {
+      $property = $Snapshot.PSObject.Properties[$numericName]
+      if ($null -eq $property -or ($property.Value -isnot [int] -and $property.Value -isnot [long]) -or
+          [int64]$property.Value -lt 0) { return $null }
+      $numbers[$numericName] = [int64]$property.Value
+    }
+    $idsProperty = $Snapshot.PSObject.Properties['ids']
+    if ($null -eq $idsProperty -or $idsProperty.Value -isnot [array]) { return $null }
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rawId in @($idsProperty.Value)) {
+      if ($rawId -isnot [string]) { return $null }
+      $id = ([string]$rawId).Trim().ToLowerInvariant()
+      if ($id -notmatch '^[a-f0-9]{8}$' -or -not $ids.Add($id)) { return $null }
+    }
+    if ($ids.Count -gt 256) { return $null }
+    $lockSessionId = [string](Get-ObjectValue $Snapshot 'lock_session_id' '')
+    $lockPidProperty = $Snapshot.PSObject.Properties['lock_pid']
+    if ($null -eq $lockPidProperty -or ($lockPidProperty.Value -isnot [int] -and $lockPidProperty.Value -isnot [long]) -or
+        [int64]$lockPidProperty.Value -lt 0 -or [int64]$lockPidProperty.Value -gt [int]::MaxValue) { return $null }
+    $lockPid = [int]$lockPidProperty.Value
+    if ($lockState -eq 'ok') {
+      $parsedSession = [Guid]::Empty
+      if (-not [Guid]::TryParse($lockSessionId, [ref]$parsedSession) -or $lockPid -le 0 -or
+          $numbers['lock_acquired_unix_ms'] -le 0) { return $null }
+    } elseif (-not [string]::IsNullOrEmpty($lockSessionId) -or $lockPid -ne 0 -or
+        $numbers['lock_acquired_unix_ms'] -ne 0 -or $numbers['lock_length'] -ne 0 -or
+        $numbers['lock_creation_ticks'] -ne 0 -or $numbers['lock_last_write_ticks'] -ne 0) {
+      return $null
+    }
+    $ambiguousProperty = $Snapshot.PSObject.Properties['ambiguous']
+    $unknownProperty = $Snapshot.PSObject.Properties['ambiguous_unknown']
+    if (($null -ne $ambiguousProperty -and $ambiguousProperty.Value -isnot [bool]) -or
+        ($null -ne $unknownProperty -and $unknownProperty.Value -isnot [bool])) { return $null }
+    $ambiguous = if ($null -ne $ambiguousProperty) { [bool]$ambiguousProperty.Value } else { $false }
+    $ambiguousUnknown = if ($null -ne $unknownProperty) { [bool]$unknownProperty.Value } else { $false }
+    $removedProperty = $Snapshot.PSObject.Properties['ambiguous_removed_ids']
+    $removedIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $removedProperty) {
+      if ($removedProperty.Value -isnot [array]) { return $null }
+      foreach ($rawId in @($removedProperty.Value)) {
+        if ($rawId -isnot [string]) { return $null }
+        $id = ([string]$rawId).Trim().ToLowerInvariant()
+        if ($id -notmatch '^[a-f0-9]{8}$' -or -not $removedIds.Add($id)) { return $null }
+      }
+    }
+    if (($ambiguousUnknown -or $removedIds.Count -gt 0) -ne $ambiguous) { return $null }
+    return [pscustomobject]@{
+      project_root = $projectRoot
+      file_state = $fileState
+      ids = @($ids | Sort-Object)
+      content_hash = $contentHash
+      length = $numbers['length']
+      creation_ticks = $numbers['creation_ticks']
+      last_write_ticks = $numbers['last_write_ticks']
+      last_write_unix_ms = $numbers['last_write_unix_ms']
+      lock_state = $lockState
+      lock_content_hash = $lockContentHash
+      lock_length = $numbers['lock_length']
+      lock_creation_ticks = $numbers['lock_creation_ticks']
+      lock_last_write_ticks = $numbers['lock_last_write_ticks']
+      lock_session_id = $lockSessionId
+      lock_pid = $lockPid
+      lock_acquired_unix_ms = $numbers['lock_acquired_unix_ms']
+      ambiguous = $ambiguous
+      ambiguous_unknown = $ambiguousUnknown
+      ambiguous_removed_ids = @($removedIds | Sort-Object)
+    }
+  } catch {
+    return $null
+  }
+}
+
+function Get-AudnCodeCronSnapshotCoreIdentity {
+  param([object]$Snapshot)
+
+  if ($null -eq $Snapshot) { return '' }
+  return @(
+    [string](Get-ObjectValue $Snapshot 'project_root' ''),
+    [string](Get-ObjectValue $Snapshot 'file_state' ''),
+    ((@((Get-ObjectValue $Snapshot 'ids' @())) | Sort-Object) -join ','),
+    [string](Get-ObjectValue $Snapshot 'content_hash' ''),
+    [string][int64](Get-ObjectValue $Snapshot 'length' 0),
+    [string][int64](Get-ObjectValue $Snapshot 'creation_ticks' 0),
+    [string][int64](Get-ObjectValue $Snapshot 'last_write_ticks' 0),
+    [string](Get-ObjectValue $Snapshot 'lock_state' ''),
+    [string](Get-ObjectValue $Snapshot 'lock_content_hash' ''),
+    [string][int64](Get-ObjectValue $Snapshot 'lock_length' 0),
+    [string][int64](Get-ObjectValue $Snapshot 'lock_creation_ticks' 0),
+    [string][int64](Get-ObjectValue $Snapshot 'lock_last_write_ticks' 0),
+    [string](Get-ObjectValue $Snapshot 'lock_session_id' ''),
+    [string][int](Get-ObjectValue $Snapshot 'lock_pid' 0),
+    [string][int64](Get-ObjectValue $Snapshot 'lock_acquired_unix_ms' 0)
+  ) -join '|'
+}
+
+function Get-AudnCodeCronFileSnapshotIdentity {
+  param([object]$Snapshot)
+
+  if ($null -eq $Snapshot) { return '' }
+  return @(
+    [string](Get-ObjectValue $Snapshot 'project_root' ''),
+    [string](Get-ObjectValue $Snapshot 'file_state' ''),
+    ((@((Get-ObjectValue $Snapshot 'ids' @())) | Sort-Object) -join ','),
+    [string](Get-ObjectValue $Snapshot 'content_hash' ''),
+    [string][int64](Get-ObjectValue $Snapshot 'length' 0),
+    [string][int64](Get-ObjectValue $Snapshot 'creation_ticks' 0),
+    [string][int64](Get-ObjectValue $Snapshot 'last_write_ticks' 0)
+  ) -join '|'
+}
+
+function Get-AudnCodeCronNativeLockOwner {
+  param(
+    [object]$Snapshot,
+    [string]$HomePath
+  )
+
+  $invalid = [pscustomobject]@{
+    valid = $false
+    live = $false
+    pid = 0
+    process_started_unix_ms = [int64]0
+    acquired_unix_ms = [int64]0
+    content_hash = ''
+  }
+  if ($null -eq $Snapshot -or [string](Get-ObjectValue $Snapshot 'lock_state' '') -ne 'ok') {
+    return $invalid
+  }
+  try {
+    $lockPid = [int](Get-ObjectValue $Snapshot 'lock_pid' 0)
+    $lockAcquiredUnixMs = [int64](Get-ObjectValue $Snapshot 'lock_acquired_unix_ms' 0)
+    $lockCreationTicks = [int64](Get-ObjectValue $Snapshot 'lock_creation_ticks' 0)
+    $lockLastWriteTicks = [int64](Get-ObjectValue $Snapshot 'lock_last_write_ticks' 0)
+    $lockHash = [string](Get-ObjectValue $Snapshot 'lock_content_hash' '')
+    if ($lockPid -le 0 -or $lockAcquiredUnixMs -le 0 -or
+        $lockCreationTicks -le 0 -or $lockLastWriteTicks -lt $lockCreationTicks -or
+        $lockHash -notmatch '^[a-f0-9]{64}$' -or
+        $lockAcquiredUnixMs -gt [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) {
+      return $invalid
+    }
+    $lockAcquiredTicks = [DateTimeOffset]::FromUnixTimeMilliseconds($lockAcquiredUnixMs).UtcDateTime.Ticks
+    $metadataToleranceTicks = [TimeSpan]::FromSeconds(5).Ticks
+    if ($lockAcquiredTicks -gt ($lockLastWriteTicks + $metadataToleranceTicks) -or
+        $lockAcquiredTicks -lt ($lockCreationTicks - $metadataToleranceTicks)) {
+      return $invalid
+    }
+    $lockSessionId = [string](Get-ObjectValue $Snapshot 'lock_session_id' '')
+    $ownerHost = Get-AudnCodeHostSession `
+      -SessionId $lockSessionId `
+      -HomePath $HomePath `
+      -ExpectedHostPid $lockPid `
+      -AllowExitedHost
+    if (-not [bool](Get-ObjectValue $ownerHost 'ok' $false) -or
+        -not [bool](Get-ObjectValue $ownerHost 'live' $false)) { return $invalid }
+    $ownerStartedUnixMs = [int64](Get-ObjectValue $ownerHost 'process_started_unix_ms' 0)
+    # The scheduler may be enabled arbitrarily late in a long-running process.
+    # PID reuse is excluded by causality, not by a two-minute upper bound.
+    if ($lockAcquiredUnixMs -lt $ownerStartedUnixMs) { return $invalid }
+    return [pscustomobject]@{
+      valid = $true
+      live = $true
+      pid = $lockPid
+      process_started_unix_ms = [int64]$ownerStartedUnixMs
+      acquired_unix_ms = $lockAcquiredUnixMs
+      content_hash = $lockHash
+    }
+  } catch {
+    return $invalid
+  }
+}
+
+function Update-AudnCodeCronRuntimeState {
+  param(
+    [object]$RuntimeInfo,
+    [object]$RegisterSession = $null,
+    [object]$Mutation = $null,
+    [object[]]$ObservedDurableCrons = @(),
+    [object]$FileSnapshot = $null,
+    [int64]$HostProcessStartedUnixMs = 0,
+    [switch]$Invalidate,
+    [switch]$ValidateOnly
+  )
+
+  if ($null -eq $RuntimeInfo) { return $null }
+  $operations = [pscustomobject]@{
+    register_session = $RegisterSession
+    mutation = $Mutation
+    observed_durable_crons = @($ObservedDurableCrons)
+    file_snapshot = $FileSnapshot
+    host_process_started_unix_ms = [int64]$HostProcessStartedUnixMs
+  }
+  return Invoke-WithClaudeSessionLock -Info $RuntimeInfo -Action {
+    param($lockedInfo, $lockedOperations, $lockedInvalidate, $lockedValidateOnly)
+    $previous = $null
+    $previousExists = Test-Path -LiteralPath $lockedInfo.path -PathType Leaf
+    try { $previous = Read-JsonFile -Path $lockedInfo.path } catch { $previous = $null }
+    # Keep structural validity distinct from observability. A process that was
+    # already running when hooks were installed can have unknown session-only
+    # cron state even though every durable field we persist is well formed.
+    # That distinction is needed only after the exact process exits: its
+    # memory-only crons then die with it, while durable scheduler evidence must
+    # still be scanned independently before the lifetime can be retired.
+    $valid = -not $previousExists
+    $sessions = New-Object 'System.Collections.Generic.List[object]'
+    $sessionIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $crons = New-Object 'System.Collections.Generic.List[object]'
+    $cronIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $snapshots = New-Object 'System.Collections.Generic.List[object]'
+    $snapshotRoots = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $deleteClaims = New-Object 'System.Collections.Generic.List[object]'
+    $deleteClaimHashes = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $retiredSessionCronIds = New-Object 'System.Collections.Generic.List[string]'
+    $retiredSessionCronIdSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $hostProcessStartedUnixMs = [int64](Get-ObjectValue $lockedOperations 'host_process_started_unix_ms' 0)
+    if ($null -ne $previous) {
+      $registryProperty = $previous.PSObject.Properties['registry_valid']
+      $preObservationProperty = $previous.PSObject.Properties['pre_observation_only']
+      $previousRegistryValid = $null -ne $registryProperty -and
+        $registryProperty.Value -is [bool] -and [bool]$registryProperty.Value
+      $previousPreObservationOnly = $null -ne $preObservationProperty -and
+        $preObservationProperty.Value -is [bool] -and [bool]$preObservationProperty.Value
+      $valid = [string](Get-ObjectValue $previous 'kind' '') -eq 'audncode-cron-runtime' -and
+        [string]::Equals([string](Get-ObjectValue $previous 'audncode_home' ''), [string]$lockedInfo.home, [StringComparison]::OrdinalIgnoreCase) -and
+        [int](Get-ObjectValue $previous 'host_pid' 0) -eq [int]$lockedInfo.pid -and
+        [int64](Get-ObjectValue $previous 'host_started_unix_ms' 0) -eq [int64]$lockedInfo.started_unix_ms -and
+        [string](Get-ObjectValue $previous 'hook_generation' '') -eq [string]$lockedInfo.hook_generation -and
+        [int64](Get-ObjectValue $previous 'hook_installed_unix_ms' 0) -eq [int64]$lockedInfo.hook_installed_unix_ms -and
+        [int64](Get-ObjectValue $previous 'host_process_started_unix_ms' 0) -gt 0 -and
+        (($previousRegistryValid -and [bool]$lockedInfo.observation_allowed -and -not $previousPreObservationOnly) -or
+         ($previousPreObservationOnly -and -not [bool]$lockedInfo.observation_allowed -and -not $previousRegistryValid))
+      $persistedProcessStarted = [int64](Get-ObjectValue $previous 'host_process_started_unix_ms' 0)
+      if ($hostProcessStartedUnixMs -gt 0 -and $persistedProcessStarted -ne $hostProcessStartedUnixMs) { $valid = $false }
+      $hostProcessStartedUnixMs = $persistedProcessStarted
+      foreach ($session in @((Get-ObjectValue $previous 'sessions' @()))) {
+        $sessionId = [string](Get-ObjectValue $session 'session_id' '')
+        $projectRoot = [string](Get-ObjectValue $session 'project_root' '')
+        $lastSeenProperty = $session.PSObject.Properties['last_seen_unix_ms']
+        $lastSeenUnixMs = [int64]0
+        if ($null -ne $lastSeenProperty) {
+          if (($lastSeenProperty.Value -is [int] -or $lastSeenProperty.Value -is [long]) -and
+              [int64]$lastSeenProperty.Value -ge 0) {
+            $lastSeenUnixMs = [int64]$lastSeenProperty.Value
+          } else {
+            $valid = $false
+          }
+        }
+        $parsedSession = [Guid]::Empty
+        try {
+          if (-not [IO.Path]::IsPathRooted($projectRoot)) { throw 'project root is not absolute' }
+          $projectRoot = [IO.Path]::GetFullPath($projectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        } catch {
+          $valid = $false
+          continue
+        }
+        if (-not [Guid]::TryParse($sessionId, [ref]$parsedSession) -or
+            [string]::IsNullOrWhiteSpace($projectRoot) -or -not $sessionIds.Add($sessionId)) {
+          $valid = $false
+          continue
+        }
+        $sessions.Add([pscustomobject]@{
+            session_id = $sessionId
+            project_root = $projectRoot
+            last_seen_unix_ms = $lastSeenUnixMs
+          })
+      }
+      foreach ($cron in @((Get-ObjectValue $previous 'crons' @()))) {
+        $id = ([string](Get-ObjectValue $cron 'id' '')).Trim().ToLowerInvariant()
+        $sessionId = [string](Get-ObjectValue $cron 'session_id' '')
+        $projectRoot = [string](Get-ObjectValue $cron 'project_root' '')
+        $recurringProperty = $cron.PSObject.Properties['recurring']
+        $durableProperty = $cron.PSObject.Properties['durable']
+        $definitionHash = [string](Get-ObjectValue $cron 'definition_hash' '')
+        $incarnationHash = [string](Get-ObjectValue $cron 'incarnation_hash' '')
+        $incarnationSource = [string](Get-ObjectValue $cron 'incarnation_source' '')
+        $toolUseIdHash = [string](Get-ObjectValue $cron 'tool_use_id_hash' '')
+        $ownerPidProperty = $cron.PSObject.Properties['scheduler_owner_pid']
+        $ownerProcessStartedProperty = $cron.PSObject.Properties['scheduler_owner_process_started_unix_ms']
+        $ownerLockAcquiredProperty = $cron.PSObject.Properties['scheduler_owner_lock_acquired_unix_ms']
+        $ownerLockHash = [string](Get-ObjectValue $cron 'scheduler_owner_lock_hash' '')
+        $ownerState = [string](Get-ObjectValue $cron 'scheduler_owner_state' '')
+        try {
+          if (-not [IO.Path]::IsPathRooted($projectRoot)) { throw 'project root is not absolute' }
+          $projectRoot = [IO.Path]::GetFullPath($projectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        } catch {
+          $valid = $false
+          continue
+        }
+        $registered = @($sessions | Where-Object {
+            [string](Get-ObjectValue $_ 'session_id' '') -eq $sessionId -and
+            [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $projectRoot, [StringComparison]::OrdinalIgnoreCase)
+          })
+        if ($id -notmatch '^[a-f0-9]{8}$' -or -not $cronIds.Add($id) -or
+            $registered.Count -ne 1 -or $null -eq $recurringProperty -or $recurringProperty.Value -isnot [bool] -or
+            $null -eq $durableProperty -or $durableProperty.Value -isnot [bool] -or
+            $definitionHash -notmatch '^[a-f0-9]{64}$' -or $incarnationHash -notmatch '^[a-f0-9]{64}$' -or
+            $incarnationSource -notin @('file', 'tool') -or
+            ($toolUseIdHash -ne '' -and $toolUseIdHash -notmatch '^[a-f0-9]{64}$') -or
+            $ownerState -notin @('pending', 'bound') -or
+            $null -eq $ownerPidProperty -or ($ownerPidProperty.Value -isnot [int] -and $ownerPidProperty.Value -isnot [long]) -or
+            [int64]$ownerPidProperty.Value -lt 0 -or [int64]$ownerPidProperty.Value -gt [int]::MaxValue -or
+            $null -eq $ownerProcessStartedProperty -or ($ownerProcessStartedProperty.Value -isnot [int] -and $ownerProcessStartedProperty.Value -isnot [long]) -or
+            [int64]$ownerProcessStartedProperty.Value -lt 0 -or
+            $null -eq $ownerLockAcquiredProperty -or ($ownerLockAcquiredProperty.Value -isnot [int] -and $ownerLockAcquiredProperty.Value -isnot [long]) -or
+            [int64]$ownerLockAcquiredProperty.Value -lt 0 -or
+            ($ownerState -eq 'pending' -and
+              ([int64]$ownerPidProperty.Value -ne 0 -or [int64]$ownerProcessStartedProperty.Value -ne 0 -or
+                [int64]$ownerLockAcquiredProperty.Value -ne 0 -or -not [string]::IsNullOrEmpty($ownerLockHash))) -or
+            ($ownerState -eq 'bound' -and
+              ([int64]$ownerPidProperty.Value -le 0 -or [int64]$ownerProcessStartedProperty.Value -le 0 -or
+                [int64]$ownerLockAcquiredProperty.Value -le 0 -or $ownerLockHash -notmatch '^[a-f0-9]{64}$'))) {
+          $valid = $false
+          continue
+        }
+        $crons.Add([pscustomobject]@{
+            id = $id
+            session_id = $sessionId
+            project_root = $projectRoot
+            recurring = [bool]$recurringProperty.Value
+            durable = [bool]$durableProperty.Value
+            definition_hash = $definitionHash
+            incarnation_hash = $incarnationHash
+            incarnation_source = $incarnationSource
+            tool_use_id_hash = $toolUseIdHash
+            scheduler_owner_state = $ownerState
+            scheduler_owner_pid = [int]$ownerPidProperty.Value
+            scheduler_owner_process_started_unix_ms = [int64]$ownerProcessStartedProperty.Value
+            scheduler_owner_lock_acquired_unix_ms = [int64]$ownerLockAcquiredProperty.Value
+            scheduler_owner_lock_hash = $ownerLockHash
+          })
+      }
+      $snapshotsProperty = $previous.PSObject.Properties['project_snapshots']
+      if ($null -eq $snapshotsProperty -or $snapshotsProperty.Value -isnot [array]) {
+        $valid = $false
+      } else {
+        foreach ($rawSnapshot in @($snapshotsProperty.Value)) {
+          $snapshot = ConvertTo-AudnCodeCronProjectSnapshot -Snapshot $rawSnapshot
+          if ($null -eq $snapshot -or -not $snapshotRoots.Add([string]$snapshot.project_root)) {
+            $valid = $false
+            continue
+          }
+          $snapshots.Add($snapshot)
+        }
+      }
+      $deleteClaimsProperty = $previous.PSObject.Properties['delete_claims']
+      if ($null -eq $deleteClaimsProperty -or $deleteClaimsProperty.Value -isnot [array]) {
+        $valid = $false
+      } else {
+        foreach ($claim in @($deleteClaimsProperty.Value)) {
+          $claimId = ([string](Get-ObjectValue $claim 'id' '')).Trim().ToLowerInvariant()
+          $claimHash = [string](Get-ObjectValue $claim 'tool_use_id_hash' '')
+          $claimProofProperty = if ($null -ne $claim) { $claim.PSObject.Properties['transcript_proof_hash'] } else { $null }
+          $claimProofHash = if ($null -ne $claimProofProperty -and $claimProofProperty.Value -is [string]) {
+            [string]$claimProofProperty.Value
+          } else { '' }
+          $claimObservedProperty = if ($null -ne $claim) { $claim.PSObject.Properties['observed_unix_ms'] } else { $null }
+          if ($claimId -notmatch '^[a-f0-9]{8}$' -or $claimHash -notmatch '^[a-f0-9]{64}$' -or
+              ($null -ne $claimProofProperty -and
+                ($claimProofProperty.Value -isnot [string] -or
+                  (-not [string]::IsNullOrEmpty($claimProofHash) -and $claimProofHash -notmatch '^[a-f0-9]{64}$'))) -or
+              -not $deleteClaimHashes.Add($claimHash) -or $null -eq $claimObservedProperty -or
+              ($claimObservedProperty.Value -isnot [int] -and $claimObservedProperty.Value -isnot [long]) -or
+              [int64]$claimObservedProperty.Value -le 0) {
+            $valid = $false
+            continue
+          }
+          $deleteClaims.Add([pscustomobject]@{
+              id = $claimId
+              tool_use_id_hash = $claimHash
+              transcript_proof_hash = $claimProofHash
+              observed_unix_ms = [int64]$claimObservedProperty.Value
+            })
+        }
+      }
+      $retiredIdsProperty = $previous.PSObject.Properties['retired_session_cron_ids']
+      if ($null -eq $retiredIdsProperty) {
+        # Shape-1 runtime files predating transcript-bound delete receipts have
+        # no exact retirement ledger. Conservatively retain every observed ID
+        # so an upgrade can never reinterpret an old delete as a new lifetime.
+        foreach ($claim in @($deleteClaims.ToArray())) {
+          $claimId = [string](Get-ObjectValue $claim 'id' '')
+          if ($retiredSessionCronIdSet.Add($claimId)) { $retiredSessionCronIds.Add($claimId) }
+        }
+      } elseif ($retiredIdsProperty.Value -isnot [array]) {
+        $valid = $false
+      } else {
+        foreach ($rawRetiredId in @($retiredIdsProperty.Value)) {
+          if ($rawRetiredId -isnot [string]) {
+            $valid = $false
+            continue
+          }
+          $retiredId = ([string]$rawRetiredId).Trim().ToLowerInvariant()
+          if ($retiredId -notmatch '^[a-f0-9]{8}$' -or -not $retiredSessionCronIdSet.Add($retiredId)) {
+            $valid = $false
+            continue
+          }
+          $retiredSessionCronIds.Add($retiredId)
+        }
+      }
+      if ($retiredSessionCronIds.Count -gt 256) { $valid = $false }
+      foreach ($cron in @($crons.ToArray())) {
+        if (-not [bool](Get-ObjectValue $cron 'durable' $false) -and
+            $retiredSessionCronIdSet.Contains([string](Get-ObjectValue $cron 'id' ''))) {
+          $valid = $false
+        }
+      }
+    }
+    if ($null -eq $previous -and $hostProcessStartedUnixMs -le 0) { $valid = $false }
+    $registration = Get-ObjectValue $lockedOperations 'register_session'
+    $registrationId = ''
+    if ($null -ne $registration) {
+      $registrationId = [string](Get-ObjectValue $registration 'session_id' '')
+      $registrationRoot = [string](Get-ObjectValue $registration 'project_root' '')
+      $parsedRegistration = [Guid]::Empty
+      try {
+        if (-not [IO.Path]::IsPathRooted($registrationRoot)) { throw 'project root is not absolute' }
+        $registrationRoot = [IO.Path]::GetFullPath($registrationRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+      } catch {
+        $valid = $false
+        $registrationRoot = ''
+      }
+      if (-not [Guid]::TryParse($registrationId, [ref]$parsedRegistration) -or [string]::IsNullOrWhiteSpace($registrationRoot)) {
+        $valid = $false
+      } elseif ($sessionIds.Contains($registrationId)) {
+        $existing = @($sessions | Where-Object { [string](Get-ObjectValue $_ 'session_id' '') -eq $registrationId })
+        if ($existing.Count -ne 1 -or
+            -not [string]::Equals([string](Get-ObjectValue $existing[0] 'project_root' ''), $registrationRoot, [StringComparison]::OrdinalIgnoreCase)) {
+          $valid = $false
+        } else {
+          Set-RecordValue -Record $existing[0] -Name 'last_seen_unix_ms' -Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+        }
+      } else {
+        [void]$sessionIds.Add($registrationId)
+        $sessions.Add([pscustomobject]@{
+            session_id = $registrationId
+            project_root = $registrationRoot
+            last_seen_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        })
+      }
+    }
+    $mutation = Get-ObjectValue $lockedOperations 'mutation'
+    $mutationAction = if ($null -ne $mutation) { [string](Get-ObjectValue $mutation 'action' '') } else { '' }
+    $mutationId = if ($null -ne $mutation) { ([string](Get-ObjectValue $mutation 'id' '')).Trim().ToLowerInvariant() } else { '' }
+    $mutationRoot = if ($null -ne $mutation) { [string](Get-ObjectValue $mutation 'project_root' '') } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($mutationRoot)) {
+      try {
+        if (-not [IO.Path]::IsPathRooted($mutationRoot)) { throw 'project root is not absolute' }
+        $mutationRoot = [IO.Path]::GetFullPath($mutationRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+      } catch {
+        $valid = $false
+        $mutationRoot = ''
+      }
+    }
+    $deleteMutationKnown = $false
+    if ($mutationAction -eq 'delete' -and $mutationId -match '^[a-f0-9]{8}$' -and
+        -not [string]::IsNullOrWhiteSpace($mutationRoot)) {
+      $knownDeletes = @($crons | Where-Object {
+          [string](Get-ObjectValue $_ 'id' '') -eq $mutationId -and
+          [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $mutationRoot, [StringComparison]::OrdinalIgnoreCase)
+        })
+      $deleteMutationKnown = $knownDeletes.Count -eq 1
+    }
+
+    $effectiveSnapshot = $null
+    $incomingSnapshotRaw = Get-ObjectValue $lockedOperations 'file_snapshot'
+    if ($null -ne $incomingSnapshotRaw) {
+      $incomingSnapshot = ConvertTo-AudnCodeCronProjectSnapshot -Snapshot $incomingSnapshotRaw
+      if ($null -eq $incomingSnapshot) {
+        $valid = $false
+      } else {
+        $snapshotRoot = [string]$incomingSnapshot.project_root
+        $existingSnapshots = @($snapshots | Where-Object {
+            [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $snapshotRoot, [StringComparison]::OrdinalIgnoreCase)
+          })
+        if ($existingSnapshots.Count -gt 1) {
+          $valid = $false
+        } else {
+          $incomingIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+          foreach ($incomingId in @($incomingSnapshot.ids)) { [void]$incomingIds.Add([string]$incomingId) }
+          $ambiguousUnknown = $false
+          $ambiguousRemovedIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+          if ($existingSnapshots.Count -eq 0) {
+            # An empty file is a trustworthy startup baseline only when it was
+            # last written before the OS process lifetime. marker.startedAt is
+            # deliberately not used: AudnCode writes it later, after awaits.
+            $emptyBaselineCutoffUnixMs = $hostProcessStartedUnixMs
+            if ([string]$incomingSnapshot.lock_state -eq 'ok') {
+              $emptyBaselineCutoffUnixMs = [Math]::Max(
+                [int64]$emptyBaselineCutoffUnixMs,
+                [int64]$incomingSnapshot.lock_acquired_unix_ms
+              )
+            }
+            if ([string]$incomingSnapshot.file_state -eq 'ok' -and $incomingIds.Count -eq 0 -and
+                ([int64]$incomingSnapshot.last_write_unix_ms -le 0 -or
+                  [int64]$incomingSnapshot.last_write_unix_ms -ge $emptyBaselineCutoffUnixMs)) {
+              $ambiguousUnknown = $true
+            }
+            if ([string]$incomingSnapshot.lock_state -eq 'ok' -and
+                -not [bool](Get-ObjectValue (Get-AudnCodeCronNativeLockOwner -Snapshot $incomingSnapshot -HomePath $lockedInfo.home) 'valid' $false)) {
+              $ambiguousUnknown = $true
+            }
+          } else {
+            $existingSnapshot = $existingSnapshots[0]
+            $ambiguousUnknown = [bool](Get-ObjectValue $existingSnapshot 'ambiguous_unknown' $false)
+            foreach ($removedId in @((Get-ObjectValue $existingSnapshot 'ambiguous_removed_ids' @()))) {
+              [void]$ambiguousRemovedIds.Add([string]$removedId)
+            }
+            foreach ($incomingId in @($incomingIds)) {
+              if ($ambiguousRemovedIds.Contains($incomingId)) {
+                # The 8-hex upstream ID has no uniqueness guarantee. Once an
+                # incarnation disappeared without a causal boundary, seeing the
+                # same ID again is a new ambiguous incarnation, never a revival.
+                $valid = $false
+              }
+            }
+            $oldIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($oldId in @((Get-ObjectValue $existingSnapshot 'ids' @()))) { [void]$oldIds.Add([string]$oldId) }
+            $removedNow = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($oldId in @($oldIds)) {
+              if (-not $incomingIds.Contains($oldId)) {
+                [void]$removedNow.Add($oldId)
+                [void]$ambiguousRemovedIds.Add($oldId)
+              }
+            }
+            $fileChanged = (Get-AudnCodeCronFileSnapshotIdentity -Snapshot $existingSnapshot) -ne
+              (Get-AudnCodeCronFileSnapshotIdentity -Snapshot $incomingSnapshot)
+            if ($fileChanged -and $removedNow.Count -eq 0 -and $oldIds.Count -eq 0 -and $incomingIds.Count -eq 0) {
+              # An empty-to-empty rewrite or native lock replacement can hide a
+              # complete add/fire/delete roundtrip. No prompt/hash can identify
+              # which cron ran, so this ambiguity is intentionally unhealable.
+              $ambiguousUnknown = $true
+            }
+            [void]$snapshots.Remove($existingSnapshot)
+            [void]$snapshotRoots.Remove($snapshotRoot)
+          }
+          Set-RecordValue -Record $incomingSnapshot -Name 'ambiguous_unknown' -Value ([bool]$ambiguousUnknown)
+          Set-RecordValue -Record $incomingSnapshot -Name 'ambiguous_removed_ids' -Value @($ambiguousRemovedIds | Sort-Object)
+          Set-RecordValue -Record $incomingSnapshot -Name 'ambiguous' -Value `
+            ([bool]$ambiguousUnknown -or $ambiguousRemovedIds.Count -gt 0)
+          [void]$snapshotRoots.Add($snapshotRoot)
+          $snapshots.Add($incomingSnapshot)
+          $effectiveSnapshot = $incomingSnapshot
+        }
+      }
+    }
+    if ($null -ne $effectiveSnapshot) {
+      $snapshotRoot = [string](Get-ObjectValue $effectiveSnapshot 'project_root' '')
+      $visibleIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+      foreach ($visibleId in @((Get-ObjectValue $effectiveSnapshot 'ids' @()))) { [void]$visibleIds.Add([string]$visibleId) }
+      if ([string](Get-ObjectValue $effectiveSnapshot 'file_state' '') -eq 'ok' -and $visibleIds.Count -eq 0) {
+        foreach ($existingCron in @($crons.ToArray())) {
+          if (-not [bool](Get-ObjectValue $existingCron 'durable' $false) -or
+              -not [string]::Equals([string](Get-ObjectValue $existingCron 'project_root' ''), $snapshotRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+          }
+          if ([string](Get-ObjectValue $existingCron 'scheduler_owner_state' '') -eq 'pending') {
+            # A durable incarnation observed before the native O_EXCL lease was
+            # visible has no exact lifetime to close. Its disappearance is
+            # intentionally fail closed until a later visible incarnation can
+            # be bound; never invent the runtime host as scheduler owner.
+            continue
+          }
+          $ownerPid = [int](Get-ObjectValue $existingCron 'scheduler_owner_pid' 0)
+          $ownerProcessStartedUnixMs = [int64](Get-ObjectValue $existingCron 'scheduler_owner_process_started_unix_ms' 0)
+          $ownerExited = $false
+          $ownerProcess = if ($ownerPid -gt 0) { Get-Process -Id $ownerPid -ErrorAction SilentlyContinue } else { $null }
+          if ($ownerPid -le 0 -or $ownerProcessStartedUnixMs -le 0) {
+            $valid = $false
+          } elseif ($null -eq $ownerProcess) {
+            $ownerExited = $true
+          } else {
+            try {
+              $observedOwnerStart = ([DateTimeOffset]$ownerProcess.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+              $ownerExited = $observedOwnerStart -ne $ownerProcessStartedUnixMs
+            } catch { $valid = $false }
+          }
+          if (-not $ownerExited) { continue }
+          $cleanBoundary = $false
+          if ([string](Get-ObjectValue $effectiveSnapshot 'lock_state' '') -eq 'missing') {
+            $cleanBoundary = $true
+          } else {
+            $successorOwner = Get-AudnCodeCronNativeLockOwner -Snapshot $effectiveSnapshot -HomePath $lockedInfo.home
+            if ([bool](Get-ObjectValue $successorOwner 'valid' $false)) {
+              $successorStartedUnixMs = [int64](Get-ObjectValue $successorOwner 'process_started_unix_ms' 0)
+              $successorAcquiredUnixMs = [int64](Get-ObjectValue $successorOwner 'acquired_unix_ms' 0)
+              $fileLastWriteUnixMs = [int64](Get-ObjectValue $effectiveSnapshot 'last_write_unix_ms' 0)
+              $cleanBoundary = $fileLastWriteUnixMs -gt 0 -and
+                $fileLastWriteUnixMs -lt $successorStartedUnixMs -and
+                $fileLastWriteUnixMs -lt $successorAcquiredUnixMs
+            }
+          }
+          if ($cleanBoundary) {
+            $closedId = [string](Get-ObjectValue $existingCron 'id' '')
+            [void]$crons.Remove($existingCron)
+            [void]$cronIds.Remove($closedId)
+            $remainingRemoved = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($removedId in @((Get-ObjectValue $effectiveSnapshot 'ambiguous_removed_ids' @()))) {
+              if ([string]$removedId -ne $closedId) { [void]$remainingRemoved.Add([string]$removedId) }
+            }
+            Set-RecordValue -Record $effectiveSnapshot -Name 'ambiguous_removed_ids' -Value @($remainingRemoved | Sort-Object)
+            Set-RecordValue -Record $effectiveSnapshot -Name 'ambiguous' -Value `
+              ([bool](Get-ObjectValue $effectiveSnapshot 'ambiguous_unknown' $false) -or $remainingRemoved.Count -gt 0)
+          }
+        }
+      }
+    }
+    $schedulerOwnerState = 'pending'
+    $schedulerOwnerPid = 0
+    $schedulerOwnerProcessStartedUnixMs = [int64]0
+    $schedulerOwnerLockAcquiredUnixMs = [int64]0
+    $schedulerOwnerLockHash = ''
+    if ($null -ne $effectiveSnapshot -and [string](Get-ObjectValue $effectiveSnapshot 'lock_state' '') -eq 'ok') {
+      $schedulerOwner = Get-AudnCodeCronNativeLockOwner -Snapshot $effectiveSnapshot -HomePath $lockedInfo.home
+      if (-not [bool](Get-ObjectValue $schedulerOwner 'valid' $false)) {
+        $valid = $false
+      } else {
+        $schedulerOwnerState = 'bound'
+        $schedulerOwnerPid = [int](Get-ObjectValue $schedulerOwner 'pid' 0)
+        $schedulerOwnerProcessStartedUnixMs = [int64](Get-ObjectValue $schedulerOwner 'process_started_unix_ms' 0)
+        $schedulerOwnerLockAcquiredUnixMs = [int64](Get-ObjectValue $schedulerOwner 'acquired_unix_ms' 0)
+        $schedulerOwnerLockHash = [string](Get-ObjectValue $schedulerOwner 'content_hash' '')
+      }
+    }
+    foreach ($observedCron in @((Get-ObjectValue $lockedOperations 'observed_durable_crons' @()))) {
+      if ($null -eq $observedCron -or $observedCron -isnot [System.Management.Automation.PSCustomObject]) {
+        $valid = $false
+        continue
+      }
+      $observedId = ([string](Get-ObjectValue $observedCron 'id' '')).Trim().ToLowerInvariant()
+      $observedSessionId = [string](Get-ObjectValue $observedCron 'session_id' '')
+      $observedRoot = [string](Get-ObjectValue $observedCron 'project_root' '')
+      $observedRecurringProperty = $observedCron.PSObject.Properties['recurring']
+      $observedDefinitionHash = [string](Get-ObjectValue $observedCron 'definition_hash' '')
+      $observedIncarnationHash = [string](Get-ObjectValue $observedCron 'incarnation_hash' '')
+      $parsedObservedSession = [Guid]::Empty
+      try {
+        if (-not [IO.Path]::IsPathRooted($observedRoot)) { throw 'project root is not absolute' }
+        $observedRoot = [IO.Path]::GetFullPath($observedRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+      } catch {
+        $valid = $false
+        continue
+      }
+      $registered = @($sessions | Where-Object {
+          [string](Get-ObjectValue $_ 'session_id' '') -eq $observedSessionId -and
+          [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $observedRoot, [StringComparison]::OrdinalIgnoreCase)
+        })
+      if ($observedId -notmatch '^[a-f0-9]{8}$' -or
+          -not [Guid]::TryParse($observedSessionId, [ref]$parsedObservedSession) -or
+          $registered.Count -ne 1 -or $null -eq $observedRecurringProperty -or
+          $observedRecurringProperty.Value -isnot [bool] -or
+          $observedDefinitionHash -notmatch '^[a-f0-9]{64}$' -or
+          $observedIncarnationHash -notmatch '^[a-f0-9]{64}$') {
+        $valid = $false
+        continue
+      }
+      if ($cronIds.Contains($observedId)) {
+        $existing = @($crons | Where-Object { [string](Get-ObjectValue $_ 'id' '') -eq $observedId })
+        if ($existing.Count -ne 1 -or
+            -not [string]::Equals([string](Get-ObjectValue $existing[0] 'project_root' ''), $observedRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [bool](Get-ObjectValue $existing[0] 'durable' $false) -or
+            [string](Get-ObjectValue $existing[0] 'definition_hash' '') -ne $observedDefinitionHash) {
+          $valid = $false
+        } elseif ([string](Get-ObjectValue $existing[0] 'incarnation_source' '') -eq 'file') {
+          if ([string](Get-ObjectValue $existing[0] 'incarnation_hash' '') -ne $observedIncarnationHash) { $valid = $false }
+        } else {
+          Set-RecordValue -Record $existing[0] -Name 'incarnation_hash' -Value $observedIncarnationHash
+          Set-RecordValue -Record $existing[0] -Name 'incarnation_source' -Value 'file'
+        }
+        if ($schedulerOwnerState -eq 'bound') {
+          # Bind or rebind only while the exact file incarnation remains visible
+          # under a stable native scheduler lease.
+          Set-RecordValue -Record $existing[0] -Name 'scheduler_owner_state' -Value 'bound'
+          Set-RecordValue -Record $existing[0] -Name 'scheduler_owner_pid' -Value ([int]$schedulerOwnerPid)
+          Set-RecordValue -Record $existing[0] -Name 'scheduler_owner_process_started_unix_ms' -Value ([int64]$schedulerOwnerProcessStartedUnixMs)
+          Set-RecordValue -Record $existing[0] -Name 'scheduler_owner_lock_acquired_unix_ms' -Value ([int64]$schedulerOwnerLockAcquiredUnixMs)
+          Set-RecordValue -Record $existing[0] -Name 'scheduler_owner_lock_hash' -Value $schedulerOwnerLockHash
+        }
+        continue
+      }
+      [void]$cronIds.Add($observedId)
+      $crons.Add([pscustomobject]@{
+          id = $observedId
+          session_id = $observedSessionId
+          project_root = $observedRoot
+          recurring = [bool]$observedRecurringProperty.Value
+          durable = $true
+          definition_hash = $observedDefinitionHash
+          incarnation_hash = $observedIncarnationHash
+          incarnation_source = 'file'
+          tool_use_id_hash = ''
+          scheduler_owner_state = $schedulerOwnerState
+          scheduler_owner_pid = [int]$schedulerOwnerPid
+          scheduler_owner_process_started_unix_ms = [int64]$schedulerOwnerProcessStartedUnixMs
+          scheduler_owner_lock_acquired_unix_ms = [int64]$schedulerOwnerLockAcquiredUnixMs
+          scheduler_owner_lock_hash = $schedulerOwnerLockHash
+        })
+    }
+    if ($null -ne $mutation) {
+      $mutationValidProperty = $mutation.PSObject.Properties['valid']
+      $action = $mutationAction
+      $id = $mutationId
+      if ($null -eq $mutationValidProperty -or $mutationValidProperty.Value -isnot [bool] -or
+          -not [bool]$mutationValidProperty.Value -or $id -notmatch '^[a-f0-9]{8}$' -or
+          $action -notin @('create', 'delete')) {
+        $valid = $false
+      } elseif ($action -eq 'delete') {
+        $deleteToolUseHash = [string](Get-ObjectValue $mutation 'tool_use_id_hash' '')
+        $deleteTranscriptProofHash = [string](Get-ObjectValue $mutation 'transcript_proof_hash' '')
+        $deleteSessionId = [string](Get-ObjectValue $mutation 'session_id' '')
+        $deleteRuntimeKey = [string](Get-ObjectValue $mutation 'runtime_key' '')
+        $parsedDeleteSession = [Guid]::Empty
+        $registeredDeleteSessions = @($sessions | Where-Object {
+            [string](Get-ObjectValue $_ 'session_id' '') -eq $deleteSessionId -and
+            [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $mutationRoot, [StringComparison]::OrdinalIgnoreCase)
+          })
+        $isDeleteOriginRuntime = $deleteRuntimeKey -eq [string]$lockedInfo.key
+        if ([string]::IsNullOrWhiteSpace($mutationRoot) -or $deleteToolUseHash -notmatch '^[a-f0-9]{64}$' -or
+            $deleteTranscriptProofHash -notmatch '^[a-f0-9]{64}$' -or
+            $deleteRuntimeKey -notmatch '^[a-f0-9]{64}$' -or
+            -not [Guid]::TryParse($deleteSessionId, [ref]$parsedDeleteSession) -or
+            ($isDeleteOriginRuntime -and $registeredDeleteSessions.Count -ne 1)) {
+          $valid = $false
+        } else {
+          $deleteReceiptFresh = $false
+          $deleteIdFresh = $false
+          if ($deleteClaimHashes.Add($deleteToolUseHash)) {
+            $deleteReceiptFresh = $true
+            $deleteClaims.Add([pscustomobject]@{
+                id = $id
+                tool_use_id_hash = $deleteToolUseHash
+                transcript_proof_hash = $deleteTranscriptProofHash
+                observed_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+              })
+          } else {
+            $matchingDeleteClaims = @($deleteClaims | Where-Object {
+                [string](Get-ObjectValue $_ 'tool_use_id_hash' '') -eq $deleteToolUseHash
+              })
+            if ($matchingDeleteClaims.Count -ne 1 -or
+                [string](Get-ObjectValue $matchingDeleteClaims[0] 'id' '') -ne $id) {
+              $valid = $false
+            }
+          }
+          if ($isDeleteOriginRuntime -and $deleteReceiptFresh) {
+            if (-not $retiredSessionCronIdSet.Contains($id)) {
+              if ($retiredSessionCronIds.Count -ge 256) {
+                $valid = $false
+              } else {
+                [void]$retiredSessionCronIdSet.Add($id)
+                $retiredSessionCronIds.Add($id)
+                $deleteIdFresh = $true
+              }
+            }
+          }
+          if ($valid -and $deleteReceiptFresh -and $deleteIdFresh -and
+              $deleteMutationKnown -and $isDeleteOriginRuntime) {
+            $sessionOnlyTargets = @($crons | Where-Object {
+                [string](Get-ObjectValue $_ 'id' '') -eq $id -and
+                [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $mutationRoot, [StringComparison]::OrdinalIgnoreCase) -and
+                -not [bool](Get-ObjectValue $_ 'durable' $false)
+              })
+            if ($sessionOnlyTargets.Count -gt 1) {
+              $valid = $false
+            } elseif ($sessionOnlyTargets.Count -eq 1) {
+              $sessionOnlyTarget = $sessionOnlyTargets[0]
+              $expectedOwnerHash = Get-Sha256Hex 'audncode/session-cron-owner/v1'
+              if ([string](Get-ObjectValue $sessionOnlyTarget 'incarnation_source' '') -ne 'tool' -or
+                  [string](Get-ObjectValue $sessionOnlyTarget 'tool_use_id_hash' '') -notmatch '^[a-f0-9]{64}$' -or
+                  [string](Get-ObjectValue $sessionOnlyTarget 'scheduler_owner_state' '') -ne 'bound' -or
+                  [int](Get-ObjectValue $sessionOnlyTarget 'scheduler_owner_pid' 0) -ne [int]$lockedInfo.pid -or
+                  [int64](Get-ObjectValue $sessionOnlyTarget 'scheduler_owner_process_started_unix_ms' 0) -ne $hostProcessStartedUnixMs -or
+                  [int64](Get-ObjectValue $sessionOnlyTarget 'scheduler_owner_lock_acquired_unix_ms' 0) -ne $hostProcessStartedUnixMs -or
+                  [string](Get-ObjectValue $sessionOnlyTarget 'scheduler_owner_lock_hash' '') -ne $expectedOwnerHash) {
+                $valid = $false
+              } else {
+                # A correlated CronDelete is terminal proof only for a
+                # session-only incarnation owned by this exact AudnCode host.
+                # Durable jobs remain governed by the native scheduler lease.
+                [void]$crons.Remove($sessionOnlyTarget)
+                [void]$cronIds.Remove($id)
+              }
+            }
+          }
+        }
+      } else {
+        $mutationSessionId = [string](Get-ObjectValue $mutation 'session_id' '')
+        $mutationRoot = [string]$mutationRoot
+        $recurringProperty = $mutation.PSObject.Properties['recurring']
+        $durableProperty = $mutation.PSObject.Properties['durable']
+        $mutationDefinitionHash = [string](Get-ObjectValue $mutation 'definition_hash' '')
+        $mutationIncarnationHash = [string](Get-ObjectValue $mutation 'incarnation_hash' '')
+        try {
+          if (-not [IO.Path]::IsPathRooted($mutationRoot)) { throw 'project root is not absolute' }
+          $mutationRoot = [IO.Path]::GetFullPath($mutationRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        } catch {
+          $valid = $false
+          $mutationRoot = ''
+        }
+        $registered = @($sessions | Where-Object {
+            [string](Get-ObjectValue $_ 'session_id' '') -eq $mutationSessionId -and
+            [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $mutationRoot, [StringComparison]::OrdinalIgnoreCase)
+          })
+        if ($registered.Count -ne 1 -or $null -eq $recurringProperty -or $recurringProperty.Value -isnot [bool] -or
+            $null -eq $durableProperty -or $durableProperty.Value -isnot [bool] -or
+            $mutationDefinitionHash -notmatch '^[a-f0-9]{64}$' -or
+            $mutationIncarnationHash -notmatch '^[a-f0-9]{64}$') {
+          $valid = $false
+        } elseif ($retiredSessionCronIdSet.Contains($id)) {
+          # Upstream cron IDs are reusable. Once any delete for an ID was
+          # observed in this host lifetime, accepting a later create would let
+          # a delayed receipt target the wrong incarnation.
+          $valid = $false
+        } elseif ($cronIds.Contains($id)) {
+          $existing = @($crons | Where-Object { [string](Get-ObjectValue $_ 'id' '') -eq $id })
+          if ($existing.Count -ne 1 -or
+              [string](Get-ObjectValue $existing[0] 'session_id' '') -ne $mutationSessionId -or
+              -not [string]::Equals([string](Get-ObjectValue $existing[0] 'project_root' ''), $mutationRoot, [StringComparison]::OrdinalIgnoreCase) -or
+              [bool](Get-ObjectValue $existing[0] 'recurring' $false) -ne [bool]$recurringProperty.Value -or
+              [bool](Get-ObjectValue $existing[0] 'durable' $false) -ne [bool]$durableProperty.Value -or
+              [string](Get-ObjectValue $existing[0] 'definition_hash' '') -ne $mutationDefinitionHash -or
+              ([string](Get-ObjectValue $existing[0] 'incarnation_source' '') -eq 'tool' -and
+                [string](Get-ObjectValue $existing[0] 'incarnation_hash' '') -ne $mutationIncarnationHash) -or
+              (-not [string]::IsNullOrEmpty([string](Get-ObjectValue $existing[0] 'tool_use_id_hash' '')) -and
+                [string](Get-ObjectValue $existing[0] 'tool_use_id_hash' '') -ne [string](Get-ObjectValue $mutation 'tool_use_id_hash' ''))) {
+            $valid = $false
+          } elseif ([string]::IsNullOrEmpty([string](Get-ObjectValue $existing[0] 'tool_use_id_hash' ''))) {
+            Set-RecordValue -Record $existing[0] -Name 'tool_use_id_hash' -Value ([string](Get-ObjectValue $mutation 'tool_use_id_hash' ''))
+          }
+        } else {
+          $mutationOwnerState = $schedulerOwnerState
+          $mutationOwnerPid = [int]$schedulerOwnerPid
+          $mutationOwnerProcessStartedUnixMs = [int64]$schedulerOwnerProcessStartedUnixMs
+          $mutationOwnerLockAcquiredUnixMs = [int64]$schedulerOwnerLockAcquiredUnixMs
+          $mutationOwnerLockHash = $schedulerOwnerLockHash
+          if (-not [bool]$durableProperty.Value) {
+            $mutationOwnerState = 'bound'
+            $mutationOwnerPid = [int]$lockedInfo.pid
+            $mutationOwnerProcessStartedUnixMs = [int64]$hostProcessStartedUnixMs
+            $mutationOwnerLockAcquiredUnixMs = [int64]$hostProcessStartedUnixMs
+            $mutationOwnerLockHash = Get-Sha256Hex 'audncode/session-cron-owner/v1'
+          }
+          [void]$cronIds.Add($id)
+          $crons.Add([pscustomobject]@{
+              id = $id
+              session_id = $mutationSessionId
+              project_root = $mutationRoot
+              recurring = [bool]$recurringProperty.Value
+              durable = [bool]$durableProperty.Value
+              definition_hash = $mutationDefinitionHash
+              incarnation_hash = $mutationIncarnationHash
+              incarnation_source = 'tool'
+              tool_use_id_hash = [string](Get-ObjectValue $mutation 'tool_use_id_hash' '')
+              scheduler_owner_state = $mutationOwnerState
+              scheduler_owner_pid = $mutationOwnerPid
+              scheduler_owner_process_started_unix_ms = $mutationOwnerProcessStartedUnixMs
+              scheduler_owner_lock_acquired_unix_ms = $mutationOwnerLockAcquiredUnixMs
+              scheduler_owner_lock_hash = $mutationOwnerLockHash
+            })
+        }
+      }
+    }
+    # /clear creates a new logical session in the same host. Keep every cron
+    # owner plus the currently registered session, then retain only the newest
+    # idle lineage up to a compact target. Historical no-cron sessions must not
+    # permanently poison an otherwise observable runtime.
+    $ownerIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($cron in @($crons.ToArray())) { [void]$ownerIds.Add([string](Get-ObjectValue $cron 'session_id' '')) }
+    if ($ownerIds.Count -gt 256) { $valid = $false }
+    $retainedIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($ownerId in @($ownerIds)) { [void]$retainedIds.Add($ownerId) }
+    if (-not [string]::IsNullOrWhiteSpace($registrationId)) { [void]$retainedIds.Add($registrationId) }
+    foreach ($session in @($sessions.ToArray() | Sort-Object {
+          [int64](Get-ObjectValue $_ 'last_seen_unix_ms' 0)
+        } -Descending)) {
+      if ($retainedIds.Count -ge 48) { break }
+      [void]$retainedIds.Add([string](Get-ObjectValue $session 'session_id' ''))
+    }
+    if ($sessions.Count -gt $retainedIds.Count) {
+      $compactedSessions = New-Object 'System.Collections.Generic.List[object]'
+      foreach ($session in @($sessions.ToArray())) {
+        if ($retainedIds.Contains([string](Get-ObjectValue $session 'session_id' ''))) { $compactedSessions.Add($session) }
+      }
+      $sessions = $compactedSessions
+    }
+    foreach ($session in @($sessions.ToArray())) {
+      $sessionRoot = [string](Get-ObjectValue $session 'project_root' '')
+      if (@($snapshots | Where-Object {
+            [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $sessionRoot, [StringComparison]::OrdinalIgnoreCase)
+          }).Count -ne 1) { $valid = $false }
+    }
+    while ($deleteClaims.Count -gt 256) { $deleteClaims.RemoveAt(0) }
+    if ($sessions.Count -eq 0 -or $crons.Count -gt 256 -or $snapshots.Count -gt 256 -or
+        $hostProcessStartedUnixMs -le 0 -or
+        $hostProcessStartedUnixMs -gt [int64]$lockedInfo.started_unix_ms -or
+        ([int64]$lockedInfo.started_unix_ms - $hostProcessStartedUnixMs) -gt 120000 -or
+        $lockedInvalidate) { $valid = $false }
+    $preObservationOnly = [bool]$valid -and -not [bool]$lockedInfo.observation_allowed
+    $valid = [bool]$valid -and [bool]$lockedInfo.observation_allowed
+    $state = [ordered]@{
+      schema = 1
+      kind = 'audncode-cron-runtime'
+      audncode_home = [string]$lockedInfo.home
+      host_pid = [int]$lockedInfo.pid
+      host_started_unix_ms = [int64]$lockedInfo.started_unix_ms
+      host_process_started_unix_ms = [int64]$hostProcessStartedUnixMs
+      hook_generation = [string]$lockedInfo.hook_generation
+      hook_installed_unix_ms = [int64]$lockedInfo.hook_installed_unix_ms
+      registry_valid = [bool]$valid
+      pre_observation_only = [bool]$preObservationOnly
+      sessions = @($sessions.ToArray())
+      crons = @($crons.ToArray())
+      project_snapshots = @($snapshots.ToArray())
+      delete_claims = @($deleteClaims.ToArray())
+      retired_session_cron_ids = @($retiredSessionCronIds.ToArray())
+      updated_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    }
+    $stateObject = [pscustomobject]$state
+    if ($lockedValidateOnly) {
+      # Finality must never repair or canonicalize evidence before deciding
+      # whether it is trustworthy. Re-run the ordinary parser in memory, then
+      # require byte-independent canonical equality with the exact persisted
+      # shape (apart from the intentionally refreshed timestamp).
+      if ($null -eq $previous -or $null -ne $registration -or $null -ne $mutation -or
+          @($lockedOperations.observed_durable_crons).Count -gt 0 -or
+          $null -ne $lockedOperations.file_snapshot -or
+          [int64]$lockedOperations.host_process_started_unix_ms -gt 0 -or $lockedInvalidate) {
+        return $null
+      }
+      $updatedProperty = $previous.PSObject.Properties['updated_unix_ms']
+      if ($null -eq $updatedProperty -or
+          ($updatedProperty.Value -isnot [int] -and $updatedProperty.Value -isnot [long]) -or
+          [int64]$updatedProperty.Value -le 0) { return $null }
+      Set-RecordValue -Record $stateObject -Name 'updated_unix_ms' -Value ([int64]$updatedProperty.Value)
+      if ((ConvertTo-CompactJson $previous) -cne (ConvertTo-CompactJson $stateObject)) { return $null }
+      return $stateObject
+    }
+    Write-JsonAtomic -Path $lockedInfo.path -Value $stateObject
+    return $stateObject
+  } -Arguments @($RuntimeInfo, $operations, [bool]$Invalidate, [bool]$ValidateOnly)
+}
+
+function Update-AudnCodeCronProjectMutation {
+  param(
+    [object]$CurrentRuntimeInfo,
+    [string]$HomePath,
+    [string]$ProjectRoot,
+    [object]$Mutation
+  )
+
+  if ($null -eq $CurrentRuntimeInfo -or $null -eq $Mutation) { return $null }
+  $projectLockInfo = Get-AudnCodeCronProjectLockInfo -HomePath $HomePath -ProjectRoot $ProjectRoot
+  if ($null -eq $projectLockInfo) { return $null }
+  return Invoke-WithClaudeSessionLock -Info $projectLockInfo -Action {
+    param($lockedProjectLockInfo, $lockedCurrentRuntimeInfo, $lockedMutation)
+    $lockedHome = [string]$lockedProjectLockInfo.home
+    $lockedProjectRoot = [string]$lockedProjectLockInfo.project_root
+    $fileState = Read-AudnCodeDurableCronFileState -ProjectRoot $lockedProjectRoot
+    if ([string](Get-ObjectValue $fileState 'state' 'unknown') -ne 'ok') {
+      [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+      return $null
+    }
+    $mutationAction = [string](Get-ObjectValue $lockedMutation 'action' '')
+    $mutationId = ([string](Get-ObjectValue $lockedMutation 'id' '')).Trim().ToLowerInvariant()
+    if ($mutationAction -notin @('create', 'delete') -or $mutationId -notmatch '^[a-f0-9]{8}$' -or
+        -not [string]::Equals([string](Get-ObjectValue $lockedMutation 'project_root' ''), $lockedProjectRoot, [StringComparison]::OrdinalIgnoreCase)) {
+      [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+      return $null
+    }
+
+    $runtimeFiles = @(Get-ChildItem -LiteralPath $ClaudeSessionsDir -Filter 'audn-cron-*.json' -File -Force -ErrorAction SilentlyContinue)
+    if ($runtimeFiles.Count -eq 0 -or $runtimeFiles.Count -gt 512) {
+      [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+      return $null
+    }
+    $targets = New-Object 'System.Collections.Generic.List[object]'
+    $targetKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($runtimeFile in $runtimeFiles) {
+      $stableRuntime = Read-AudnCodeStableUtf8FileSnapshot `
+        -RootPath $ClaudeSessionsDir `
+        -Path $runtimeFile.FullName `
+        -MaxBytes 16MB
+      if ([string](Get-ObjectValue $stableRuntime 'state' 'unknown') -ne 'ok') {
+        [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+        return $null
+      }
+      try { $runtimeState = ConvertFrom-StrictJsonText -Text ([string]$stableRuntime.raw) } catch {
+        [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+        return $null
+      }
+      if ([string](Get-ObjectValue $runtimeState 'kind' '') -ne 'audncode-cron-runtime' -or
+          -not [string]::Equals([string](Get-ObjectValue $runtimeState 'audncode_home' ''), $lockedHome, [StringComparison]::OrdinalIgnoreCase)) {
+        continue
+      }
+      $rawSessionsProperty = $runtimeState.PSObject.Properties['sessions']
+      if ($null -eq $rawSessionsProperty -or $rawSessionsProperty.Value -isnot [array]) {
+        [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+        return $null
+      }
+      $rawMatchingSessions = @(@($rawSessionsProperty.Value) | Where-Object {
+          [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $lockedProjectRoot, [StringComparison]::OrdinalIgnoreCase)
+        })
+      if ($rawMatchingSessions.Count -eq 0) { continue }
+      $runtimeProcessStartedProperty = $runtimeState.PSObject.Properties['host_process_started_unix_ms']
+      if ($null -eq $runtimeProcessStartedProperty -or
+          ($runtimeProcessStartedProperty.Value -isnot [int] -and $runtimeProcessStartedProperty.Value -isnot [long])) {
+        [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+        return $null
+      }
+      $runtimeHostStarted = [int64](Get-ObjectValue $runtimeState 'host_started_unix_ms' 0)
+      $runtimeProcessStarted = [int64]$runtimeProcessStartedProperty.Value
+      $runtimeMarker = Get-AudnCodeCronObservationMarker `
+        -HomePath $lockedHome `
+        -HostStartedUnixMs $runtimeHostStarted `
+        -HostProcessStartedUnixMs $runtimeProcessStarted
+      if (-not [bool](Get-ObjectValue $runtimeMarker 'ok' $false) -or
+          [string](Get-ObjectValue $runtimeMarker 'generation' '') -ne [string](Get-ObjectValue $runtimeState 'hook_generation' '') -or
+          [int64](Get-ObjectValue $runtimeMarker 'installed_unix_ms' 0) -ne [int64](Get-ObjectValue $runtimeState 'hook_installed_unix_ms' 0)) {
+        [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+        return $null
+      }
+      $runtimeInfo = Get-AudnCodeCronRuntimeStateInfo `
+        -HomePath $lockedHome `
+        -HostPid ([int](Get-ObjectValue $runtimeState 'host_pid' 0)) `
+        -HostStartedUnixMs $runtimeHostStarted `
+        -HookGeneration ([string](Get-ObjectValue $runtimeState 'hook_generation' '')) `
+        -HookInstalledUnixMs ([int64](Get-ObjectValue $runtimeState 'hook_installed_unix_ms' 0)) `
+        -ObservationAllowed ([bool](Get-ObjectValue $runtimeMarker 'host_observable' $false))
+      if ($null -eq $runtimeInfo -or
+          -not [string]::Equals([IO.Path]::GetFullPath([string]$runtimeInfo.path), [IO.Path]::GetFullPath($runtimeFile.FullName), [StringComparison]::OrdinalIgnoreCase) -or
+          -not $targetKeys.Add([string]$runtimeInfo.key)) {
+        [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+        return $null
+      }
+      $validatedRuntimeState = Update-AudnCodeCronRuntimeState -RuntimeInfo $runtimeInfo -ValidateOnly
+      if ($null -eq $validatedRuntimeState) {
+        [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+        return $null
+      }
+      $runtimeState = $validatedRuntimeState
+      $matchingSessions = @(@((Get-ObjectValue $runtimeState 'sessions' @())) | Where-Object {
+          [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $lockedProjectRoot, [StringComparison]::OrdinalIgnoreCase)
+        } | Sort-Object { [int64](Get-ObjectValue $_ 'last_seen_unix_ms' 0) } -Descending)
+      if ($matchingSessions.Count -eq 0) { continue }
+      $containsMutationId = @(@((Get-ObjectValue $runtimeState 'crons' @())) | Where-Object {
+          [string](Get-ObjectValue $_ 'id' '') -eq $mutationId -and
+          [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $lockedProjectRoot, [StringComparison]::OrdinalIgnoreCase)
+        }).Count -eq 1
+      $targets.Add([pscustomobject]@{
+          info = $runtimeInfo
+          owner_session_id = [string](Get-ObjectValue $matchingSessions[0] 'session_id' '')
+          contains_mutation_id = [bool]$containsMutationId
+          is_current = [string]$runtimeInfo.key -eq [string]$lockedCurrentRuntimeInfo.key
+        })
+    }
+    if (@($targets | Where-Object { [bool](Get-ObjectValue $_ 'is_current' $false) }).Count -ne 1) {
+      [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedCurrentRuntimeInfo -Invalidate)
+      return $null
+    }
+
+    $result = $null
+    foreach ($target in @($targets.ToArray() | Sort-Object { [string](Get-ObjectValue (Get-ObjectValue $_ 'info') 'key' '') })) {
+      $targetInfo = Get-ObjectValue $target 'info'
+      $ownerSessionId = [string](Get-ObjectValue $target 'owner_session_id' '')
+      $observed = New-Object 'System.Collections.Generic.List[object]'
+      foreach ($entry in @((Get-ObjectValue $fileState 'entries' @()))) {
+        $observed.Add([pscustomobject]@{
+            id = [string](Get-ObjectValue $entry 'id' '')
+            session_id = $ownerSessionId
+            project_root = $lockedProjectRoot
+            recurring = [bool](Get-ObjectValue $entry 'recurring' $false)
+            definition_hash = [string](Get-ObjectValue $entry 'definition_hash' '')
+            incarnation_hash = [string](Get-ObjectValue $entry 'incarnation_hash' '')
+          })
+      }
+      $targetMutation = $null
+      if ($mutationAction -eq 'delete' -and
+          ([bool](Get-ObjectValue $target 'contains_mutation_id' $false) -or [bool](Get-ObjectValue $target 'is_current' $false))) {
+        $targetMutation = $lockedMutation
+      } elseif ($mutationAction -eq 'create' -and [bool](Get-ObjectValue $target 'is_current' $false)) {
+        $targetMutation = $lockedMutation
+      }
+      $updated = Update-AudnCodeCronRuntimeState `
+        -RuntimeInfo $targetInfo `
+        -Mutation $targetMutation `
+        -ObservedDurableCrons @($observed.ToArray()) `
+        -FileSnapshot (Get-ObjectValue $fileState 'snapshot')
+      $updatedUsable = $null -ne $updated -and $(if ([bool](Get-ObjectValue $targetInfo 'observation_allowed' $false)) {
+          [bool](Get-ObjectValue $updated 'registry_valid' $false) -and
+            -not [bool](Get-ObjectValue $updated 'pre_observation_only' $false)
+        } else {
+          -not [bool](Get-ObjectValue $updated 'registry_valid' $true) -and
+            [bool](Get-ObjectValue $updated 'pre_observation_only' $false)
+        })
+      if (-not $updatedUsable) {
+        return $null
+      }
+      if ([bool](Get-ObjectValue $target 'is_current' $false)) { $result = $updated }
+    }
+    return $result
+  } -Arguments @($projectLockInfo, $CurrentRuntimeInfo, $Mutation)
+}
+
+function Update-AudnCodeCronFromToolEvent {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [int64]$HookStartTicks,
+    [object]$HookInput,
+    [object]$LifecycleArm
+  )
+
+  $mutation = ConvertFrom-AudnCodeCronToolEvent -HookInput $HookInput
+  if ($null -eq $mutation -or $null -eq $LifecycleArm -or
+      -not [bool](Get-ObjectValue $LifecycleArm 'armed' $false)) { return $false }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $false }
+  $correlation = Get-ObjectValue $LifecycleArm 'correlation'
+  $armToken = [string](Get-ObjectValue $LifecycleArm 'token' '')
+  if ($null -eq $correlation -or $armToken -notmatch '^[a-f0-9]{32}$') { return $false }
+  $armedSessionState = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedTranscriptPath, $lockedHookStartTicks, $lockedEpoch, $lockedToken)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $null }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'cron'
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+          -not [string]::Equals([string](Get-ObjectValue $state 'transcript_path' ''), $lockedTranscriptPath, [StringComparison]::OrdinalIgnoreCase) -or
+          [int64](Get-ObjectValue $state 'epoch' 0) -ne [int64]$lockedEpoch -or
+          -not [bool](Get-ObjectValue $pendingState 'valid' $false) -or
+          $lockedToken -notin @((Get-ObjectValue $pendingState 'tokens' @())) -or
+          [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0) -le 0 -or
+          $lockedHookStartTicks -le [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)) { return $null }
+      return $state
+    } -Arguments @($info.path, $SessionId, $TranscriptPath, $HookStartTicks, [int64]$correlation.epoch, $armToken)
+  if ($null -eq $armedSessionState -or [int]$correlation.host_pid -le 0 -or
+      [int64]$correlation.host_started_unix_ms -le 0 -or [string]::IsNullOrWhiteSpace([string]$correlation.home) -or
+      [string]::IsNullOrWhiteSpace([string]$correlation.project_root) -or
+      [string]$correlation.hook_generation -notmatch '^[a-f0-9]{32}$' -or
+      [int64]$correlation.hook_installed_unix_ms -le 0) { return $false }
+  $audnHostSession = Get-AudnCodeHostSession -SessionId $SessionId -HomePath ([string]$correlation.home) -ExpectedHostPid ([int]$correlation.host_pid)
+  if (-not [bool]$audnHostSession.ok -or
+      [int64]$audnHostSession.started_unix_ms -ne [int64]$correlation.host_started_unix_ms) { return $false }
+  $cronMarker = Get-AudnCodeCronObservationMarker `
+    -HomePath ([string]$correlation.home) `
+    -HostStartedUnixMs ([int64]$correlation.host_started_unix_ms) `
+    -HostProcessStartedUnixMs ([int64](Get-ObjectValue $audnHostSession 'process_started_unix_ms' 0))
+  if (-not [bool]$cronMarker.ok -or
+      [string]$cronMarker.generation -ne [string]$correlation.hook_generation -or
+      [int64]$cronMarker.installed_unix_ms -ne [int64]$correlation.hook_installed_unix_ms) { return $false }
+  $runtimeInfo = Get-AudnCodeCronRuntimeStateInfo `
+    -HomePath ([string]$correlation.home) `
+    -HostPid ([int]$correlation.host_pid) `
+    -HostStartedUnixMs ([int64]$correlation.host_started_unix_ms) `
+    -HookGeneration ([string]$cronMarker.generation) `
+    -HookInstalledUnixMs ([int64]$cronMarker.installed_unix_ms) `
+    -ObservationAllowed ([bool]$cronMarker.host_observable)
+  if ($null -eq $runtimeInfo -or [string]$runtimeInfo.key -ne [string]$correlation.cron_key) { return $false }
+  $guardInfo = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $runtimeInfo -RegistryKind 'cron'
+  $armedGuardInfo = Get-ObjectValue $LifecycleArm 'guard_info'
+  if ($null -eq $guardInfo -or $null -eq $armedGuardInfo -or
+      [string]$guardInfo.key -ne [string](Get-ObjectValue $armedGuardInfo 'key' '')) { return $false }
+  if ([bool](Get-ObjectValue $mutation 'valid' $false) -and
+      [string](Get-ObjectValue $mutation 'action' '') -eq 'delete') {
+    $deleteProof = Get-AudnCodeCronDeleteTranscriptProof `
+      -SessionState $armedSessionState `
+      -SessionId $SessionId `
+      -SessionEpoch ([int64]$correlation.epoch) `
+      -TranscriptPath $TranscriptPath `
+      -HomePath ([string]$correlation.home) `
+      -HookInput $HookInput
+    if (-not [bool](Get-ObjectValue $deleteProof 'ok' $false) -or
+        [string](Get-ObjectValue $deleteProof 'proof_hash' '') -notmatch '^[a-f0-9]{64}$') {
+      [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $runtimeInfo -Invalidate)
+      return $false
+    }
+    Set-RecordValue -Record $mutation -Name 'transcript_proof_hash' -Value ([string]$deleteProof.proof_hash)
+  }
+  if ([bool](Get-ObjectValue $mutation 'valid' $false)) {
+    Set-RecordValue -Record $mutation -Name 'session_id' -Value $SessionId
+    Set-RecordValue -Record $mutation -Name 'project_root' -Value ([string]$correlation.project_root)
+    Set-RecordValue -Record $mutation -Name 'runtime_key' -Value ([string]$runtimeInfo.key)
+  }
+  $runtimeState = if ([bool](Get-ObjectValue $mutation 'valid' $false)) {
+    Update-AudnCodeCronProjectMutation `
+      -CurrentRuntimeInfo $runtimeInfo `
+      -HomePath ([string]$correlation.home) `
+      -ProjectRoot ([string]$correlation.project_root) `
+      -Mutation $mutation
+  } else {
+    Update-AudnCodeCronRuntimeState -RuntimeInfo $runtimeInfo -Invalidate
+  }
+  if ($null -eq $runtimeState -or -not [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)) { return $false }
+  $guardState = Update-AudnCodeLifecycleGuard `
+    -GuardInfo $guardInfo `
+    -Operation 'commit' `
+    -Token $armToken
+  if ($null -eq $guardState -or -not [bool](Get-ObjectValue $guardState 'operation_committed' $false)) { return $false }
+  $sessionCommitted = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedEpoch, $lockedCronKey, $lockedRuntimeState, $lockedToken)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'cron'
+      $pendingTokens = @((Get-ObjectValue $pendingState 'tokens' @()))
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [int64](Get-ObjectValue $state 'epoch' 0) -ne [int64]$lockedEpoch -or
+          [string](Get-ObjectValue $state 'audncode_cron_runtime_key' '') -ne $lockedCronKey -or
+          -not [bool](Get-ObjectValue $pendingState 'valid' $false) -or
+          $lockedToken -notin $pendingTokens) { return $false }
+      $remainingTokens = @($pendingTokens | Where-Object { $_ -ne $lockedToken })
+      if (-not (Set-AudnCodeSessionLifecyclePendingTokens -Record $state -RegistryKind 'cron' -Tokens $remainingTokens)) { return $false }
+      $allCommitted = $remainingTokens.Count -eq 0
+      $previousLifecycleReason = [string](Get-ObjectValue $state 'audncode_cron_lifecycle_failure_reason' '')
+      $stickyLifecycleLoss = [bool](Get-ObjectValue $state 'audncode_cron_lifecycle_unverifiable' $false) -and
+        $previousLifecycleReason -ne 'audncode-cron-lifecycle-pending'
+      Set-RecordValue -Record $state -Name 'audncode_cron_registry_valid' -Value `
+        ([bool](Get-ObjectValue $lockedRuntimeState 'registry_valid' $false) -and $allCommitted -and -not $stickyLifecycleLoss)
+      Set-RecordValue -Record $state -Name 'audncode_cron_lifecycle_unverifiable' -Value `
+        ($stickyLifecycleLoss -or -not $allCommitted)
+      Set-RecordValue -Record $state -Name 'audncode_cron_lifecycle_failure_reason' -Value `
+        $(if ($stickyLifecycleLoss) {
+            if ([string]::IsNullOrWhiteSpace($previousLifecycleReason)) { 'audncode-cron-lifecycle-unverifiable' } else { $previousLifecycleReason }
+          } elseif ($allCommitted) { '' } else { 'audncode-cron-lifecycle-pending' })
+      Write-JsonAtomic -Path $lockedPath -Value $state
+      return $true
+    } -Arguments @($info.path, $SessionId, [int64]$correlation.epoch, [string]$runtimeInfo.key, $runtimeState, $armToken)
+  return [bool]$sessionCommitted
+}
+
+function Set-AudnCodeCronLifecycleUnverifiable {
+  param(
+    [string]$SessionId,
+    [int64]$HookStartTicks,
+    [object]$LifecycleArm,
+    [string]$Reason = 'audncode-cron-lifecycle-unverifiable'
+  )
+
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info -or $HookStartTicks -le 0) { return $false }
+  $guardInfo = if ($null -ne $LifecycleArm) { Get-ObjectValue $LifecycleArm 'guard_info' } else { $null }
+  $guardToken = if ($null -ne $LifecycleArm) { [string](Get-ObjectValue $LifecycleArm 'token' '') } else { '' }
+  $armCorrelation = if ($null -ne $LifecycleArm) { Get-ObjectValue $LifecycleArm 'correlation' } else { $null }
+  $expectedEpoch = if ($null -ne $armCorrelation) { [int64](Get-ObjectValue $armCorrelation 'epoch' 0) } else { [int64]0 }
+  if ($null -eq $guardInfo) {
+    $guardInfo = Get-AudnCodeLifecycleGuardInfoFromCorrelation -Correlation $armCorrelation -RegistryKind 'cron'
+  }
+  if ($null -eq $guardInfo) {
+    $fallbackCorrelation = Invoke-WithClaudeSessionLock -Info $info -Action {
+        param($lockedPath, $lockedSessionId, $lockedHookStartTicks, $lockedExpectedEpoch)
+        try { $state = Read-JsonFile -Path $lockedPath } catch { return $null }
+        $busyHookStartTicks = [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)
+        if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+            [string](Get-ObjectValue $state 'state' '') -notin @('busy', 'idle') -or
+            ($lockedExpectedEpoch -gt 0 -and [int64](Get-ObjectValue $state 'epoch' 0) -ne $lockedExpectedEpoch) -or
+            $busyHookStartTicks -le 0 -or $lockedHookStartTicks -le $busyHookStartTicks) { return $null }
+        return [pscustomobject]@{
+          home = [string](Get-ObjectValue $state 'audncode_home' '')
+          host_pid = [int](Get-ObjectValue $state 'audncode_host_pid' 0)
+          host_started_unix_ms = [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0)
+          cron_key = [string](Get-ObjectValue $state 'audncode_cron_runtime_key' '')
+          hook_generation = [string](Get-ObjectValue $state 'audncode_cron_hook_generation' '')
+          hook_installed_unix_ms = [int64](Get-ObjectValue $state 'audncode_cron_hook_installed_unix_ms' 0)
+        }
+      } -Arguments @($info.path, $SessionId, $HookStartTicks, $expectedEpoch)
+    $guardInfo = Get-AudnCodeLifecycleGuardInfoFromCorrelation -Correlation $fallbackCorrelation -RegistryKind 'cron'
+  }
+  if ($null -ne $guardInfo) {
+    [void](Update-AudnCodeLifecycleGuard -GuardInfo $guardInfo -Operation 'fail' -Token $guardToken)
+  }
+  $updated = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedHookStartTicks, $lockedExpectedEpoch, $lockedReason, $lockedToken)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $null }
+      $busyHookStartTicks = [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $state 'state' '') -notin @('busy', 'idle') -or
+          ($lockedExpectedEpoch -gt 0 -and [int64](Get-ObjectValue $state 'epoch' 0) -ne $lockedExpectedEpoch) -or
+          $busyHookStartTicks -le 0 -or $lockedHookStartTicks -le $busyHookStartTicks) {
+        return $null
+      }
+      # A successful CronCreate can be session-only and therefore leave no
+      # filesystem evidence. If its trusted lifecycle hook cannot be committed,
+      # an empty scheduled_tasks.json is not proof of idleness. This flag is
+      # intentionally sticky for the host lifetime; a later CronDelete-shaped
+      # event cannot retroactively prove what the lost event created.
+      Set-RecordValue -Record $state -Name 'audncode_cron_registry_valid' -Value $false
+      Set-RecordValue -Record $state -Name 'audncode_cron_lifecycle_unverifiable' -Value $true
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'cron'
+      $pendingTokens = if ([bool](Get-ObjectValue $pendingState 'valid' $false)) {
+        @((Get-ObjectValue $pendingState 'tokens' @()))
+      } else { @() }
+      $remainingTokens = @($pendingTokens | Where-Object { [string]::IsNullOrEmpty($lockedToken) -or $_ -ne $lockedToken })
+      [void](Set-AudnCodeSessionLifecyclePendingTokens -Record $state -RegistryKind 'cron' -Tokens $remainingTokens)
+      Set-RecordValue -Record $state -Name 'audncode_cron_lifecycle_failure_reason' -Value `
+        (Sanitize-NotificationText -Text $lockedReason -MaxLength 120)
+      Write-JsonAtomic -Path $lockedPath -Value $state
+      return $true
+    } -Arguments @($info.path, $SessionId, $HookStartTicks, $expectedEpoch, $Reason, $guardToken)
+  return [bool]$updated
+}
+
+function Get-AudnCodeExitedHostFinalityState {
+  param(
+    [object]$SessionState,
+    [object]$LockedSessionState = $null
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; reason = 'audncode-exited-host-unverifiable'; fingerprint = '' }
+  if ($null -eq $SessionState) { return $unknown }
+  $sessionId = [string](Get-ObjectValue $SessionState 'session_id' '')
+  $homePath = [string](Get-ObjectValue $SessionState 'audncode_home' '')
+  $hostPid = [int](Get-ObjectValue $SessionState 'audncode_host_pid' 0)
+  $hostStartedUnixMs = [int64](Get-ObjectValue $SessionState 'audncode_host_started_unix_ms' 0)
+  $hostProcessStartedUnixMs = [int64](Get-ObjectValue $SessionState 'audncode_host_process_started_unix_ms' 0)
+  $projectRoot = [string](Get-ObjectValue $SessionState 'audncode_project_root' '')
+  if ([string]::IsNullOrWhiteSpace($sessionId) -or [string]::IsNullOrWhiteSpace($homePath) -or
+      $hostPid -le 0 -or $hostStartedUnixMs -le 0 -or $hostProcessStartedUnixMs -le 0 -or
+      $hostProcessStartedUnixMs -gt $hostStartedUnixMs -or
+      ($hostStartedUnixMs - $hostProcessStartedUnixMs) -gt 120000 -or
+      [string]::IsNullOrWhiteSpace($projectRoot) -or
+      $homePath.Length -gt 32768 -or $projectRoot.Length -gt 32768) { return $unknown }
+
+  try {
+    if (-not [IO.Path]::IsPathRooted($homePath) -or -not [IO.Path]::IsPathRooted($projectRoot)) { return $unknown }
+    $resolvedHome = [IO.Path]::GetFullPath($homePath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $resolvedProjectRoot = [IO.Path]::GetFullPath($projectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if ([string]::IsNullOrWhiteSpace($resolvedHome) -or [string]::IsNullOrWhiteSpace($resolvedProjectRoot)) { return $unknown }
+    $hostSession = Get-AudnCodeHostSession `
+      -SessionId $sessionId `
+      -HomePath $resolvedHome `
+      -ExpectedHostPid $hostPid `
+      -ExpectedHostStartedUnixMs $hostStartedUnixMs `
+      -AllowExitedHost
+    if (-not [bool]$hostSession.ok -or [int]$hostSession.pid -ne $hostPid -or
+        [int64]$hostSession.started_unix_ms -ne $hostStartedUnixMs) { return $unknown }
+    if ([bool]$hostSession.live) {
+      return [pscustomobject]@{ state = 'live'; reason = 'audncode-host-live'; fingerprint = '' }
+    }
+
+    # AudnCode launches Bash/Agent work detached. An abrupt parent exit can skip
+    # cooperative cleanup while those children continue running, so process
+    # death is not terminal proof for the background registry. Require the same
+    # lifecycle/ingress guards and an explicitly empty runtime snapshot that a
+    # live-host commit requires. A non-empty registry at crash time is
+    # intentionally unhealable: only a trusted terminal hook before exit can
+    # close it.
+    $backgroundRuntimeKey = [string](Get-ObjectValue $SessionState 'audncode_runtime_key' '')
+    $backgroundRegistryProperty = $SessionState.PSObject.Properties['audncode_background_registry_valid']
+    $backgroundLifecycleProperty = $SessionState.PSObject.Properties['audncode_background_lifecycle_unverifiable']
+    $backgroundPendingState = Get-AudnCodeSessionLifecyclePendingTokenState `
+      -Record $SessionState `
+      -RegistryKind 'background'
+    if ($backgroundRuntimeKey -notmatch '^[a-f0-9]{64}$' -or
+        $null -eq $backgroundRegistryProperty -or $backgroundRegistryProperty.Value -isnot [bool] -or
+        -not [bool]$backgroundRegistryProperty.Value -or
+        $null -eq $backgroundLifecycleProperty -or $backgroundLifecycleProperty.Value -isnot [bool] -or
+        [bool]$backgroundLifecycleProperty.Value -or
+        -not [bool](Get-ObjectValue $backgroundPendingState 'valid' $false) -or
+        @((Get-ObjectValue $backgroundPendingState 'tokens' @())).Count -gt 0) { return $unknown }
+    $ingressFallbackState = Get-AudnCodeIngressFallbackState `
+      -HomePath $resolvedHome `
+      -HostStartedUnixMs $hostStartedUnixMs
+    if ([string](Get-ObjectValue $ingressFallbackState 'state' 'unknown') -ne 'clear') { return $unknown }
+    $backgroundRuntimeInfo = Get-AudnCodeRuntimeStateInfo `
+      -HomePath $resolvedHome `
+      -HostPid $hostPid `
+      -HostStartedUnixMs $hostStartedUnixMs
+    if ($null -eq $backgroundRuntimeInfo -or [string]$backgroundRuntimeInfo.key -ne $backgroundRuntimeKey) {
+      return $unknown
+    }
+    foreach ($registryKind in @('ingress', 'background')) {
+      $guardInfo = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $backgroundRuntimeInfo -RegistryKind $registryKind
+      $guardState = Get-AudnCodeLifecycleGuardState -GuardInfo $guardInfo
+      if ([string](Get-ObjectValue $guardState 'state' 'unknown') -ne 'clear') { return $unknown }
+    }
+    $backgroundRuntimeState = Read-AudnCodeRuntimeBackgroundState -RuntimeInfo $backgroundRuntimeInfo
+    if ($null -eq $backgroundRuntimeState -or
+        -not [bool](Get-ObjectValue $backgroundRuntimeState 'registry_valid' $false)) { return $unknown }
+    $backgroundIds = @((Get-ObjectValue $backgroundRuntimeState 'background_ids' @()))
+    $localAgentUiUncertain = [bool](Get-ObjectValue $backgroundRuntimeState 'local_agent_ui_uncertain' $false)
+    if ($backgroundIds.Count -gt 0 -or $localAgentUiUncertain) {
+      return [pscustomobject]@{
+        state = 'busy'
+        reason = 'audncode-detached-background-active'
+        fingerprint = ''
+      }
+    }
+    # A local Agent query loop dies with the host, but a foreground shell it
+    # spawned can already be detached before AudnCode registers a non-a task
+    # identity. SendMessage pendingMessages likewise have no durable consumed
+    # receipt. Exact host exit therefore cannot heal either remaining a-ID state
+    # or sticky delivery/overlap uncertainty without risking an intermediate.
+    $stateTranscriptPath = [string](Get-ObjectValue $SessionState 'transcript_path' '')
+    $backgroundLineage = @(@((Get-ObjectValue $backgroundRuntimeState 'sessions' @())) | Where-Object {
+        [string](Get-ObjectValue $_ 'session_id' '') -eq $sessionId -and
+        [string]::Equals([string](Get-ObjectValue $_ 'transcript_path' ''), $stateTranscriptPath, [StringComparison]::OrdinalIgnoreCase)
+      })
+    if ($backgroundLineage.Count -ne 1) { return $unknown }
+    $backgroundFingerprint = Get-Sha256Hex (
+      "audncode-exited-background/v1|$backgroundRuntimeKey|" +
+      [string](Get-ObjectValue $backgroundRuntimeState 'closed_ids_fingerprint' '')
+    )
+
+    # Queue state and session-only cron state are process memory, but team
+    # inboxes and durable crons persist outside the process and can reactivate
+    # work later. Their evidence remains mandatory and fail closed.
+    $expectedRuntimeKey = [string](Get-ObjectValue $SessionState 'audncode_cron_runtime_key' '')
+    $hookGeneration = [string](Get-ObjectValue $SessionState 'audncode_cron_hook_generation' '')
+    $hookInstalledUnixMs = [int64](Get-ObjectValue $SessionState 'audncode_cron_hook_installed_unix_ms' 0)
+    if ($expectedRuntimeKey -notmatch '^[a-f0-9]{64}$' -or $hookGeneration -notmatch '^[a-f0-9]{32}$' -or
+        $hookInstalledUnixMs -le 0) { return $unknown }
+    $cronMarker = Get-AudnCodeCronObservationMarker `
+      -HomePath $resolvedHome `
+      -HostStartedUnixMs $hostStartedUnixMs `
+      -HostProcessStartedUnixMs $hostProcessStartedUnixMs
+    if (-not [bool](Get-ObjectValue $cronMarker 'ok' $false) -or
+        [string](Get-ObjectValue $cronMarker 'generation' '') -ne $hookGeneration -or
+        [int64](Get-ObjectValue $cronMarker 'installed_unix_ms' 0) -ne $hookInstalledUnixMs) { return $unknown }
+    $cronHostObservable = [bool](Get-ObjectValue $cronMarker 'host_observable' $false)
+    $runtimeInfo = Get-AudnCodeCronRuntimeStateInfo `
+      -HomePath $resolvedHome `
+      -HostPid $hostPid `
+      -HostStartedUnixMs $hostStartedUnixMs `
+      -HookGeneration $hookGeneration `
+      -HookInstalledUnixMs $hookInstalledUnixMs `
+      -ObservationAllowed $cronHostObservable
+    if ($null -eq $runtimeInfo -or [string]$runtimeInfo.key -ne $expectedRuntimeKey -or
+        -not (Test-Path -LiteralPath $runtimeInfo.path -PathType Leaf)) { return $unknown }
+    $cronGuardInfo = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $runtimeInfo -RegistryKind 'cron'
+    $cronGuardState = Get-AudnCodeLifecycleGuardState -GuardInfo $cronGuardInfo
+    if ([string](Get-ObjectValue $cronGuardState 'state' 'unknown') -ne 'clear') { return $unknown }
+    $runtimeBefore = Get-Item -LiteralPath $runtimeInfo.path -ErrorAction Stop
+    if ([int64]$runtimeBefore.Length -gt 16MB) { return $unknown }
+    $runtimeRaw = [IO.File]::ReadAllText($runtimeInfo.path, $Utf8StrictNoBom)
+    try { $runtimeState = ConvertFrom-StrictJsonText -Text $runtimeRaw } catch { return $unknown }
+    $runtimeAfter = Get-Item -LiteralPath $runtimeInfo.path -ErrorAction Stop
+    if ([int64]$runtimeBefore.Length -ne [int64]$runtimeAfter.Length -or
+        [int64]$runtimeBefore.LastWriteTimeUtc.Ticks -ne [int64]$runtimeAfter.LastWriteTimeUtc.Ticks -or
+        [int64]$runtimeBefore.CreationTimeUtc.Ticks -ne [int64]$runtimeAfter.CreationTimeUtc.Ticks) { return $unknown }
+    $schemaProperty = if ($null -ne $runtimeState) { $runtimeState.PSObject.Properties['schema'] } else { $null }
+    $registryProperty = if ($null -ne $runtimeState) { $runtimeState.PSObject.Properties['registry_valid'] } else { $null }
+    $preObservationProperty = if ($null -ne $runtimeState) { $runtimeState.PSObject.Properties['pre_observation_only'] } else { $null }
+    $sessionsProperty = if ($null -ne $runtimeState) { $runtimeState.PSObject.Properties['sessions'] } else { $null }
+    $cronsProperty = if ($null -ne $runtimeState) { $runtimeState.PSObject.Properties['crons'] } else { $null }
+    $runtimeRegistryValid = $null -ne $registryProperty -and
+      $registryProperty.Value -is [bool] -and [bool]$registryProperty.Value
+    $runtimePreObservationOnly = $null -ne $preObservationProperty -and
+      $preObservationProperty.Value -is [bool] -and [bool]$preObservationProperty.Value
+    $runtimeFinalityModeValid = if ($cronHostObservable) {
+      $runtimeRegistryValid -and -not $runtimePreObservationOnly
+    } else {
+      -not $runtimeRegistryValid -and $runtimePreObservationOnly
+    }
+    if ($null -eq $schemaProperty -or
+        ($schemaProperty.Value -isnot [int] -and $schemaProperty.Value -isnot [long]) -or
+        [int64]$schemaProperty.Value -ne 1 -or
+        [string](Get-ObjectValue $runtimeState 'kind' '') -ne 'audncode-cron-runtime' -or
+        -not [string]::Equals([string](Get-ObjectValue $runtimeState 'audncode_home' ''), $resolvedHome, [StringComparison]::OrdinalIgnoreCase) -or
+        [int](Get-ObjectValue $runtimeState 'host_pid' 0) -ne $hostPid -or
+        [int64](Get-ObjectValue $runtimeState 'host_started_unix_ms' 0) -ne $hostStartedUnixMs -or
+        [int64](Get-ObjectValue $runtimeState 'host_process_started_unix_ms' 0) -ne $hostProcessStartedUnixMs -or
+        [string](Get-ObjectValue $runtimeState 'hook_generation' '') -ne $hookGeneration -or
+        [int64](Get-ObjectValue $runtimeState 'hook_installed_unix_ms' 0) -ne $hookInstalledUnixMs -or
+        $null -eq $registryProperty -or $registryProperty.Value -isnot [bool] -or
+        ($null -ne $preObservationProperty -and $preObservationProperty.Value -isnot [bool]) -or
+        -not $runtimeFinalityModeValid -or
+        $null -eq $sessionsProperty -or $sessionsProperty.Value -isnot [array] -or
+        $null -eq $cronsProperty -or $cronsProperty.Value -isnot [array]) { return $unknown }
+
+    $runtimeSessions = @($sessionsProperty.Value)
+    $runtimeCrons = @($cronsProperty.Value)
+    if ($runtimeSessions.Count -eq 0 -or $runtimeSessions.Count -gt 256 -or $runtimeCrons.Count -gt 256) { return $unknown }
+    $sessionRoots = @{}
+    $projectRoots = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($runtimeSession in $runtimeSessions) {
+      if ($null -eq $runtimeSession -or $runtimeSession -isnot [System.Management.Automation.PSCustomObject]) { return $unknown }
+      $runtimeSessionId = [string](Get-ObjectValue $runtimeSession 'session_id' '')
+      $runtimeProjectRoot = [string](Get-ObjectValue $runtimeSession 'project_root' '')
+      $parsedSession = [Guid]::Empty
+      if (-not [Guid]::TryParse($runtimeSessionId, [ref]$parsedSession) -or $sessionRoots.ContainsKey($runtimeSessionId) -or
+          [string]::IsNullOrWhiteSpace($runtimeProjectRoot) -or $runtimeProjectRoot.Length -gt 32768 -or
+          -not [IO.Path]::IsPathRooted($runtimeProjectRoot)) { return $unknown }
+      $runtimeProjectRoot = [IO.Path]::GetFullPath($runtimeProjectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+      if ([string]::IsNullOrWhiteSpace($runtimeProjectRoot)) { return $unknown }
+      $lastSeenProperty = $runtimeSession.PSObject.Properties['last_seen_unix_ms']
+      if ($null -ne $lastSeenProperty -and
+          (($lastSeenProperty.Value -isnot [int] -and $lastSeenProperty.Value -isnot [long]) -or [int64]$lastSeenProperty.Value -lt 0)) { return $unknown }
+      $sessionRoots[$runtimeSessionId] = $runtimeProjectRoot
+      [void]$projectRoots.Add($runtimeProjectRoot)
+    }
+    if (-not $sessionRoots.ContainsKey($sessionId) -or
+        -not [string]::Equals([string]$sessionRoots[$sessionId], $resolvedProjectRoot, [StringComparison]::OrdinalIgnoreCase)) { return $unknown }
+
+    $validatedRuntimeState = Update-AudnCodeCronRuntimeState -RuntimeInfo $runtimeInfo -ValidateOnly
+    $validatedRuntimeUsable = $null -ne $validatedRuntimeState -and $(if ($cronHostObservable) {
+        [bool](Get-ObjectValue $validatedRuntimeState 'registry_valid' $false) -and
+          -not [bool](Get-ObjectValue $validatedRuntimeState 'pre_observation_only' $false)
+      } else {
+        -not [bool](Get-ObjectValue $validatedRuntimeState 'registry_valid' $true) -and
+          [bool](Get-ObjectValue $validatedRuntimeState 'pre_observation_only' $false)
+      })
+    if (-not $validatedRuntimeUsable) { return $unknown }
+    $runtimeState = $validatedRuntimeState
+
+    $remoteFingerprints = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($runtimeSession in $runtimeSessions) {
+      $teamState = Get-AudnCodeTeamState `
+        -SessionId ([string](Get-ObjectValue $runtimeSession 'session_id' '')) `
+        -HomePath $resolvedHome `
+        -AdditionalTeamName ([string](Get-ObjectValue $runtimeSession 'team_name' '')) `
+        -AdditionalTeamNameValid ([bool](Get-ObjectValue $runtimeSession 'team_name_valid' $true))
+      if ([string](Get-ObjectValue $teamState 'state' 'unknown') -ne 'idle') {
+        return [pscustomobject]@{
+          state = [string](Get-ObjectValue $teamState 'state' 'unknown')
+          reason = [string](Get-ObjectValue $teamState 'reason' 'audncode-team-unverifiable')
+          fingerprint = ''
+        }
+      }
+      $remoteLineages = @(@((Get-ObjectValue $backgroundRuntimeState 'sessions' @())) | Where-Object {
+          [string](Get-ObjectValue $_ 'session_id' '') -eq [string](Get-ObjectValue $runtimeSession 'session_id' '')
+        })
+      if ($remoteLineages.Count -ne 1) { return $unknown }
+      $remoteState = Get-AudnCodeRemoteAgentState `
+        -SessionId ([string](Get-ObjectValue $runtimeSession 'session_id' '')) `
+        -TranscriptPath ([string](Get-ObjectValue $remoteLineages[0] 'transcript_path' '')) `
+        -HomePath $resolvedHome `
+        -LockedSessionState $(if ([string](Get-ObjectValue $runtimeSession 'session_id' '') -eq $sessionId) { $LockedSessionState } else { $null })
+      if ([string](Get-ObjectValue $remoteState 'state' 'unknown') -ne 'idle') {
+        return [pscustomobject]@{
+          state = [string](Get-ObjectValue $remoteState 'state' 'unknown')
+          reason = [string](Get-ObjectValue $remoteState 'reason' 'audncode-remote-agents-unverifiable')
+          fingerprint = ''
+        }
+      }
+      $remoteFingerprints.Add(
+        "remote|$([string](Get-ObjectValue $runtimeSession 'session_id' ''))|$([string](Get-ObjectValue $remoteState 'fingerprint' ''))"
+      )
+    }
+
+    $runtimeState = Update-AudnCodeCronRuntimeState -RuntimeInfo $runtimeInfo
+    $updatedRuntimeUsable = $null -ne $runtimeState -and $(if ($cronHostObservable) {
+        [bool](Get-ObjectValue $runtimeState 'registry_valid' $false) -and
+          -not [bool](Get-ObjectValue $runtimeState 'pre_observation_only' $false)
+      } else {
+        -not [bool](Get-ObjectValue $runtimeState 'registry_valid' $true) -and
+          [bool](Get-ObjectValue $runtimeState 'pre_observation_only' $false)
+      })
+    if (-not $updatedRuntimeUsable) { return $unknown }
+    $fingerprintParts = New-Object 'System.Collections.Generic.List[string]'
+    $fingerprintParts.Add("host|$resolvedHome|$hostPid|$hostStartedUnixMs|$expectedRuntimeKey")
+    $fingerprintParts.Add("background|$backgroundFingerprint")
+    foreach ($remoteFingerprint in $remoteFingerprints) { $fingerprintParts.Add($remoteFingerprint) }
+    foreach ($lineageProjectRoot in @($projectRoots | Sort-Object)) {
+      $owners = @(@((Get-ObjectValue $runtimeState 'sessions' @())) | Where-Object {
+          [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $lineageProjectRoot, [StringComparison]::OrdinalIgnoreCase)
+        } | Sort-Object { [int64](Get-ObjectValue $_ 'last_seen_unix_ms' 0) } -Descending)
+      if ($owners.Count -eq 0) { return $unknown }
+      $projectLockInfo = Get-AudnCodeCronProjectLockInfo -HomePath $resolvedHome -ProjectRoot $lineageProjectRoot
+      if ($null -eq $projectLockInfo) { return $unknown }
+      $projectResult = Invoke-WithClaudeSessionLock -Info $projectLockInfo -Action {
+        param($lockedProjectInfo, $lockedRuntimeInfo, $lockedProjectRoot, $lockedOwnerSessionId)
+        $fileState = Read-AudnCodeDurableCronFileState -ProjectRoot $lockedProjectRoot
+        if ([string](Get-ObjectValue $fileState 'state' 'unknown') -ne 'ok') {
+          [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedRuntimeInfo -Invalidate)
+          return [pscustomobject]@{ state = 'unknown'; runtime_state = $null }
+        }
+        $observed = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($entry in @((Get-ObjectValue $fileState 'entries' @()))) {
+          $observed.Add([pscustomobject]@{
+              id = [string](Get-ObjectValue $entry 'id' '')
+              session_id = $lockedOwnerSessionId
+              project_root = $lockedProjectRoot
+              recurring = [bool](Get-ObjectValue $entry 'recurring' $false)
+              definition_hash = [string](Get-ObjectValue $entry 'definition_hash' '')
+              incarnation_hash = [string](Get-ObjectValue $entry 'incarnation_hash' '')
+            })
+        }
+        $updated = Update-AudnCodeCronRuntimeState `
+          -RuntimeInfo $lockedRuntimeInfo `
+          -ObservedDurableCrons @($observed.ToArray()) `
+          -FileSnapshot (Get-ObjectValue $fileState 'snapshot')
+        $updatedUsable = $null -ne $updated -and $(if ([bool](Get-ObjectValue $lockedRuntimeInfo 'observation_allowed' $false)) {
+            [bool](Get-ObjectValue $updated 'registry_valid' $false) -and
+              -not [bool](Get-ObjectValue $updated 'pre_observation_only' $false)
+          } else {
+            -not [bool](Get-ObjectValue $updated 'registry_valid' $true) -and
+              [bool](Get-ObjectValue $updated 'pre_observation_only' $false)
+          })
+        if (-not $updatedUsable) {
+          return [pscustomobject]@{ state = 'unknown'; runtime_state = $updated }
+        }
+        $snapshots = @(@((Get-ObjectValue $updated 'project_snapshots' @())) | Where-Object {
+            [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $lockedProjectRoot, [StringComparison]::OrdinalIgnoreCase)
+          })
+        if ($snapshots.Count -ne 1 -or [bool](Get-ObjectValue $snapshots[0] 'ambiguous' $true)) {
+          return [pscustomobject]@{ state = 'unknown'; runtime_state = $updated }
+        }
+        $durable = @(@((Get-ObjectValue $updated 'crons' @())) | Where-Object {
+            [bool](Get-ObjectValue $_ 'durable' $false) -and
+            [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $lockedProjectRoot, [StringComparison]::OrdinalIgnoreCase)
+          })
+        if ($durable.Count -gt 0 -or @((Get-ObjectValue $snapshots[0] 'ids' @())).Count -gt 0) {
+          return [pscustomobject]@{ state = 'busy'; runtime_state = $updated }
+        }
+        return [pscustomobject]@{
+          state = 'idle'
+          runtime_state = $updated
+          fingerprint = Get-Sha256Hex (Get-AudnCodeCronSnapshotCoreIdentity -Snapshot $snapshots[0])
+        }
+      } -Arguments @($projectLockInfo, $runtimeInfo, $lineageProjectRoot, [string](Get-ObjectValue $owners[0] 'session_id' ''))
+      if ([string](Get-ObjectValue $projectResult 'state' 'unknown') -eq 'unknown') { return $unknown }
+      $runtimeState = Get-ObjectValue $projectResult 'runtime_state'
+      if ([string](Get-ObjectValue $projectResult 'state' '') -eq 'busy') {
+        return [pscustomobject]@{ state = 'busy'; reason = 'audncode-durable-crons-active'; fingerprint = '' }
+      }
+      $fingerprintParts.Add("project|$lineageProjectRoot|" + [string](Get-ObjectValue $projectResult 'fingerprint' ''))
+    }
+    return [pscustomobject]@{
+      state = 'idle'
+      reason = 'audncode-exited-host-idle'
+      fingerprint = Get-Sha256Hex (($fingerprintParts.ToArray()) -join "`n")
+    }
+  } catch {
+    return $unknown
+  }
+}
+
+function Get-AudnCodeExitedHostLifetimeFinalityState {
+  param(
+    [object]$SessionState,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs,
+    [object]$LockedSessionState = $null
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; reason = 'audncode-exited-host-lifetime-unverifiable'; fingerprint = '' }
+  if ($null -eq $SessionState -or [string]::IsNullOrWhiteSpace($HomePath) -or
+      $HostPid -le 0 -or $HostStartedUnixMs -le 0) { return $unknown }
+  $sessionId = [string](Get-ObjectValue $SessionState 'session_id' '')
+  $currentTranscript = [string](Get-ObjectValue $SessionState 'transcript_path' '')
+  if ([string]::IsNullOrWhiteSpace($sessionId) -or [string]::IsNullOrWhiteSpace($currentTranscript)) { return $unknown }
+  try {
+    $resolvedHome = [IO.Path]::GetFullPath($HomePath)
+    $resolvedTranscript = [IO.Path]::GetFullPath($currentTranscript)
+  } catch { return $unknown }
+
+  $backgroundRuntime = Get-AudnCodeRuntimeStateInfo `
+    -HomePath $resolvedHome `
+    -HostPid $HostPid `
+    -HostStartedUnixMs $HostStartedUnixMs
+  $backgroundState = Read-AudnCodeRuntimeBackgroundState -RuntimeInfo $backgroundRuntime
+  if ($null -eq $backgroundRuntime -or $null -eq $backgroundState -or
+      -not [bool](Get-ObjectValue $backgroundState 'registry_valid' $false)) { return $unknown }
+  $backgroundLineages = @(@((Get-ObjectValue $backgroundState 'sessions' @())) | Where-Object {
+      [string](Get-ObjectValue $_ 'session_id' '') -eq $sessionId
+    })
+  if ($backgroundLineages.Count -ne 1 -or
+      -not [string]::Equals(
+        [string](Get-ObjectValue $backgroundLineages[0] 'transcript_path' ''),
+        $resolvedTranscript,
+        [StringComparison]::OrdinalIgnoreCase
+      )) { return $unknown }
+
+  $cronMarkerProbe = Get-AudnCodeCronObservationMarker `
+    -HomePath $resolvedHome `
+    -HostStartedUnixMs $HostStartedUnixMs
+  if (-not [bool](Get-ObjectValue $cronMarkerProbe 'ok' $false)) { return $unknown }
+  $cronRuntimeProbe = Get-AudnCodeCronRuntimeStateInfo `
+    -HomePath $resolvedHome `
+    -HostPid $HostPid `
+    -HostStartedUnixMs $HostStartedUnixMs `
+    -HookGeneration ([string](Get-ObjectValue $cronMarkerProbe 'generation' '')) `
+    -HookInstalledUnixMs ([int64](Get-ObjectValue $cronMarkerProbe 'installed_unix_ms' 0)) `
+    -ObservationAllowed $false
+  if ($null -eq $cronRuntimeProbe) { return $unknown }
+  $stableCronRuntime = Read-AudnCodeStableUtf8FileSnapshot `
+    -RootPath $ClaudeSessionsDir `
+    -Path ([string]$cronRuntimeProbe.path) `
+    -MaxBytes 16MB
+  if ([string](Get-ObjectValue $stableCronRuntime 'state' 'unknown') -ne 'ok') { return $unknown }
+  try {
+    $cronRuntimeRaw = ConvertFrom-StrictJsonText -Text ([string](Get-ObjectValue $stableCronRuntime 'raw' ''))
+    $processStartedProperty = $cronRuntimeRaw.PSObject.Properties['host_process_started_unix_ms']
+    if ($null -eq $processStartedProperty -or
+        ($processStartedProperty.Value -isnot [int] -and $processStartedProperty.Value -isnot [long])) { return $unknown }
+    $hostProcessStartedUnixMs = [int64]$processStartedProperty.Value
+  } catch { return $unknown }
+  if ($hostProcessStartedUnixMs -le 0 -or $hostProcessStartedUnixMs -gt $HostStartedUnixMs -or
+      ($HostStartedUnixMs - $hostProcessStartedUnixMs) -gt 120000) { return $unknown }
+  $cronMarker = Get-AudnCodeCronObservationMarker `
+    -HomePath $resolvedHome `
+    -HostStartedUnixMs $HostStartedUnixMs `
+    -HostProcessStartedUnixMs $hostProcessStartedUnixMs
+  if (-not [bool](Get-ObjectValue $cronMarker 'ok' $false)) { return $unknown }
+  $cronHostObservable = [bool](Get-ObjectValue $cronMarker 'host_observable' $false)
+  $cronRuntime = Get-AudnCodeCronRuntimeStateInfo `
+    -HomePath $resolvedHome `
+    -HostPid $HostPid `
+    -HostStartedUnixMs $HostStartedUnixMs `
+    -HookGeneration ([string](Get-ObjectValue $cronMarker 'generation' '')) `
+    -HookInstalledUnixMs ([int64](Get-ObjectValue $cronMarker 'installed_unix_ms' 0)) `
+    -ObservationAllowed $cronHostObservable
+  if ($null -eq $cronRuntime -or
+      -not [string]::Equals([string]$cronRuntime.path, [string]$cronRuntimeProbe.path, [StringComparison]::OrdinalIgnoreCase)) {
+    return $unknown
+  }
+  $cronState = Update-AudnCodeCronRuntimeState -RuntimeInfo $cronRuntime -ValidateOnly
+  $cronStateUsable = $null -ne $cronState -and $(if ($cronHostObservable) {
+      [bool](Get-ObjectValue $cronState 'registry_valid' $false) -and
+        -not [bool](Get-ObjectValue $cronState 'pre_observation_only' $false)
+    } else {
+      -not [bool](Get-ObjectValue $cronState 'registry_valid' $true) -and
+        [bool](Get-ObjectValue $cronState 'pre_observation_only' $false)
+    })
+  if (-not $cronStateUsable) { return $unknown }
+  $cronSessionsProperty = if ($null -ne $cronState) { $cronState.PSObject.Properties['sessions'] } else { $null }
+  if ($null -eq $cronSessionsProperty -or $cronSessionsProperty.Value -isnot [array]) { return $unknown }
+  $cronLineages = @(@($cronSessionsProperty.Value) | Where-Object {
+      [string](Get-ObjectValue $_ 'session_id' '') -eq $sessionId
+    })
+  if ($cronLineages.Count -ne 1) { return $unknown }
+  $projectRoot = [string](Get-ObjectValue $cronLineages[0] 'project_root' '')
+  if ([string]::IsNullOrWhiteSpace($projectRoot)) { return $unknown }
+
+  # The handoff overwrites host-specific mirror fields in the logical session.
+  # Reconstruct only identity keys; the authoritative host guards and runtime
+  # registries are re-read by Get-AudnCodeExitedHostFinalityState below.
+  $hostState = [pscustomobject]@{
+    session_id = $sessionId
+    transcript_path = $resolvedTranscript
+    audncode_home = $resolvedHome
+    audncode_host_pid = [int]$HostPid
+    audncode_host_started_unix_ms = [int64]$HostStartedUnixMs
+    audncode_host_process_started_unix_ms = [int64]$hostProcessStartedUnixMs
+    audncode_project_root = $projectRoot
+    audncode_runtime_key = [string](Get-ObjectValue $backgroundRuntime 'key' '')
+    audncode_background_registry_valid = $true
+    audncode_background_lifecycle_pending_tokens = @()
+    audncode_background_lifecycle_pending_token = ''
+    audncode_background_lifecycle_unverifiable = $false
+    audncode_cron_runtime_key = [string](Get-ObjectValue $cronRuntime 'key' '')
+    audncode_cron_hook_generation = [string](Get-ObjectValue $cronMarker 'generation' '')
+    audncode_cron_hook_installed_unix_ms = [int64](Get-ObjectValue $cronMarker 'installed_unix_ms' 0)
+  }
+  return Get-AudnCodeExitedHostFinalityState `
+    -SessionState $hostState `
+    -LockedSessionState $LockedSessionState
+}
+
+function Get-AudnCodeCronFinalityState {
+  param(
+    [string]$SessionId,
+    [string]$HomePath,
+    [int]$HostPid,
+    [int64]$HostStartedUnixMs,
+    [int64]$HostProcessStartedUnixMs,
+    [string]$ExpectedRuntimeKey,
+    [string]$ExpectedHookGeneration,
+    [int64]$ExpectedHookInstalledUnixMs
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; reason = 'audncode-cron-state-unverifiable' }
+  $cronMarker = Get-AudnCodeCronObservationMarker `
+    -HomePath $HomePath `
+    -HostStartedUnixMs $HostStartedUnixMs `
+    -HostProcessStartedUnixMs $HostProcessStartedUnixMs
+  if (-not [bool]$cronMarker.ok -or -not [bool]$cronMarker.host_observable -or
+      [string]$cronMarker.generation -ne $ExpectedHookGeneration -or
+      [int64]$cronMarker.installed_unix_ms -ne $ExpectedHookInstalledUnixMs) { return $unknown }
+  $runtimeInfo = Get-AudnCodeCronRuntimeStateInfo `
+    -HomePath $HomePath `
+    -HostPid $HostPid `
+    -HostStartedUnixMs $HostStartedUnixMs `
+    -HookGeneration ([string]$cronMarker.generation) `
+    -HookInstalledUnixMs ([int64]$cronMarker.installed_unix_ms) `
+    -ObservationAllowed ([bool]$cronMarker.host_observable)
+  if ($null -eq $runtimeInfo -or [string]$runtimeInfo.key -ne $ExpectedRuntimeKey) { return $unknown }
+  $guardInfo = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $runtimeInfo -RegistryKind 'cron'
+  $guardState = Get-AudnCodeLifecycleGuardState -GuardInfo $guardInfo
+  if ([string](Get-ObjectValue $guardState 'state' 'unknown') -ne 'clear') { return $unknown }
+  $validatedRuntimeState = Update-AudnCodeCronRuntimeState -RuntimeInfo $runtimeInfo -ValidateOnly
+  if ($null -eq $validatedRuntimeState -or
+      -not [bool](Get-ObjectValue $validatedRuntimeState 'registry_valid' $false) -or
+      [bool](Get-ObjectValue $validatedRuntimeState 'pre_observation_only' $false)) { return $unknown }
+  $runtimeState = Update-AudnCodeCronRuntimeState -RuntimeInfo $runtimeInfo
+  if ($null -eq $runtimeState -or -not [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)) { return $unknown }
+  $currentSession = @(@((Get-ObjectValue $runtimeState 'sessions' @())) | Where-Object {
+      [string](Get-ObjectValue $_ 'session_id' '') -eq $SessionId
+    })
+  if ($currentSession.Count -ne 1) { return $unknown }
+  $activeCrons = @((Get-ObjectValue $runtimeState 'crons' @()))
+  if (@($activeCrons | Where-Object { -not [bool](Get-ObjectValue $_ 'durable' $false) }).Count -gt 0) {
+    # AudnCode keeps session-only cron IDs only in process memory and its fire
+    # transcript marker deliberately omits the ID. Without CronDelete there is
+    # no unique durable proof that a one-shot, especially among identical
+    # prompts, was the task that fired. Stay fail closed rather than guess.
+    return [pscustomobject]@{ state = 'busy'; reason = 'audncode-session-crons-active' }
+  }
+  $fingerprintParts = New-Object 'System.Collections.Generic.List[string]'
+  $projectRoots = @(@((Get-ObjectValue $runtimeState 'sessions' @())) |
+      ForEach-Object { [string](Get-ObjectValue $_ 'project_root' '') } |
+      Sort-Object -Unique)
+  foreach ($projectRoot in $projectRoots) {
+    if ([string]::IsNullOrWhiteSpace($projectRoot)) { return $unknown }
+    $projectOwners = @(@((Get-ObjectValue $runtimeState 'sessions' @())) | Where-Object {
+        [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $projectRoot, [StringComparison]::OrdinalIgnoreCase)
+      } | Sort-Object { [int64](Get-ObjectValue $_ 'last_seen_unix_ms' 0) } -Descending)
+    if ($projectOwners.Count -eq 0) { return $unknown }
+    $observationOwnerSessionId = [string](Get-ObjectValue $projectOwners[0] 'session_id' '')
+    $projectLockInfo = Get-AudnCodeCronProjectLockInfo -HomePath $HomePath -ProjectRoot $projectRoot
+    if ($null -eq $projectLockInfo) { return $unknown }
+    $projectResult = Invoke-WithClaudeSessionLock -Info $projectLockInfo -Action {
+      param($lockedProjectInfo, $lockedRuntimeInfo, $lockedProjectRoot, $lockedOwnerSessionId)
+      $fileState = Read-AudnCodeDurableCronFileState -ProjectRoot $lockedProjectRoot
+      if ([string](Get-ObjectValue $fileState 'state' 'unknown') -ne 'ok') {
+        [void](Update-AudnCodeCronRuntimeState -RuntimeInfo $lockedRuntimeInfo -Invalidate)
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-cron-state-unverifiable'; runtime_state = $null }
+      }
+      $observed = New-Object 'System.Collections.Generic.List[object]'
+      foreach ($entry in @((Get-ObjectValue $fileState 'entries' @()))) {
+        $observed.Add([pscustomobject]@{
+            id = [string](Get-ObjectValue $entry 'id' '')
+            session_id = $lockedOwnerSessionId
+            project_root = $lockedProjectRoot
+            recurring = [bool](Get-ObjectValue $entry 'recurring' $false)
+            definition_hash = [string](Get-ObjectValue $entry 'definition_hash' '')
+            incarnation_hash = [string](Get-ObjectValue $entry 'incarnation_hash' '')
+          })
+      }
+      $updatedRuntime = Update-AudnCodeCronRuntimeState `
+        -RuntimeInfo $lockedRuntimeInfo `
+        -ObservedDurableCrons @($observed.ToArray()) `
+        -FileSnapshot (Get-ObjectValue $fileState 'snapshot')
+      if ($null -eq $updatedRuntime -or -not [bool](Get-ObjectValue $updatedRuntime 'registry_valid' $false)) {
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-cron-state-unverifiable'; runtime_state = $updatedRuntime }
+      }
+      $snapshots = @(@((Get-ObjectValue $updatedRuntime 'project_snapshots' @())) | Where-Object {
+          [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $lockedProjectRoot, [StringComparison]::OrdinalIgnoreCase)
+        })
+      if ($snapshots.Count -ne 1 -or [bool](Get-ObjectValue $snapshots[0] 'ambiguous' $true)) {
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-cron-snapshot-ambiguous'; runtime_state = $updatedRuntime }
+      }
+      $ids = @((Get-ObjectValue $snapshots[0] 'ids' @()))
+      $expectedIds = @(@((Get-ObjectValue $updatedRuntime 'crons' @())) | Where-Object {
+          [bool](Get-ObjectValue $_ 'durable' $false) -and
+          [string]::Equals([string](Get-ObjectValue $_ 'project_root' ''), $lockedProjectRoot, [StringComparison]::OrdinalIgnoreCase)
+        } | ForEach-Object { [string](Get-ObjectValue $_ 'id' '') })
+      if ($ids.Count -gt 0 -or $expectedIds.Count -gt 0) {
+        return [pscustomobject]@{ state = 'busy'; reason = 'audncode-durable-crons-active'; runtime_state = $updatedRuntime }
+      }
+      return [pscustomobject]@{
+        state = 'idle'
+        reason = 'audncode-project-crons-idle'
+        runtime_state = $updatedRuntime
+        fingerprint = Get-Sha256Hex (Get-AudnCodeCronSnapshotCoreIdentity -Snapshot $snapshots[0])
+      }
+    } -Arguments @($projectLockInfo, $runtimeInfo, $projectRoot, $observationOwnerSessionId)
+    if ($null -eq $projectResult -or [string](Get-ObjectValue $projectResult 'state' 'unknown') -eq 'unknown') {
+      return [pscustomobject]@{ state = 'unknown'; reason = [string](Get-ObjectValue $projectResult 'reason' 'audncode-cron-state-unverifiable') }
+    }
+    $runtimeState = Get-ObjectValue $projectResult 'runtime_state'
+    if ([string](Get-ObjectValue $projectResult 'state' '') -eq 'busy') {
+      return [pscustomobject]@{ state = 'busy'; reason = [string](Get-ObjectValue $projectResult 'reason' 'audncode-durable-crons-active') }
+    }
+    $fingerprintParts.Add("project|$projectRoot|" + [string](Get-ObjectValue $projectResult 'fingerprint' ''))
+    $activeCrons = @((Get-ObjectValue $runtimeState 'crons' @()))
+  }
+  return [pscustomobject]@{
+    state = 'idle'
+    reason = 'audncode-crons-idle'
+    fingerprint = Get-Sha256Hex (($fingerprintParts.ToArray()) -join "`n")
+  }
+}
+
+function ConvertFrom-AudnCodeTaskNotification {
+  param([string]$Content)
+
+  if ([string]::IsNullOrWhiteSpace($Content) -or $Content.Length -gt 1024 * 1024) { return $null }
+  try {
+    # These producer strings are deliberately XML-like rather than XML: a
+    # local agent's unescaped result may itself contain tags and '&', while
+    # remote review notifications append explanatory text after the wrapper.
+    # Trust only the canonical header at offset zero. Provenance is validated
+    # separately from the transcript envelope, so payload tags cannot replace
+    # the first task-id/status pair or manufacture a human-pasted proof.
+    $headerPattern = '\A[ \t]*<task-notification>[ \t]*\r?\n' +
+      '[ \t]*<task-id>[ \t]*(?<id>[A-Za-z0-9][A-Za-z0-9._:-]{0,159})[ \t]*</task-id>[ \t]*\r?\n' +
+      '(?:[ \t]*<tool-use-id>[^\r\n<>]{1,256}</tool-use-id>[ \t]*\r?\n)?' +
+      '(?:[ \t]*<task-type>[ \t]*(?<tasktype>[A-Za-z0-9_-]{1,80})[ \t]*</task-type>[ \t]*\r?\n)?' +
+      '(?:[ \t]*<output-file>[^\r\n]{1,32768}</output-file>[ \t]*\r?\n)?' +
+      '[ \t]*<status>[ \t]*(?<status>[A-Za-z]+)[ \t]*</status>[ \t]*\r?\n' +
+      '[ \t]*<summary>'
+    $header = [regex]::Match($Content, $headerPattern)
+    if (-not $header.Success) { return $null }
+    $afterHeader = $Content.Substring($header.Index + $header.Length)
+    if (-not [regex]::IsMatch(
+        $afterHeader,
+        '^[ \t]*</task-notification>[ \t]*\r?$',
+        [Text.RegularExpressions.RegexOptions]::Multiline)) { return $null }
+    $id = [string]$header.Groups['id'].Value
+    $status = ([string]$header.Groups['status'].Value).ToLowerInvariant()
+    if ($status -notin @('completed', 'failed', 'killed')) { return $null }
+    return [pscustomobject]@{
+      id = $id
+      status = $status
+      task_type = [string]$header.Groups['tasktype'].Value
+    }
+  } catch {
+    return $null
+  }
+}
+
+function Get-AudnCodeTerminalClaimsFromPrompt {
+  param([string]$Prompt)
+
+  $claim = ConvertFrom-AudnCodeTaskNotification -Content $Prompt
+  if ($null -eq $claim) { return @() }
+  return @($claim)
+}
+
+function Start-AudnCodeBackgroundLifecycleMutation {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [int64]$HookStartTicks
+  )
+
+  $token = [Guid]::NewGuid().ToString('N')
+  $result = [ordered]@{
+    armed = $false
+    token = $token
+    session_id = $SessionId
+    hook_start_ticks = [int64]$HookStartTicks
+    correlation = $null
+    runtime_info = $null
+    guard_info = $null
+  }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info -or $HookStartTicks -le 0) { return [pscustomobject]$result }
+  $correlation = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedTranscriptPath, $lockedHookStartTicks)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $null }
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+          -not [string]::Equals([string](Get-ObjectValue $state 'transcript_path' ''), $lockedTranscriptPath, [StringComparison]::OrdinalIgnoreCase) -or
+          [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0) -le 0 -or
+          $lockedHookStartTicks -le [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)) { return $null }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'background'
+      $pendingCount = @((Get-ObjectValue $pendingState 'tokens' @())).Count
+      return [pscustomobject]@{
+        epoch = [int64](Get-ObjectValue $state 'epoch' 0)
+        host_pid = [int](Get-ObjectValue $state 'audncode_host_pid' 0)
+        host_started_unix_ms = [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0)
+        home = [string](Get-ObjectValue $state 'audncode_home' '')
+        runtime_key = [string](Get-ObjectValue $state 'audncode_runtime_key' '')
+        prior_loss = -not [bool](Get-ObjectValue $pendingState 'valid' $false) -or
+          ([bool](Get-ObjectValue $state 'audncode_background_lifecycle_unverifiable' $false) -and $pendingCount -eq 0)
+      }
+    } -Arguments @($info.path, $SessionId, $TranscriptPath, $HookStartTicks)
+  if ($null -eq $correlation) { return [pscustomobject]$result }
+  $result.correlation = $correlation
+
+  $sessionPrearmed = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedEpoch, $lockedRuntimeKey, $lockedToken)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $false }
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [int64](Get-ObjectValue $state 'epoch' 0) -ne [int64]$lockedEpoch -or
+          [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+          [string](Get-ObjectValue $state 'audncode_runtime_key' '') -ne $lockedRuntimeKey) { return $false }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'background'
+      $pendingTokens = @((Get-ObjectValue $pendingState 'tokens' @()))
+      if (-not [bool](Get-ObjectValue $pendingState 'valid' $false)) { $pendingTokens = @() }
+      if ($lockedToken -notin $pendingTokens) {
+        if ($pendingTokens.Count -ge $AudnCodeLifecycleMaxPendingTokens) { return $false }
+        $pendingTokens += $lockedToken
+      }
+      Set-RecordValue -Record $state -Name 'audncode_background_registry_valid' -Value $false
+      if (-not (Set-AudnCodeSessionLifecyclePendingTokens -Record $state -RegistryKind 'background' -Tokens $pendingTokens)) { return $false }
+      Set-RecordValue -Record $state -Name 'audncode_background_lifecycle_unverifiable' -Value $true
+      Set-RecordValue -Record $state -Name 'audncode_background_lifecycle_failure_reason' -Value 'audncode-background-lifecycle-pending'
+      Write-JsonAtomic -Path $lockedPath -Value $state
+      return $true
+    } -Arguments @($info.path, $SessionId, [int64]$correlation.epoch, [string]$correlation.runtime_key, $token)
+  if (-not [bool]$sessionPrearmed) { return [pscustomobject]$result }
+
+  $runtimeInfo = Get-AudnCodeRuntimeStateInfo `
+    -HomePath ([string]$correlation.home) `
+    -HostPid ([int]$correlation.host_pid) `
+    -HostStartedUnixMs ([int64]$correlation.host_started_unix_ms)
+  $guardInfo = if ($null -ne $runtimeInfo -and [string]$runtimeInfo.key -eq [string]$correlation.runtime_key) {
+    Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $runtimeInfo -RegistryKind 'background'
+  } else { $null }
+  $guardState = if ($null -ne $guardInfo) {
+    Update-AudnCodeLifecycleGuard `
+      -GuardInfo $guardInfo `
+      -Operation 'arm' `
+      -Token $token `
+      -ForceLost:([bool]$correlation.prior_loss)
+  } else { $null }
+  $result.runtime_info = $runtimeInfo
+  $result.guard_info = $guardInfo
+  if ($null -ne $guardState) { Wait-AudnCodeLifecycleArmTestBarrier -RegistryKind 'background' -Token $token }
+  $stickyLoss = $null -eq $guardState -or [bool](Get-ObjectValue $guardState 'lost' $true)
+  $sessionArmed = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedEpoch, $lockedRuntimeKey, $lockedToken, $lockedStickyLoss)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $false }
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [int64](Get-ObjectValue $state 'epoch' 0) -ne [int64]$lockedEpoch -or
+          [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+          [string](Get-ObjectValue $state 'audncode_runtime_key' '') -ne $lockedRuntimeKey) { return $false }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'background'
+      if (-not [bool](Get-ObjectValue $pendingState 'valid' $false) -or
+          $lockedToken -notin @((Get-ObjectValue $pendingState 'tokens' @()))) { return $false }
+      Set-RecordValue -Record $state -Name 'audncode_background_registry_valid' -Value $false
+      if ($lockedStickyLoss) {
+        Set-RecordValue -Record $state -Name 'audncode_background_lifecycle_unverifiable' -Value $true
+        Set-RecordValue -Record $state -Name 'audncode_background_lifecycle_failure_reason' -Value 'audncode-background-lifecycle-unverifiable'
+      }
+      Write-JsonAtomic -Path $lockedPath -Value $state
+      return $true
+    } -Arguments @($info.path, $SessionId, [int64]$correlation.epoch, [string]$correlation.runtime_key, $token, [bool]$stickyLoss)
+  if (-not [bool]$sessionArmed) {
+    if ($null -ne $guardInfo) {
+      [void](Update-AudnCodeLifecycleGuard -GuardInfo $guardInfo -Operation 'fail' -Token $token)
+    }
+    return [pscustomobject]$result
+  }
+  $result.armed = $null -ne $guardState
+  return [pscustomobject]$result
+}
+
+function Add-AudnCodeBackgroundIds {
+  param(
+    [string]$SessionId,
+    [string[]]$BackgroundIds,
+    [object[]]$StartIncarnations = @(),
+    [string[]]$CompletedIds = @(),
+    [string]$TranscriptPath,
+    [int64]$HookStartTicks,
+    [object]$LifecycleArm = $null,
+    [switch]$MarkLocalAgentUiUncertain,
+    [switch]$Invalidate
+  )
+
+  $validIds = @($BackgroundIds | Where-Object {
+      -not [string]::IsNullOrWhiteSpace($_) -and $_.Length -le 160 -and $_ -match '^[A-Za-z0-9][A-Za-z0-9._:-]*$'
+    } | Select-Object -Unique)
+  $validCompletedIds = @($CompletedIds | Where-Object {
+      -not [string]::IsNullOrWhiteSpace($_) -and $_.Length -le 160 -and $_ -match '^[A-Za-z0-9][A-Za-z0-9._:-]*$'
+    } | Select-Object -Unique)
+  if ($validIds.Count -eq 0 -and $validCompletedIds.Count -eq 0 -and $StartIncarnations.Count -eq 0 -and
+      -not $MarkLocalAgentUiUncertain -and -not $Invalidate) { return $true }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $false }
+  $requiresLifecycleCommit = $null -ne $LifecycleArm
+  $armToken = if ($requiresLifecycleCommit) { [string](Get-ObjectValue $LifecycleArm 'token' '') } else { '' }
+  $armCorrelation = if ($requiresLifecycleCommit) { Get-ObjectValue $LifecycleArm 'correlation' } else { $null }
+  $expectedEpoch = if ($null -ne $armCorrelation) { [int64](Get-ObjectValue $armCorrelation 'epoch' 0) } else { [int64]0 }
+  if ($requiresLifecycleCommit -and
+      (-not [bool](Get-ObjectValue $LifecycleArm 'armed' $false) -or $armToken -notmatch '^[a-f0-9]{32}$' -or
+        $null -eq $armCorrelation -or $expectedEpoch -le 0)) { return $false }
+  $correlation = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedTranscriptPath, $lockedHookStartTicks, $lockedExpectedEpoch, $lockedToken)
+      $state = $null
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $null }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'background'
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+          -not [string]::Equals([string](Get-ObjectValue $state 'transcript_path' ''), $lockedTranscriptPath, [StringComparison]::OrdinalIgnoreCase) -or
+          ($lockedExpectedEpoch -gt 0 -and [int64](Get-ObjectValue $state 'epoch' 0) -ne $lockedExpectedEpoch) -or
+          (-not [string]::IsNullOrEmpty($lockedToken) -and
+            (-not [bool](Get-ObjectValue $pendingState 'valid' $false) -or
+              $lockedToken -notin @((Get-ObjectValue $pendingState 'tokens' @())))) -or
+          [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0) -le 0 -or
+          $lockedHookStartTicks -le [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)) {
+        return $null
+      }
+      return [pscustomobject]@{
+        epoch = [int64](Get-ObjectValue $state 'epoch' 0)
+        host_pid = [int](Get-ObjectValue $state 'audncode_host_pid' 0)
+        host_started_unix_ms = [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0)
+        home = [string](Get-ObjectValue $state 'audncode_home' '')
+        runtime_key = [string](Get-ObjectValue $state 'audncode_runtime_key' '')
+      }
+    } -Arguments @($info.path, $SessionId, $TranscriptPath, $HookStartTicks, $expectedEpoch, $armToken)
+  if ($null -eq $correlation -or [int]$correlation.host_pid -le 0 -or
+      [int64]$correlation.host_started_unix_ms -le 0 -or [string]::IsNullOrWhiteSpace([string]$correlation.home)) {
+    return $false
+  }
+  $audnHostSession = Get-AudnCodeHostSession `
+    -SessionId $SessionId `
+    -HomePath ([string]$correlation.home) `
+    -ExpectedHostPid ([int]$correlation.host_pid)
+  if (-not [bool]$audnHostSession.ok -or
+      [int64]$audnHostSession.started_unix_ms -ne [int64]$correlation.host_started_unix_ms) {
+    return $false
+  }
+  $runtimeInfo = Get-AudnCodeRuntimeStateInfo `
+    -HomePath ([string]$correlation.home) `
+    -HostPid ([int]$correlation.host_pid) `
+    -HostStartedUnixMs ([int64]$correlation.host_started_unix_ms)
+  if ($null -eq $runtimeInfo -or [string]$runtimeInfo.key -ne [string]$correlation.runtime_key) { return $false }
+  $guardInfo = $null
+  if ($requiresLifecycleCommit) {
+    $guardInfo = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $runtimeInfo -RegistryKind 'background'
+    $armedGuardInfo = Get-ObjectValue $LifecycleArm 'guard_info'
+    if ($null -eq $guardInfo -or $null -eq $armedGuardInfo -or
+        [string]$guardInfo.key -ne [string](Get-ObjectValue $armedGuardInfo 'key' '')) { return $false }
+  }
+  $runtimeState = Update-AudnCodeRuntimeBackgroundState `
+    -RuntimeInfo $runtimeInfo `
+    -AddIds $validIds `
+    -StartIncarnations $StartIncarnations `
+    -CompletedIds $validCompletedIds `
+    -MarkLocalAgentUiUncertain:$MarkLocalAgentUiUncertain `
+    -Invalidate:$Invalidate
+  if ($null -eq $runtimeState) { return $false }
+  if ($requiresLifecycleCommit) {
+    if (-not [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)) { return $false }
+    $guardState = Update-AudnCodeLifecycleGuard `
+      -GuardInfo $guardInfo `
+      -Operation 'commit' `
+      -Token $armToken
+    if ($null -eq $guardState -or -not [bool](Get-ObjectValue $guardState 'operation_committed' $false)) { return $false }
+  }
+  # Keep a diagnostic snapshot in the current logical session. Finality reads
+  # the runtime registry directly, so /clear and /resume cannot lose tasks.
+  $sessionUpdated = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedEpoch, $lockedRuntimeKey, $lockedRuntimeState, $lockedToken)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $false }
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'background'
+      $pendingTokens = @((Get-ObjectValue $pendingState 'tokens' @()))
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [int64](Get-ObjectValue $state 'epoch' 0) -ne [int64]$lockedEpoch -or
+          [string](Get-ObjectValue $state 'audncode_runtime_key' '') -ne $lockedRuntimeKey -or
+          (-not [string]::IsNullOrEmpty($lockedToken) -and
+            (-not [bool](Get-ObjectValue $pendingState 'valid' $false) -or $lockedToken -notin $pendingTokens))) { return $false }
+      Set-RecordValue -Record $state -Name 'audncode_background_ids' -Value @((Get-ObjectValue $lockedRuntimeState 'background_ids' @()))
+      if (-not [string]::IsNullOrEmpty($lockedToken)) {
+        $pendingTokens = @($pendingTokens | Where-Object { $_ -ne $lockedToken })
+        if (-not (Set-AudnCodeSessionLifecyclePendingTokens -Record $state -RegistryKind 'background' -Tokens $pendingTokens)) { return $false }
+      }
+      $allCommitted = $pendingTokens.Count -eq 0
+      $previousLifecycleReason = [string](Get-ObjectValue $state 'audncode_background_lifecycle_failure_reason' '')
+      $stickyLifecycleLoss = [bool](Get-ObjectValue $state 'audncode_background_lifecycle_unverifiable' $false) -and
+        $previousLifecycleReason -ne 'audncode-background-lifecycle-pending'
+      Set-RecordValue -Record $state -Name 'audncode_background_registry_valid' -Value `
+        ([bool](Get-ObjectValue $lockedRuntimeState 'registry_valid' $false) -and $allCommitted -and -not $stickyLifecycleLoss)
+      Set-RecordValue -Record $state -Name 'audncode_background_lifecycle_unverifiable' -Value `
+        ($stickyLifecycleLoss -or -not $allCommitted)
+      Set-RecordValue -Record $state -Name 'audncode_background_lifecycle_failure_reason' -Value `
+        $(if ($stickyLifecycleLoss) {
+            if ([string]::IsNullOrWhiteSpace($previousLifecycleReason)) { 'audncode-background-lifecycle-unverifiable' } else { $previousLifecycleReason }
+          } elseif ($allCommitted) { '' } else { 'audncode-background-lifecycle-pending' })
+      Write-JsonAtomic -Path $lockedPath -Value $state
+      return $true
+    } -Arguments @($info.path, $SessionId, [int64]$correlation.epoch, [string]$runtimeInfo.key, $runtimeState, $armToken)
+  if ($requiresLifecycleCommit -and -not [bool]$sessionUpdated) { return $false }
+  return $true
+}
+
+function Set-AudnCodeBackgroundLifecycleUnverifiable {
+  param(
+    [string]$SessionId,
+    [int64]$HookStartTicks,
+    [object]$LifecycleArm,
+    [string]$Reason = 'audncode-background-lifecycle-unverifiable'
+  )
+
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info -or $HookStartTicks -le 0) { return $false }
+  $guardInfo = if ($null -ne $LifecycleArm) { Get-ObjectValue $LifecycleArm 'guard_info' } else { $null }
+  $guardToken = if ($null -ne $LifecycleArm) { [string](Get-ObjectValue $LifecycleArm 'token' '') } else { '' }
+  $armCorrelation = if ($null -ne $LifecycleArm) { Get-ObjectValue $LifecycleArm 'correlation' } else { $null }
+  $expectedEpoch = if ($null -ne $armCorrelation) { [int64](Get-ObjectValue $armCorrelation 'epoch' 0) } else { [int64]0 }
+  if ($null -eq $guardInfo) {
+    $guardInfo = Get-AudnCodeLifecycleGuardInfoFromCorrelation -Correlation $armCorrelation -RegistryKind 'background'
+  }
+  if ($null -eq $guardInfo) {
+    $fallbackCorrelation = Invoke-WithClaudeSessionLock -Info $info -Action {
+        param($lockedPath, $lockedSessionId, $lockedHookStartTicks, $lockedExpectedEpoch)
+        try { $state = Read-JsonFile -Path $lockedPath } catch { return $null }
+        $busyHookStartTicks = [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)
+        if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+            [string](Get-ObjectValue $state 'state' '') -notin @('busy', 'idle') -or
+            ($lockedExpectedEpoch -gt 0 -and [int64](Get-ObjectValue $state 'epoch' 0) -ne $lockedExpectedEpoch) -or
+            $busyHookStartTicks -le 0 -or $lockedHookStartTicks -le $busyHookStartTicks) { return $null }
+        return [pscustomobject]@{
+          home = [string](Get-ObjectValue $state 'audncode_home' '')
+          host_pid = [int](Get-ObjectValue $state 'audncode_host_pid' 0)
+          host_started_unix_ms = [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0)
+          runtime_key = [string](Get-ObjectValue $state 'audncode_runtime_key' '')
+        }
+      } -Arguments @($info.path, $SessionId, $HookStartTicks, $expectedEpoch)
+    $guardInfo = Get-AudnCodeLifecycleGuardInfoFromCorrelation -Correlation $fallbackCorrelation -RegistryKind 'background'
+  }
+  if ($null -ne $guardInfo) {
+    [void](Update-AudnCodeLifecycleGuard -GuardInfo $guardInfo -Operation 'fail' -Token $guardToken)
+  }
+  $updated = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedHookStartTicks, $lockedExpectedEpoch, $lockedReason, $lockedToken)
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $false }
+      $busyHookStartTicks = [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0)
+      if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+          [string](Get-ObjectValue $state 'state' '') -notin @('busy', 'idle') -or
+          ($lockedExpectedEpoch -gt 0 -and [int64](Get-ObjectValue $state 'epoch' 0) -ne $lockedExpectedEpoch) -or
+          $busyHookStartTicks -le 0 -or $lockedHookStartTicks -le $busyHookStartTicks) { return $false }
+      Set-RecordValue -Record $state -Name 'audncode_background_registry_valid' -Value $false
+      Set-RecordValue -Record $state -Name 'audncode_background_lifecycle_unverifiable' -Value $true
+      $pendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $state -RegistryKind 'background'
+      $pendingTokens = if ([bool](Get-ObjectValue $pendingState 'valid' $false)) {
+        @((Get-ObjectValue $pendingState 'tokens' @()))
+      } else { @() }
+      $remainingTokens = @($pendingTokens | Where-Object { [string]::IsNullOrEmpty($lockedToken) -or $_ -ne $lockedToken })
+      [void](Set-AudnCodeSessionLifecyclePendingTokens -Record $state -RegistryKind 'background' -Tokens $remainingTokens)
+      Set-RecordValue -Record $state -Name 'audncode_background_lifecycle_failure_reason' -Value `
+        (Sanitize-NotificationText -Text $lockedReason -MaxLength 120)
+      Write-JsonAtomic -Path $lockedPath -Value $state
+      return $true
+    } -Arguments @($info.path, $SessionId, $HookStartTicks, $expectedEpoch, $Reason, $guardToken)
+  return [bool]$updated
+}
+
+function Get-AudnCodeBytesHash {
+  param([byte[]]$Bytes)
+
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+function Test-AudnCodeKillAllSummary {
+  param([string]$Content)
+
+  if ([string]::IsNullOrWhiteSpace($Content) -or $Content.Length -gt $AudnCodeQueueMaxLineChars) { return $false }
+  return [regex]::IsMatch($Content, '\ABackground agent "[\s\S]+" was stopped by the user\.\z', [Text.RegularExpressions.RegexOptions]::CultureInvariant) -or
+    [regex]::IsMatch($Content, '\A[1-9][0-9]{0,5} background agents were stopped by the user: [\s\S]+\.\z', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+}
+
+function Get-AudnCodeAcceptedQueuedContent {
+  param(
+    [object]$Entry,
+    [string]$SessionId
+  )
+
+  if ($null -eq $Entry -or [string](Get-ObjectValue $Entry 'sessionId' '') -ne $SessionId -or
+      [string](Get-ObjectValue $Entry 'userType' '') -ne 'external' -or
+      -not [string]::IsNullOrWhiteSpace([string](Get-ObjectValue $Entry 'agentId' ''))) { return $null }
+  $sidechain = $Entry.PSObject.Properties['isSidechain']
+  if ($null -ne $sidechain -and ($sidechain.Value -isnot [bool] -or [bool]$sidechain.Value)) { return $null }
+  $type = [string](Get-ObjectValue $Entry 'type' '')
+  if ($type -eq 'attachment') {
+    $attachment = Get-ObjectValue $Entry 'attachment'
+    if ($null -eq $attachment -or [string](Get-ObjectValue $attachment 'type' '') -ne 'queued_command' -or
+        [string](Get-ObjectValue $attachment 'commandMode' '') -ne 'task-notification') { return $null }
+    $promptProperty = $attachment.PSObject.Properties['prompt']
+    if ($null -ne $promptProperty -and $promptProperty.Value -is [string]) { return [string]$promptProperty.Value }
+    return $null
+  }
+  if ($type -eq 'user') {
+    $origin = Get-ObjectValue $Entry 'origin'
+    $message = Get-ObjectValue $Entry 'message'
+    $contentProperty = if ($null -ne $message) { $message.PSObject.Properties['content'] } else { $null }
+    if ($null -ne $origin -and [string](Get-ObjectValue $origin 'kind' '') -eq 'task-notification' -and
+        $null -ne $message -and [string](Get-ObjectValue $message 'role' '') -eq 'user' -and
+        $null -ne $contentProperty -and $contentProperty.Value -is [string]) {
+      return [string]$contentProperty.Value
+    }
+  }
+  return $null
+}
+
+function Get-AudnCodeQueueTranscriptSnapshot {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [int64]$HostStartedUnixMs
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; operations = @(); accepted = @(); length = -1; write_ticks = 0 }
+  $resolved = [IO.Path]::GetFullPath($TranscriptPath)
+  $cacheKey = Get-Sha256Hex ("audn-queue/v2|$resolved|$SessionId|$HostStartedUnixMs")
+  $before = Get-Item -LiteralPath $resolved -ErrorAction Stop
+  if ([int64]$before.Length -gt $AudnCodeQueueMaxTranscriptBytes) { return $unknown }
+  $cached = if ($script:AudnCodeQueueStateCache.ContainsKey($cacheKey)) { $script:AudnCodeQueueStateCache[$cacheKey] } else { $null }
+  if ($null -ne $cached -and
+      [int64](Get-ObjectValue $cached 'length' -1) -eq [int64]$before.Length -and
+      [int64](Get-ObjectValue $cached 'write_ticks' 0) -eq [int64]$before.LastWriteTimeUtc.Ticks -and
+      [int64](Get-ObjectValue $cached 'creation_ticks' 0) -eq [int64]$before.CreationTimeUtc.Ticks) {
+    return $cached
+  }
+
+  $stream = $null
+  $reader = $null
+  try {
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    if ([int64]$stream.Length -ne [int64]$before.Length) { return $unknown }
+    if ($stream.Length -gt 0) {
+      [void]$stream.Seek(-1, [IO.SeekOrigin]::End)
+      if ($stream.ReadByte() -ne 10) { return $unknown }
+    }
+
+    $startOffset = [int64]0
+    $rowIndex = 0
+    $operations = New-Object 'System.Collections.Generic.List[object]'
+    $accepted = New-Object 'System.Collections.Generic.List[object]'
+    if ($null -ne $cached -and
+        [int64](Get-ObjectValue $cached 'length' -1) -ge 0 -and
+        [int64](Get-ObjectValue $cached 'length' -1) -lt [int64]$before.Length -and
+        [int64](Get-ObjectValue $cached 'creation_ticks' 0) -eq [int64]$before.CreationTimeUtc.Ticks) {
+      $oldLength = [int64](Get-ObjectValue $cached 'length' 0)
+      $anchorStart = [int64](Get-ObjectValue $cached 'anchor_start' 0)
+      $anchorHash = [string](Get-ObjectValue $cached 'anchor_hash' '')
+      $anchorLength = [int]($oldLength - $anchorStart)
+      $anchorValid = $anchorStart -ge 0 -and $anchorLength -ge 0 -and $anchorLength -le 65536
+      if ($anchorValid -and $anchorLength -gt 0) {
+        [void]$stream.Seek($anchorStart, [IO.SeekOrigin]::Begin)
+        $anchorBytes = New-Object byte[] $anchorLength
+        $readTotal = 0
+        while ($readTotal -lt $anchorLength) {
+          $readNow = $stream.Read($anchorBytes, $readTotal, $anchorLength - $readTotal)
+          if ($readNow -le 0) { $anchorValid = $false; break }
+          $readTotal += $readNow
+        }
+        if ($anchorValid) { $anchorValid = (Get-AudnCodeBytesHash -Bytes $anchorBytes) -eq $anchorHash }
+      }
+      if ($anchorValid) {
+        $startOffset = $oldLength
+        $rowIndex = [int](Get-ObjectValue $cached 'row_count' 0)
+        foreach ($item in @((Get-ObjectValue $cached 'operations' @()))) { $operations.Add($item) }
+        foreach ($item in @((Get-ObjectValue $cached 'accepted' @()))) { $accepted.Add($item) }
+        if ($operations.Count -gt $AudnCodeQueueMaxEvidenceRecords -or
+            $accepted.Count -gt $AudnCodeQueueMaxEvidenceRecords) { return $unknown }
+      }
+    }
+
+    [void]$stream.Seek($startOffset, [IO.SeekOrigin]::Begin)
+    # Keep the stream open after disposing the reader so the stable tail anchor
+    # can be captured without reopening a different file snapshot.
+    $reader = New-Object System.IO.StreamReader($stream, $Utf8StrictNoBom, ($startOffset -eq 0), 65536, $true)
+    while (-not $reader.EndOfStream) {
+      $rowIndex++
+      $line = [string]$reader.ReadLine()
+      if ($startOffset -eq 0 -and $rowIndex -eq 1) { $line = $line.TrimStart([char]0xFEFF) }
+      $looksRelevant = $line -match '"type"\s*:\s*"queue-operation"' -or
+        $line -match '"type"\s*:\s*"attachment"' -or $line -match '"origin"\s*:'
+      if ($line.Length -gt $AudnCodeQueueMaxLineChars) {
+        if ($looksRelevant) { return $unknown }
+        continue
+      }
+      if (-not $looksRelevant) { continue }
+      $entry = $null
+      try { $entry = ConvertFrom-StrictJsonText -Text $line } catch { return $unknown }
+      $timestamp = [DateTimeOffset]::MinValue
+      $style = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+      if (-not [DateTimeOffset]::TryParse([string](Get-ObjectValue $entry 'timestamp' ''), [Globalization.CultureInfo]::InvariantCulture, $style, [ref]$timestamp)) {
+        if ([string](Get-ObjectValue $entry 'type' '') -eq 'queue-operation') { return $unknown }
+        continue
+      }
+      if ($timestamp.ToUnixTimeMilliseconds() -lt ($HostStartedUnixMs - 2000)) { continue }
+      if ([string](Get-ObjectValue $entry 'type' '') -eq 'queue-operation') {
+        if ([string](Get-ObjectValue $entry 'sessionId' '') -ne $SessionId) { continue }
+        $operation = [string](Get-ObjectValue $entry 'operation' '')
+        if ($operation -notin @('enqueue', 'dequeue', 'remove', 'popAll')) { return $unknown }
+        $contentProperty = $entry.PSObject.Properties['content']
+        if ($null -ne $contentProperty -and $contentProperty.Value -isnot [string]) { return $unknown }
+        if ($null -ne $contentProperty -and ([string]$contentProperty.Value).Length -gt $AudnCodeQueueMaxContentChars) { return $unknown }
+        if ($operations.Count -ge $AudnCodeQueueMaxEvidenceRecords) { return $unknown }
+        $operations.Add([pscustomobject]@{
+            timestamp_ticks = [int64]$timestamp.UtcDateTime.Ticks
+            row_index = $rowIndex
+            operation = $operation
+            content = if ($null -ne $contentProperty) { [string]$contentProperty.Value } else { '' }
+            content_known = $null -ne $contentProperty
+          })
+        continue
+      }
+      $acceptedContent = Get-AudnCodeAcceptedQueuedContent -Entry $entry -SessionId $SessionId
+      if ($null -ne $acceptedContent) {
+        if (([string]$acceptedContent).Length -gt $AudnCodeQueueMaxContentChars -or
+            $accepted.Count -ge $AudnCodeQueueMaxEvidenceRecords) { return $unknown }
+        $accepted.Add([pscustomobject]@{
+            timestamp_ticks = [int64]$timestamp.UtcDateTime.Ticks
+            row_index = $rowIndex
+            content = [string]$acceptedContent
+          })
+      }
+    }
+    $reader.Dispose()
+    $reader = $null
+    $after = Get-Item -LiteralPath $resolved -ErrorAction Stop
+    if ([int64]$after.Length -ne [int64]$before.Length -or
+        [int64]$after.LastWriteTimeUtc.Ticks -ne [int64]$before.LastWriteTimeUtc.Ticks -or
+        [int64]$after.CreationTimeUtc.Ticks -ne [int64]$before.CreationTimeUtc.Ticks) { return $unknown }
+
+    $anchorStart = [Math]::Max([int64]0, [int64]$before.Length - 65536)
+    $anchorLength = [int]([int64]$before.Length - $anchorStart)
+    $anchorHash = ''
+    if ($anchorLength -gt 0) {
+      [void]$stream.Seek($anchorStart, [IO.SeekOrigin]::Begin)
+      $anchorBytes = New-Object byte[] $anchorLength
+      $readTotal = 0
+      while ($readTotal -lt $anchorLength) {
+        $readNow = $stream.Read($anchorBytes, $readTotal, $anchorLength - $readTotal)
+        if ($readNow -le 0) { return $unknown }
+        $readTotal += $readNow
+      }
+      $anchorHash = Get-AudnCodeBytesHash -Bytes $anchorBytes
+    }
+    $snapshot = [pscustomobject]@{
+      state = 'ok'
+      operations = @($operations.ToArray())
+      accepted = @($accepted.ToArray())
+      length = [int64]$before.Length
+      write_ticks = [int64]$before.LastWriteTimeUtc.Ticks
+      creation_ticks = [int64]$before.CreationTimeUtc.Ticks
+      row_count = $rowIndex
+      anchor_start = $anchorStart
+      anchor_hash = $anchorHash
+    }
+    $script:AudnCodeQueueStateCache[$cacheKey] = $snapshot
+    if ($script:AudnCodeQueueStateCache.Count -gt 128) {
+      foreach ($oldKey in @($script:AudnCodeQueueStateCache.Keys | Select-Object -First ($script:AudnCodeQueueStateCache.Count - 128))) {
+        $script:AudnCodeQueueStateCache.Remove($oldKey)
+      }
+    }
+    return $snapshot
+  } catch {
+    $script:AudnCodeQueueStateCache.Remove($cacheKey)
+    return $unknown
+  } finally {
+    if ($null -ne $reader) { $reader.Dispose() } elseif ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
+function Get-AudnCodeQueueState {
+  param(
+    [object[]]$Sessions,
+    [int64]$HostStartedUnixMs,
+    [string]$HomePath = $AudnCodeHome
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; count = -1; reason = 'audncode-queue-unverifiable'; fingerprint = '' }
+  if ($HostStartedUnixMs -le 0 -or @($Sessions).Count -eq 0 -or @($Sessions).Count -gt 256) { return $unknown }
+  try {
+    $snapshots = New-Object 'System.Collections.Generic.List[object]'
+    $seenSessions = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $fingerprintParts = New-Object 'System.Collections.Generic.List[string]'
+    $lineageTranscriptBytes = [int64]0
+    $lineageIndex = 0
+    foreach ($session in @($Sessions)) {
+      $sessionId = [string](Get-ObjectValue $session 'session_id' '')
+      $transcriptPath = [string](Get-ObjectValue $session 'transcript_path' '')
+      if (-not $seenSessions.Add($sessionId) -or
+          -not (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath -HomePath $HomePath)) { return $unknown }
+      $transcriptInfo = Get-Item -LiteralPath $transcriptPath -ErrorAction Stop
+      $lineageTranscriptBytes += [int64]$transcriptInfo.Length
+      if ([int64]$transcriptInfo.Length -gt $AudnCodeQueueMaxTranscriptBytes -or
+          $lineageTranscriptBytes -gt $AudnCodeQueueMaxTranscriptBytes) { return $unknown }
+      $snapshot = Get-AudnCodeQueueTranscriptSnapshot -SessionId $sessionId -TranscriptPath $transcriptPath -HostStartedUnixMs $HostStartedUnixMs
+      if ([string]$snapshot.state -ne 'ok') { return $unknown }
+      $snapshots.Add([pscustomobject]@{ lineage_index = $lineageIndex; snapshot = $snapshot })
+      $fingerprintParts.Add("$sessionId|$($snapshot.length)|$($snapshot.write_ticks)|$($snapshot.anchor_hash)")
+      $lineageIndex++
+    }
+    $lineageFingerprint = Get-Sha256Hex (($fingerprintParts.ToArray()) -join "`n")
+    $lineageCacheKey = Get-Sha256Hex ("audn-queue-lineage/v1|$([IO.Path]::GetFullPath($HomePath))|$HostStartedUnixMs|$lineageFingerprint")
+    if ($script:AudnCodeQueueLineageCache.ContainsKey($lineageCacheKey)) {
+      return $script:AudnCodeQueueLineageCache[$lineageCacheKey]
+    }
+
+    # A changed transcript extends only its cached row fold. Rebuild the small
+    # cross-session ordering view only when the lineage fingerprint changes;
+    # the repeated settle/precommit gates are O(session count) when unchanged.
+    $operations = New-Object 'System.Collections.Generic.List[object]'
+    $accepted = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($sessionSnapshot in $snapshots) {
+      $lineageIndex = [int]$sessionSnapshot.lineage_index
+      $snapshot = $sessionSnapshot.snapshot
+      foreach ($item in @($snapshot.operations)) {
+        $operations.Add([pscustomobject]@{
+            timestamp_ticks = [int64]$item.timestamp_ticks
+            lineage_index = $lineageIndex
+            row_index = [int]$item.row_index
+            operation = [string]$item.operation
+            content = [string]$item.content
+            content_known = [bool]$item.content_known
+          })
+      }
+      foreach ($item in @($snapshot.accepted)) {
+        $accepted.Add([pscustomobject]@{
+            timestamp_ticks = [int64]$item.timestamp_ticks
+            lineage_index = $lineageIndex
+            row_index = [int]$item.row_index
+            content = [string]$item.content
+          })
+      }
+    }
+    $ordered = @($operations | Sort-Object timestamp_ticks, lineage_index, row_index)
+    $orderedAccepted = @($accepted | Sort-Object timestamp_ticks, lineage_index, row_index)
+    for ($index = 1; $index -lt $ordered.Count; $index++) {
+      if ([int64]$ordered[$index].timestamp_ticks -eq [int64]$ordered[$index - 1].timestamp_ticks -and
+          [int]$ordered[$index].lineage_index -ne [int]$ordered[$index - 1].lineage_index) { return $unknown }
+    }
+
+    # clearCommandQueue() is intentionally not logged upstream. In AudnCode
+    # 0.9.1 its only call is immediately followed by an aggregate kill-all
+    # task notification. The same notification can also be emitted by Ctrl+C
+    # without clearing, so the enqueue text alone is not a reset. Once that
+    # exact queued command is observed as accepted in the transcript, every
+    # command ahead of it has necessarily been consumed or cleared.
+    $resetOperation = $null
+    $resetProof = $null
+    foreach ($operation in $ordered) {
+      if ([string]$operation.operation -ne 'enqueue' -or -not [bool]$operation.content_known -or
+          -not (Test-AudnCodeKillAllSummary -Content ([string]$operation.content))) { continue }
+      foreach ($proof in $orderedAccepted) {
+        $proofAfterOperation = [int64]$proof.timestamp_ticks -gt [int64]$operation.timestamp_ticks -or
+          ([int64]$proof.timestamp_ticks -eq [int64]$operation.timestamp_ticks -and
+           ([int]$proof.lineage_index -gt [int]$operation.lineage_index -or
+            ([int]$proof.lineage_index -eq [int]$operation.lineage_index -and [int]$proof.row_index -gt [int]$operation.row_index)))
+        if ($proofAfterOperation -and [string]$proof.content -eq [string]$operation.content) {
+          if ($null -eq $resetProof -or [int64]$proof.timestamp_ticks -gt [int64]$resetProof.timestamp_ticks -or
+              ([int64]$proof.timestamp_ticks -eq [int64]$resetProof.timestamp_ticks -and [int]$proof.row_index -gt [int]$resetProof.row_index)) {
+            $resetOperation = $operation
+            $resetProof = $proof
+          }
+          break
+        }
+      }
+    }
+
+    $balance = 0
+    if ($null -ne $resetProof) {
+      # Conservatively retain every enqueue between reset and proof that lacks
+      # its own queued-command acceptance evidence. This covers later-priority
+      # task notifications without reviving the silently cleared prefix.
+      $usedAcceptedProofs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+      foreach ($operation in $ordered) {
+        $afterReset = [int64]$operation.timestamp_ticks -gt [int64]$resetOperation.timestamp_ticks -or
+          ([int64]$operation.timestamp_ticks -eq [int64]$resetOperation.timestamp_ticks -and
+           ([int]$operation.lineage_index -gt [int]$resetOperation.lineage_index -or
+            ([int]$operation.lineage_index -eq [int]$resetOperation.lineage_index -and [int]$operation.row_index -gt [int]$resetOperation.row_index)))
+        $beforeProof = [int64]$operation.timestamp_ticks -lt [int64]$resetProof.timestamp_ticks -or
+          ([int64]$operation.timestamp_ticks -eq [int64]$resetProof.timestamp_ticks -and
+           ([int]$operation.lineage_index -lt [int]$resetProof.lineage_index -or
+            ([int]$operation.lineage_index -eq [int]$resetProof.lineage_index -and [int]$operation.row_index -lt [int]$resetProof.row_index)))
+        if (-not $afterReset -or -not $beforeProof -or [string]$operation.operation -ne 'enqueue') { continue }
+        $consumed = $false
+        if ([bool]$operation.content_known) {
+          foreach ($proof in $orderedAccepted) {
+            if ([string]$proof.content -ne [string]$operation.content) { continue }
+            $proofKey = "$($proof.lineage_index)|$($proof.row_index)|$($proof.timestamp_ticks)"
+            if ($usedAcceptedProofs.Contains($proofKey)) { continue }
+            $proofAfterEnqueue = [int64]$proof.timestamp_ticks -gt [int64]$operation.timestamp_ticks -or
+              ([int64]$proof.timestamp_ticks -eq [int64]$operation.timestamp_ticks -and
+               ([int]$proof.lineage_index -gt [int]$operation.lineage_index -or
+                ([int]$proof.lineage_index -eq [int]$operation.lineage_index -and [int]$proof.row_index -gt [int]$operation.row_index)))
+            $proofNoLaterThanReset = [int64]$proof.timestamp_ticks -lt [int64]$resetProof.timestamp_ticks -or
+              ([int64]$proof.timestamp_ticks -eq [int64]$resetProof.timestamp_ticks -and
+               ([int]$proof.lineage_index -lt [int]$resetProof.lineage_index -or
+                ([int]$proof.lineage_index -eq [int]$resetProof.lineage_index -and [int]$proof.row_index -le [int]$resetProof.row_index)))
+            if ($proofAfterEnqueue -and $proofNoLaterThanReset -and $usedAcceptedProofs.Add($proofKey)) {
+              $consumed = $true
+              break
+            }
+          }
+        }
+        if (-not $consumed) { $balance++ }
+      }
+      foreach ($operation in $ordered) {
+        $afterProof = [int64]$operation.timestamp_ticks -gt [int64]$resetProof.timestamp_ticks -or
+          ([int64]$operation.timestamp_ticks -eq [int64]$resetProof.timestamp_ticks -and
+           ([int]$operation.lineage_index -gt [int]$resetProof.lineage_index -or
+            ([int]$operation.lineage_index -eq [int]$resetProof.lineage_index -and [int]$operation.row_index -gt [int]$resetProof.row_index)))
+        if (-not $afterProof) { continue }
+        if ([string]$operation.operation -eq 'enqueue') { $balance++ } else { $balance-- }
+        if ($balance -lt 0) { return $unknown }
+      }
+    } else {
+      foreach ($operation in $ordered) {
+        if ([string]$operation.operation -eq 'enqueue') { $balance++ } else { $balance-- }
+        if ($balance -lt 0) { return $unknown }
+      }
+    }
+    $result = [pscustomobject]@{
+      state = if ($balance -gt 0) { 'busy' } else { 'idle' }
+      count = $balance
+      reason = if ($balance -gt 0) { 'audncode-command-queue-active' } else { 'audncode-command-queue-empty' }
+      fingerprint = $lineageFingerprint
+    }
+    $script:AudnCodeQueueLineageCache[$lineageCacheKey] = $result
+    if ($script:AudnCodeQueueLineageCache.Count -gt 128) {
+      foreach ($oldKey in @($script:AudnCodeQueueLineageCache.Keys | Select-Object -First ($script:AudnCodeQueueLineageCache.Count - 128))) {
+        $script:AudnCodeQueueLineageCache.Remove($oldKey)
+      }
+    }
+    return $result
+  } catch {
+    return $unknown
+  }
+}
+
+function Get-AudnCodeTeamState {
+  param(
+    [string]$SessionId,
+    [string]$HomePath = $AudnCodeHome,
+    [string]$AdditionalTeamName = '',
+    [bool]$AdditionalTeamNameValid = $true
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; count = -1; reason = 'audncode-team-unverifiable' }
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or [string]::IsNullOrWhiteSpace($SessionId) -or
+      -not $AdditionalTeamNameValid -or
+      (-not [string]::IsNullOrWhiteSpace($AdditionalTeamName) -and
+       ($AdditionalTeamName.Length -gt 200 -or $AdditionalTeamName -notmatch '^[A-Za-z0-9_-]+$'))) {
+    return $unknown
+  }
+  try {
+    $canonicalHomePath = [IO.Path]::GetFullPath($HomePath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $teamsRoot = [IO.Path]::GetFullPath((Join-Path $canonicalHomePath 'teams'))
+    if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHomePath -TargetPath $teamsRoot)) {
+      return $unknown
+    }
+    if (-not (Test-Path -LiteralPath $teamsRoot)) {
+      return [pscustomobject]@{ state = 'idle'; count = 0; reason = 'audncode-team-absent' }
+    }
+    if (-not (Test-Path -LiteralPath $teamsRoot -PathType Container)) { return $unknown }
+    $teamsRootBefore = Get-Item -LiteralPath $teamsRoot -Force -ErrorAction Stop
+    if (($teamsRootBefore.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $unknown }
+    $teamDirs = @(Get-ChildItem -LiteralPath $teamsRoot -Directory -ErrorAction Stop | Select-Object -First 129)
+    if ($teamDirs.Count -gt 128) { return $unknown }
+    $teamDirNames = @($teamDirs | ForEach-Object { $_.Name } | Sort-Object)
+    $matchedTeams = 0
+    foreach ($teamDir in $teamDirs) {
+      $teamDirectoryPath = [IO.Path]::GetFullPath($teamDir.FullName)
+      $configPath = [IO.Path]::GetFullPath((Join-Path $teamDirectoryPath 'config.json'))
+      if (($teamDir.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+          -not (Test-AudnCodePathHasNoReparseComponents -RootPath $teamsRoot -TargetPath $teamDirectoryPath) -or
+          -not (Test-AudnCodePathHasNoReparseComponents -RootPath $teamsRoot -TargetPath $configPath)) {
+        return $unknown
+      }
+      if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { return $unknown }
+      $before = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
+      if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $unknown }
+      if ([int64]$before.Length -gt $AudnCodeTeamConfigMaxBytes) { return $unknown }
+      $raw = [IO.File]::ReadAllText($configPath, $Utf8StrictNoBom)
+      $after = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
+      if (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+          [int64]$before.Length -ne [int64]$after.Length -or
+          [int64]$before.LastWriteTimeUtc.Ticks -ne [int64]$after.LastWriteTimeUtc.Ticks -or
+          [int64]$before.CreationTimeUtc.Ticks -ne [int64]$after.CreationTimeUtc.Ticks -or
+          -not (Test-AudnCodePathHasNoReparseComponents -RootPath $teamsRoot -TargetPath $configPath)) {
+        return $unknown
+      }
+      # A registered team name is stored in the same sanitized form used for
+      # its task-list directory, while config.json retains the display name.
+      # Parse the bounded config set when provenance is present; a raw string
+      # prefilter would miss names such as "review:team" -> "review-team".
+      $team = $null
+      try { $team = ConvertFrom-StrictJsonText -Text $raw } catch { return $unknown }
+      $configuredTeamName = [string](Get-ObjectValue $team 'name' '')
+      $configuredLeadSessionId = [string](Get-ObjectValue $team 'leadSessionId' '')
+      $parsedLeadSessionId = [Guid]::Empty
+      if ([string]::IsNullOrWhiteSpace($configuredTeamName) -or $configuredTeamName.Length -gt 200 -or
+          -not [Guid]::TryParse($configuredLeadSessionId, [ref]$parsedLeadSessionId)) { return $unknown }
+      $safeConfiguredTeamName = $configuredTeamName -replace '[^A-Za-z0-9_-]', '-'
+      if ([string]::IsNullOrWhiteSpace($safeConfiguredTeamName) -or
+          -not [string]::Equals($safeConfiguredTeamName, $teamDir.Name, [StringComparison]::OrdinalIgnoreCase)) {
+        return $unknown
+      }
+      $leadAgentId = [string](Get-ObjectValue $team 'leadAgentId' '')
+      $membersProperty = $team.PSObject.Properties['members']
+      if ([string]::IsNullOrWhiteSpace($leadAgentId) -or
+          $null -eq $membersProperty -or $membersProperty.Value -isnot [System.Array] -or
+          @($membersProperty.Value).Count -gt $AudnCodeTeamMaxMembers) {
+        return $unknown
+      }
+      $memberAgentIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+      $leadMemberFound = $false
+      foreach ($member in @($membersProperty.Value)) {
+        if ($null -eq $member -or $member -isnot [System.Management.Automation.PSCustomObject]) { return $unknown }
+        $memberAgentId = [string](Get-ObjectValue $member 'agentId' '')
+        $activeProperty = $member.PSObject.Properties['isActive']
+        if ([string]::IsNullOrWhiteSpace($memberAgentId) -or -not $memberAgentIds.Add($memberAgentId) -or
+            ($null -ne $activeProperty -and $activeProperty.Value -isnot [bool])) { return $unknown }
+        if ($memberAgentId -eq $leadAgentId) { $leadMemberFound = $true }
+      }
+      if (-not $leadMemberFound) { return $unknown }
+      $matchesSession = $configuredLeadSessionId -eq $SessionId
+      $matchesProvenance = -not [string]::IsNullOrWhiteSpace($AdditionalTeamName) -and
+        [string]::Equals($safeConfiguredTeamName, $AdditionalTeamName, [StringComparison]::OrdinalIgnoreCase)
+      if (-not $matchesSession -and -not $matchesProvenance) { continue }
+      $matchedTeams++
+      if ($matchedTeams -gt 1) { return $unknown }
+    }
+    $teamsRootAfter = Get-Item -LiteralPath $teamsRoot -Force -ErrorAction Stop
+    $teamDirNamesAfter = @(Get-ChildItem -LiteralPath $teamsRoot -Directory -ErrorAction Stop |
+        ForEach-Object { $_.Name } | Sort-Object)
+    if (($teamsRootAfter.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [int64]$teamsRootBefore.LastWriteTimeUtc.Ticks -ne [int64]$teamsRootAfter.LastWriteTimeUtc.Ticks -or
+        [int64]$teamsRootBefore.CreationTimeUtc.Ticks -ne [int64]$teamsRootAfter.CreationTimeUtc.Ticks -or
+        ($teamDirNames -join "`n") -ne ($teamDirNamesAfter -join "`n") -or
+        -not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHomePath -TargetPath $teamsRoot)) {
+      return $unknown
+    }
+    # AudnCode can dispatch persisted teammate inbox work directly to onQuery,
+    # without UserPromptSubmit or an authoritative durable dequeue cursor. A
+    # matched team lineage is therefore busy until TeamDelete removes its
+    # directory; member isActive flags and membership removal are not terminal
+    # proof for that inbox.
+    return [pscustomobject]@{
+      state = if ($matchedTeams -gt 0) { 'busy' } else { 'idle' }
+      count = $matchedTeams
+      reason = if ($matchedTeams -gt 0) { 'audncode-team-lineage-active' } else { 'audncode-team-absent' }
+    }
+  } catch {
+    return $unknown
+  }
+}
+
+function Get-AudnCodeTaskState {
+  param(
+    [string]$SessionId,
+    [string]$HomePath = $AudnCodeHome,
+    [string]$AdditionalTaskListId = '',
+    [bool]$AdditionalTaskListValid = $true,
+    [string]$AdditionalTeamName = '',
+    [bool]$AdditionalTeamNameValid = $true
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; count = -1; reason = 'audncode-tasks-unverifiable' }
+  if ([string]::IsNullOrWhiteSpace($HomePath) -or [string]::IsNullOrWhiteSpace($SessionId)) {
+    return $unknown
+  }
+  try {
+    $canonicalHomePath = [IO.Path]::GetFullPath($HomePath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $tasksRoot = [IO.Path]::GetFullPath((Join-Path $canonicalHomePath 'tasks'))
+    if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHomePath -TargetPath $tasksRoot)) {
+      return $unknown
+    }
+    if (-not (Test-Path -LiteralPath $tasksRoot)) {
+      return [pscustomobject]@{ state = 'idle'; count = 0; reason = 'audncode-tasks-absent' }
+    }
+    if (-not (Test-Path -LiteralPath $tasksRoot -PathType Container)) { return $unknown }
+    $tasksRootBefore = Get-Item -LiteralPath $tasksRoot -Force -ErrorAction Stop
+    if (($tasksRootBefore.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $unknown }
+    $listNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if (-not $AdditionalTaskListValid) { return $unknown }
+    if (-not [string]::IsNullOrWhiteSpace($AdditionalTaskListId)) {
+      if ($AdditionalTaskListId.Length -gt 200 -or $AdditionalTaskListId -notmatch '^[A-Za-z0-9_-]+$') { return $unknown }
+      [void]$listNames.Add($AdditionalTaskListId)
+    } else {
+      if (-not $AdditionalTeamNameValid -or
+          (-not [string]::IsNullOrWhiteSpace($AdditionalTeamName) -and
+           ($AdditionalTeamName.Length -gt 200 -or $AdditionalTeamName -notmatch '^[A-Za-z0-9_-]+$'))) {
+        return $unknown
+      }
+      $teamListNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+      $teamsRoot = [IO.Path]::GetFullPath((Join-Path $canonicalHomePath 'teams'))
+      if (Test-Path -LiteralPath $teamsRoot -PathType Container) {
+        if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHomePath -TargetPath $teamsRoot)) {
+          return $unknown
+        }
+        $teamsRootBefore = Get-Item -LiteralPath $teamsRoot -Force -ErrorAction Stop
+        if (($teamsRootBefore.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $unknown }
+        $teamDirs = @(Get-ChildItem -LiteralPath $teamsRoot -Directory -ErrorAction Stop | Select-Object -First 129)
+        if ($teamDirs.Count -gt 128) { return $unknown }
+        $teamDirNames = @($teamDirs | ForEach-Object { $_.Name } | Sort-Object)
+        foreach ($teamDir in $teamDirs) {
+          $teamDirectoryPath = [IO.Path]::GetFullPath($teamDir.FullName)
+          $configPath = [IO.Path]::GetFullPath((Join-Path $teamDirectoryPath 'config.json'))
+          if (($teamDir.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+              -not (Test-AudnCodePathHasNoReparseComponents -RootPath $teamsRoot -TargetPath $teamDirectoryPath) -or
+              -not (Test-AudnCodePathHasNoReparseComponents -RootPath $teamsRoot -TargetPath $configPath)) {
+            return $unknown
+          }
+          if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { return $unknown }
+          $before = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
+          if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $unknown }
+          if ([int64]$before.Length -gt $AudnCodeTeamConfigMaxBytes) { return $unknown }
+          $raw = [IO.File]::ReadAllText($configPath, $Utf8StrictNoBom)
+          $after = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
+          if (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+              [int64]$before.Length -ne [int64]$after.Length -or
+              [int64]$before.LastWriteTimeUtc.Ticks -ne [int64]$after.LastWriteTimeUtc.Ticks -or
+              [int64]$before.CreationTimeUtc.Ticks -ne [int64]$after.CreationTimeUtc.Ticks -or
+              -not (Test-AudnCodePathHasNoReparseComponents -RootPath $teamsRoot -TargetPath $configPath)) {
+            return $unknown
+          }
+          try { $team = ConvertFrom-StrictJsonText -Text $raw } catch { return $unknown }
+          if ([string](Get-ObjectValue $team 'leadSessionId' '') -ne $SessionId) { continue }
+          $teamName = [string](Get-ObjectValue $team 'name' '')
+          if ([string]::IsNullOrWhiteSpace($teamName) -or $teamName.Length -gt 200) { return $unknown }
+          $safeTeamName = $teamName -replace '[^A-Za-z0-9_-]', '-'
+          if ([string]::IsNullOrWhiteSpace($safeTeamName)) { return $unknown }
+          [void]$teamListNames.Add($safeTeamName)
+        }
+        $teamsRootAfter = Get-Item -LiteralPath $teamsRoot -Force -ErrorAction Stop
+        $teamDirNamesAfter = @(Get-ChildItem -LiteralPath $teamsRoot -Directory -ErrorAction Stop |
+            ForEach-Object { $_.Name } | Sort-Object)
+        if (($teamsRootAfter.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [int64]$teamsRootBefore.LastWriteTimeUtc.Ticks -ne [int64]$teamsRootAfter.LastWriteTimeUtc.Ticks -or
+            [int64]$teamsRootBefore.CreationTimeUtc.Ticks -ne [int64]$teamsRootAfter.CreationTimeUtc.Ticks -or
+            ($teamDirNames -join "`n") -ne ($teamDirNamesAfter -join "`n") -or
+            -not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHomePath -TargetPath $teamsRoot)) {
+          return $unknown
+        }
+      }
+      if ($teamListNames.Count -gt 1) { return $unknown }
+      if ($teamListNames.Count -eq 1) {
+        foreach ($teamListName in $teamListNames) { [void]$listNames.Add($teamListName) }
+      } elseif (-not [string]::IsNullOrWhiteSpace($AdditionalTeamName)) {
+        [void]$listNames.Add($AdditionalTeamName)
+      } else {
+        [void]$listNames.Add($SessionId)
+      }
+    }
+
+    $activeCount = 0
+    foreach ($listName in $listNames) {
+      # AudnCode sanitizes task-list directory names to this exact alphabet.
+      $safeName = ([string]$listName) -replace '[^A-Za-z0-9_-]', '-'
+      $listPath = [IO.Path]::GetFullPath((Join-Path $tasksRoot $safeName))
+      $rootPrefix = [IO.Path]::GetFullPath($tasksRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+      if (-not $listPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+          -not (Test-AudnCodePathHasNoReparseComponents -RootPath $tasksRoot -TargetPath $listPath)) { return $unknown }
+      if (-not (Test-Path -LiteralPath $listPath)) { continue }
+      if (-not (Test-Path -LiteralPath $listPath -PathType Container)) { return $unknown }
+      $listBefore = Get-Item -LiteralPath $listPath -Force -ErrorAction Stop
+      if (($listBefore.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $unknown }
+      $listLockPath = [IO.Path]::GetFullPath((Join-Path $listPath '.lock.lock'))
+      if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $tasksRoot -TargetPath $listLockPath) -or
+          (Test-Path -LiteralPath $listLockPath)) { return $unknown }
+      $taskFiles = @(Get-ChildItem -LiteralPath $listPath -Filter '*.json' -File -ErrorAction Stop | Select-Object -First 1025)
+      if ($taskFiles.Count -gt 1024) { return $unknown }
+      $taskFileNames = @($taskFiles | ForEach-Object { $_.Name } | Sort-Object)
+      foreach ($taskFile in $taskFiles) {
+        $taskFilePath = [IO.Path]::GetFullPath($taskFile.FullName)
+        $taskLockPath = [IO.Path]::GetFullPath($taskFilePath + '.lock')
+        if (($taskFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not (Test-AudnCodePathHasNoReparseComponents -RootPath $tasksRoot -TargetPath $taskFilePath) -or
+            -not (Test-AudnCodePathHasNoReparseComponents -RootPath $tasksRoot -TargetPath $taskLockPath) -or
+            (Test-Path -LiteralPath $taskLockPath)) { return $unknown }
+        $before = Get-Item -LiteralPath $taskFilePath -Force -ErrorAction Stop
+        if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $unknown }
+        if ([int64]$before.Length -gt $AudnCodeTaskFileMaxBytes) { return $unknown }
+        $raw = [IO.File]::ReadAllText($taskFilePath, $Utf8StrictNoBom)
+        try { $task = ConvertFrom-StrictJsonText -Text $raw } catch { return $unknown }
+        $after = Get-Item -LiteralPath $taskFilePath -Force -ErrorAction Stop
+        if (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [int64]$before.Length -ne [int64]$after.Length -or
+            [int64]$before.LastWriteTimeUtc.Ticks -ne [int64]$after.LastWriteTimeUtc.Ticks -or
+            [int64]$before.CreationTimeUtc.Ticks -ne [int64]$after.CreationTimeUtc.Ticks -or
+            -not (Test-AudnCodePathHasNoReparseComponents -RootPath $tasksRoot -TargetPath $taskFilePath)) {
+          return $unknown
+        }
+        if (Test-Path -LiteralPath $taskLockPath) { return $unknown }
+        $status = ([string](Get-ObjectValue $task 'status' '')).Trim().ToLowerInvariant()
+        if ($status -eq 'completed') { continue }
+        if ($status -notin @('pending', 'in_progress')) { return $unknown }
+        $activeCount++
+      }
+      if (Test-Path -LiteralPath $listLockPath) { return $unknown }
+      $listAfter = Get-Item -LiteralPath $listPath -Force -ErrorAction Stop
+      $taskFileNamesAfter = @(Get-ChildItem -LiteralPath $listPath -Filter '*.json' -File -ErrorAction Stop |
+          ForEach-Object { $_.Name } | Sort-Object)
+      if (($listAfter.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+          [int64]$listBefore.LastWriteTimeUtc.Ticks -ne [int64]$listAfter.LastWriteTimeUtc.Ticks -or
+          [int64]$listBefore.CreationTimeUtc.Ticks -ne [int64]$listAfter.CreationTimeUtc.Ticks -or
+          ($taskFileNames -join "`n") -ne ($taskFileNamesAfter -join "`n") -or
+          -not (Test-AudnCodePathHasNoReparseComponents -RootPath $tasksRoot -TargetPath $listPath)) {
+        return $unknown
+      }
+    }
+    $tasksRootAfter = Get-Item -LiteralPath $tasksRoot -Force -ErrorAction Stop
+    if (($tasksRootAfter.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [int64]$tasksRootBefore.LastWriteTimeUtc.Ticks -ne [int64]$tasksRootAfter.LastWriteTimeUtc.Ticks -or
+        [int64]$tasksRootBefore.CreationTimeUtc.Ticks -ne [int64]$tasksRootAfter.CreationTimeUtc.Ticks -or
+        -not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHomePath -TargetPath $tasksRoot)) {
+      return $unknown
+    }
+    return [pscustomobject]@{
+      state = if ($activeCount -gt 0) { 'busy' } else { 'idle' }
+      count = $activeCount
+      reason = if ($activeCount -gt 0) { 'audncode-goal-tasks-active' } else { 'audncode-goal-tasks-complete' }
+    }
+  } catch {
+    return $unknown
+  }
+}
+
+function Get-AudnCodeMainSessionSidechainIds {
+  param(
+    [string]$TranscriptPath,
+    [int64]$PromptBusyUnixMs,
+    [int64]$HostStartedUnixMs
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; ids = @(); reason = 'audncode-main-session-unverifiable' }
+  if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or $PromptBusyUnixMs -le 0 -or $HostStartedUnixMs -le 0) {
+    return $unknown
+  }
+  try {
+    $projectDir = Split-Path -Parent ([IO.Path]::GetFullPath($TranscriptPath))
+    if (-not (Test-Path -LiteralPath $projectDir -PathType Container)) { return $unknown }
+    $sessionId = [IO.Path]::GetFileNameWithoutExtension($TranscriptPath)
+    $sidechainRoot = [IO.Path]::GetFullPath((Join-Path $projectDir $sessionId))
+    if (-not (Test-Path -LiteralPath $sidechainRoot -PathType Container)) {
+      return [pscustomobject]@{ state = 'ok'; ids = @(); reason = 'audncode-main-session-absent' }
+    }
+    $rootPrefix = $sidechainRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $reparseDirs = @(Get-ChildItem -LiteralPath $sidechainRoot -Recurse -Directory -ErrorAction Stop |
+        Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 } | Select-Object -First 1)
+    if ($reparseDirs.Count -gt 0) { return $unknown }
+    # Enumeration is bounded, but completed sidechains are filtered later by
+    # the runtime's exact compact tombstone index. A chat can therefore retain
+    # hundreds of completed Ctrl+B transcripts without becoming permanently
+    # unverifiable at the former 256-file boundary.
+    $files = @(Get-ChildItem -LiteralPath $sidechainRoot -Recurse -Filter 'agent-s*.jsonl' -File -ErrorAction Stop | Select-Object -First 4097)
+    if ($files.Count -gt 4096) { return $unknown }
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($file in $files) {
+      $resolvedFile = [IO.Path]::GetFullPath($file.FullName)
+      if (-not $resolvedFile.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) { return $unknown }
+      if ($file.BaseName -notmatch '^agent-(?<id>s[a-z0-9]{8})$') { return $unknown }
+      $id = [string]$Matches['id']
+      if ($ids.Contains($id)) { return $unknown }
+      $beforeLength = [int64]$file.Length
+      $beforeWriteTicks = [int64]$file.LastWriteTimeUtc.Ticks
+      $lastWriteUnixMs = ([DateTimeOffset]$file.LastWriteTimeUtc).ToUnixTimeMilliseconds()
+      if ($lastWriteUnixMs -lt ($HostStartedUnixMs - 2000)) { continue }
+      $after = Get-Item -LiteralPath $file.FullName -ErrorAction Stop
+      if ([int64]$after.Length -ne $beforeLength -or [int64]$after.LastWriteTimeUtc.Ticks -ne $beforeWriteTicks) {
+        return $unknown
+      }
+      [void]$ids.Add($id)
+    }
+    return [pscustomobject]@{
+      state = 'ok'
+      ids = @($ids)
+      reason = if ($ids.Count -gt 0) { 'audncode-main-session-observed' } else { 'audncode-main-session-absent' }
+    }
+  } catch {
+    return $unknown
+  }
+}
+
+function Get-AudnCodeValidatedTerminalClaimIds {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [object[]]$Claims,
+    [bool]$ClaimsValid,
+    [int64]$Cursor,
+    [bool]$CursorAtLineBoundary,
+    [string[]]$ActiveIds,
+    [int64]$HostStartedUnixMs,
+    [string]$RequiredTaskType = ''
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; ids = @(); completions = @(); reason = 'audncode-terminal-proof-unverifiable' }
+  if (-not $ClaimsValid) { return $unknown }
+  $active = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  foreach ($activeId in @($ActiveIds)) {
+    if ($activeId -isnot [string] -or $activeId.Length -gt 160 -or $activeId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$') {
+      return $unknown
+    }
+    [void]$active.Add($activeId)
+  }
+  $required = @{}
+  foreach ($claim in @($Claims)) {
+    $id = [string](Get-ObjectValue $claim 'id' '')
+    $status = ([string](Get-ObjectValue $claim 'status' '')).Trim().ToLowerInvariant()
+    if ($id.Length -gt 160 -or $id -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$' -or
+        $status -notin @('completed', 'failed', 'killed') -or $required.ContainsKey($id)) {
+      return $unknown
+    }
+    if ($active.Contains($id)) { $required[$id] = $status }
+  }
+  if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or $Cursor -lt 0) { return $unknown }
+  $stream = $null
+  $reader = $null
+  try {
+    $resolved = [IO.Path]::GetFullPath($TranscriptPath)
+    $before = Get-Item -LiteralPath $resolved -ErrorAction Stop
+    if ($Cursor -gt [int64]$before.Length) { return $unknown }
+    $scanCursor = $Cursor
+    $scanAtLineBoundary = $CursorAtLineBoundary
+    if ($required.Count -eq 0 -and ([int64]$before.Length - $scanCursor) -gt 8MB) {
+      $scanCursor = [int64]$before.Length - 8MB
+      $scanAtLineBoundary = $false
+    } elseif (([int64]$before.Length - $scanCursor) -gt 8MB) {
+      return $unknown
+    }
+    if ([int64]$before.Length -eq $scanCursor) {
+      if ($required.Count -eq 0) {
+        return [pscustomobject]@{ state = 'ok'; ids = @(); completions = @(); reason = 'audncode-terminal-proof-not-observed' }
+      }
+      return [pscustomobject]@{ state = 'pending'; ids = @(); reason = 'audncode-awaiting-terminal-proof' }
+    }
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    if ([int64]$stream.Length -ne [int64]$before.Length) { return $unknown }
+    [void]$stream.Seek(-1, [IO.SeekOrigin]::End)
+    if ($stream.ReadByte() -ne 10) {
+      return [pscustomobject]@{ state = 'pending'; ids = @(); reason = 'audncode-awaiting-terminal-proof' }
+    }
+    [void]$stream.Seek($scanCursor, [IO.SeekOrigin]::Begin)
+    if (-not $scanAtLineBoundary) {
+      $foundBoundary = $false
+      while ($stream.Position -lt $stream.Length) {
+        if ($stream.ReadByte() -eq 10) { $foundBoundary = $true; break }
+      }
+      if (-not $foundBoundary) {
+        return [pscustomobject]@{ state = 'pending'; ids = @(); reason = 'audncode-awaiting-terminal-proof' }
+      }
+    }
+    $reader = New-Object System.IO.StreamReader($stream, $Utf8StrictNoBom, $false, 65536, $false)
+    $validated = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $completionReceipts = New-Object 'System.Collections.Generic.List[object]'
+    $seenCompletionReceipts = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $seenCompletionUuids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    while (-not $reader.EndOfStream) {
+      $line = [string]$reader.ReadLine()
+      if ($line.Length -gt $AudnCodeQueueMaxLineChars) {
+        if ($line -match 'task-notification') { return $unknown }
+        continue
+      }
+      if ($line -notmatch 'task-notification') { continue }
+      $entry = $null
+      try { $entry = ConvertFrom-StrictJsonText -Text $line } catch { return $unknown }
+      $sidechainProperty = $entry.PSObject.Properties['isSidechain']
+      $agentId = [string](Get-ObjectValue $entry 'agentId' '')
+      if ([string](Get-ObjectValue $entry 'sessionId' '') -ne $SessionId -or
+          [string](Get-ObjectValue $entry 'userType' '') -ne 'external' -or
+          -not [string]::IsNullOrWhiteSpace($agentId) -or
+          ($null -ne $sidechainProperty -and ($sidechainProperty.Value -isnot [bool] -or [bool]$sidechainProperty.Value))) {
+        continue
+      }
+      $rawTimestamp = Get-ObjectValue $entry 'timestamp'
+      $entryTimestamp = [DateTimeOffset]::MinValue
+      $timestampStyle = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+      if (-not [DateTimeOffset]::TryParse([string]$rawTimestamp, [Globalization.CultureInfo]::InvariantCulture, $timestampStyle, [ref]$entryTimestamp) -or
+          $entryTimestamp.ToUnixTimeMilliseconds() -lt ($HostStartedUnixMs - 2000)) {
+        continue
+      }
+      $entryType = [string](Get-ObjectValue $entry 'type' '')
+      $proofContent = ''
+      if ($entryType -eq 'user') {
+        $origin = Get-ObjectValue $entry 'origin'
+        $message = Get-ObjectValue $entry 'message'
+        if ($null -eq $origin -or $origin -isnot [System.Management.Automation.PSCustomObject] -or
+            [string](Get-ObjectValue $origin 'kind' '') -ne 'task-notification') { continue }
+        if ($null -eq $message -or $message -isnot [System.Management.Automation.PSCustomObject] -or
+            [string](Get-ObjectValue $message 'role' '') -ne 'user') { return $unknown }
+        $contentProperty = $message.PSObject.Properties['content']
+        if ($null -eq $contentProperty -or $contentProperty.Value -isnot [string]) { return $unknown }
+        $proofContent = [string]$contentProperty.Value
+      } elseif ($entryType -eq 'attachment') {
+        $attachment = Get-ObjectValue $entry 'attachment'
+        if ($null -eq $attachment -or $attachment -isnot [System.Management.Automation.PSCustomObject] -or
+            [string](Get-ObjectValue $attachment 'type' '') -ne 'queued_command' -or
+            [string](Get-ObjectValue $attachment 'commandMode' '') -ne 'task-notification') { continue }
+        foreach ($originHolder in @($entry, $attachment)) {
+          $originProperty = $originHolder.PSObject.Properties['origin']
+          if ($null -ne $originProperty -and $null -ne $originProperty.Value -and
+              ($originProperty.Value -isnot [System.Management.Automation.PSCustomObject] -or
+               [string](Get-ObjectValue $originProperty.Value 'kind' '') -ne 'task-notification')) {
+            return $unknown
+          }
+        }
+        $promptProperty = $attachment.PSObject.Properties['prompt']
+        if ($null -eq $promptProperty -or $promptProperty.Value -isnot [string]) { return $unknown }
+        $proofContent = [string]$promptProperty.Value
+      } else {
+        continue
+      }
+      $proof = ConvertFrom-AudnCodeTaskNotification -Content $proofContent
+      if ($null -eq $proof) { return $unknown }
+      if (-not [string]::IsNullOrWhiteSpace($RequiredTaskType) -and
+          -not [string]::Equals([string](Get-ObjectValue $proof 'task_type' ''), $RequiredTaskType, [StringComparison]::Ordinal)) {
+        continue
+      }
+      $proofId = [string]$proof.id
+      if (-not $active.Contains($proofId)) { continue }
+      if ($required.ContainsKey($proofId) -and [string]$required[$proofId] -ne [string]$proof.status) { return $unknown }
+      [void]$validated.Add($proofId)
+      $entryUuid = [string](Get-ObjectValue $entry 'uuid' '')
+      $parsedEntryUuid = [Guid]::Empty
+      if ([Guid]::TryParse($entryUuid, [ref]$parsedEntryUuid)) {
+        $normalizedEntryUuid = $parsedEntryUuid.ToString('D').ToLowerInvariant()
+        if (-not $seenCompletionUuids.Add($normalizedEntryUuid)) { return $unknown }
+        $receipt = Get-Sha256Hex (
+          'audncode-background-terminal/v1|' + $SessionId + '|' +
+          $normalizedEntryUuid + '|' + $proofId + '|' + [string]$proof.status
+        )
+        if (-not $seenCompletionReceipts.Add($receipt)) { return $unknown }
+        $completionReceipts.Add([pscustomobject]@{ id = $proofId; receipt = $receipt })
+      } elseif ($proofId -match '^a[a-z0-9]{8}$') {
+        # Counted local-agent incarnations can only be closed once. A stable
+        # native transcript UUID is the dedupe receipt; without it, repeated
+        # scans could consume more than one overlapping resume lifecycle.
+        return $unknown
+      }
+    }
+    $after = Get-Item -LiteralPath $resolved -ErrorAction Stop
+    if ([int64]$after.Length -ne [int64]$before.Length -or
+        [int64]$after.LastWriteTimeUtc.Ticks -ne [int64]$before.LastWriteTimeUtc.Ticks) {
+      return [pscustomobject]@{ state = 'pending'; ids = @(); reason = 'audncode-awaiting-terminal-proof' }
+    }
+    foreach ($requiredId in $required.Keys) {
+      if (-not $validated.Contains([string]$requiredId)) {
+        return [pscustomobject]@{ state = 'pending'; ids = @(); reason = 'audncode-awaiting-terminal-proof' }
+      }
+    }
+    return [pscustomobject]@{
+      state = 'ok'
+      ids = @($validated)
+      completions = @($completionReceipts.ToArray())
+      reason = 'audncode-terminal-proof-validated'
+    }
+  } catch {
+    return $unknown
+  } finally {
+    if ($null -ne $reader) { $reader.Dispose() } elseif ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
+function Get-AudnCodeRemoteClaimEnvelope {
+  param(
+    [object]$Record,
+    [string]$ClaimsProperty = 'audncode_remote_claims',
+    [string]$ValidProperty = 'audncode_remote_claims_valid'
+  )
+
+  $invalid = [pscustomobject]@{ valid = $false; claims = @() }
+  if ($null -eq $Record) { return [pscustomobject]@{ valid = $true; claims = @() } }
+  $claimsPropertyValue = $Record.PSObject.Properties[$ClaimsProperty]
+  $validPropertyValue = $Record.PSObject.Properties[$ValidProperty]
+  if ($null -eq $claimsPropertyValue -and $null -eq $validPropertyValue) {
+    return [pscustomobject]@{ valid = $true; claims = @() }
+  }
+  if ($null -eq $claimsPropertyValue -or $claimsPropertyValue.Value -isnot [array] -or
+      $null -eq $validPropertyValue -or $validPropertyValue.Value -isnot [bool] -or
+      -not [bool]$validPropertyValue.Value) { return $invalid }
+  $claims = @($claimsPropertyValue.Value)
+  if ($claims.Count -gt $AudnCodeRemoteAgentMaxClaims) { return $invalid }
+  $claimIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $taskIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $normalized = New-Object 'System.Collections.Generic.List[object]'
+  foreach ($claim in $claims) {
+    if ($null -eq $claim -or $claim -isnot [System.Management.Automation.PSCustomObject]) { return $invalid }
+    $claimId = [string](Get-ObjectValue $claim 'claim_id' '')
+    $kind = [string](Get-ObjectValue $claim 'kind' '')
+    $claimedProperty = $claim.PSObject.Properties['claimed_unix_ms']
+    $taskId = [string](Get-ObjectValue $claim 'task_id' '')
+    $identityHash = [string](Get-ObjectValue $claim 'identity_hash' '')
+    $terminalProperty = $claim.PSObject.Properties['terminal_proven']
+    if ($claimId -notmatch '^[a-f0-9]{32}$' -or -not $claimIds.Add($claimId) -or
+        $kind -notin @('ultrareview-launch', 'remote-sidecar') -or
+        $null -eq $claimedProperty -or
+        ($claimedProperty.Value -isnot [int] -and $claimedProperty.Value -isnot [long]) -or
+        [int64]$claimedProperty.Value -le 0 -or
+        (-not [string]::IsNullOrWhiteSpace($taskId) -and
+          ($taskId -notmatch '^r[a-z0-9]{8}$' -or -not $taskIds.Add($taskId) -or $identityHash -notmatch '^[a-f0-9]{64}$')) -or
+        ([string]::IsNullOrWhiteSpace($taskId) -and -not [string]::IsNullOrWhiteSpace($identityHash)) -or
+        $null -eq $terminalProperty -or $terminalProperty.Value -isnot [bool]) {
+      return $invalid
+    }
+    $normalized.Add([pscustomobject]@{
+        claim_id = $claimId
+        kind = $kind
+        claimed_unix_ms = [int64]$claimedProperty.Value
+        task_id = $taskId
+        identity_hash = $identityHash
+        terminal_proven = [bool]$terminalProperty.Value
+      })
+  }
+  return [pscustomobject]@{ valid = $true; claims = @($normalized.ToArray()) }
+}
+
+function Read-AudnCodeRemoteAgentSidecars {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; entries = @(); fingerprint = ''; reason = 'audncode-remote-sidecars-unverifiable' }
+  if (-not (Test-AudnCodeTranscriptPath -SessionId $SessionId -TranscriptPath $TranscriptPath -AllowMissing -HomePath $HomePath)) {
+    return $unknown
+  }
+  try {
+    $canonicalHome = [IO.Path]::GetFullPath($HomePath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $projectsRoot = [IO.Path]::GetFullPath((Join-Path $canonicalHome 'projects')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $projectDirectory = [IO.Path]::GetFullPath((Split-Path -Parent $TranscriptPath)).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $sessionDirectory = [IO.Path]::GetFullPath((Join-Path $projectDirectory $SessionId))
+    $remoteDirectory = [IO.Path]::GetFullPath((Join-Path $sessionDirectory 'remote-agents'))
+    $projectsRootItem = Get-Item -LiteralPath $projectsRoot -Force -ErrorAction Stop
+    if (($projectsRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $unknown }
+    if (-not [string]::Equals($projectDirectory, $projectsRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        -not (Test-AudnCodePathHasNoReparseComponents -RootPath $projectsRoot -TargetPath $projectDirectory)) {
+      return $unknown
+    }
+    foreach ($path in @($sessionDirectory, $remoteDirectory)) {
+      if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $projectsRoot -TargetPath $path)) { return $unknown }
+    }
+    if (-not (Test-Path -LiteralPath $remoteDirectory)) {
+      return [pscustomobject]@{
+        state = 'ok'
+        entries = @()
+        fingerprint = Get-Sha256Hex "audncode-remote-sidecars/v1|$SessionId|missing"
+        reason = 'audncode-remote-sidecars-absent'
+      }
+    }
+    if (-not (Test-Path -LiteralPath $remoteDirectory -PathType Container)) { return $unknown }
+    $directoryBefore = Get-Item -LiteralPath $remoteDirectory -Force -ErrorAction Stop
+    if (($directoryBefore.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $unknown }
+    $children = @(Get-ChildItem -LiteralPath $remoteDirectory -Force -ErrorAction Stop | Select-Object -First ($AudnCodeRemoteAgentMaxFiles + 2))
+    if ($children.Count -gt $AudnCodeRemoteAgentMaxFiles) { return $unknown }
+    $childNames = @($children | ForEach-Object { $_.Name } | Sort-Object)
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($child in $children) {
+      if ($child.PSIsContainer -or $child.Name -notmatch '^remote-agent-(?<id>r[a-z0-9]{8})\.meta\.json$') { return $unknown }
+      $taskId = [string]$Matches['id']
+      if (-not $ids.Add($taskId)) { return $unknown }
+      $filePath = [IO.Path]::GetFullPath($child.FullName)
+      $snapshot = Read-AudnCodeStableUtf8FileSnapshot `
+        -RootPath $projectsRoot `
+        -Path $filePath `
+        -MaxBytes $AudnCodeRemoteAgentMetadataMaxBytes
+      if ([string](Get-ObjectValue $snapshot 'state' 'unknown') -ne 'ok') { return $unknown }
+      try { $metadata = ConvertFrom-StrictJsonText -Text ([string]$snapshot.raw) } catch { return $unknown }
+      if ($null -eq $metadata -or $metadata -isnot [System.Management.Automation.PSCustomObject]) { return $unknown }
+      $metadataTaskId = [string](Get-ObjectValue $metadata 'taskId' '')
+      $remoteTaskType = [string](Get-ObjectValue $metadata 'remoteTaskType' '')
+      $remoteSessionId = [string](Get-ObjectValue $metadata 'sessionId' '')
+      $titleProperty = $metadata.PSObject.Properties['title']
+      $commandProperty = $metadata.PSObject.Properties['command']
+      $spawnedProperty = $metadata.PSObject.Properties['spawnedAt']
+      if ($metadataTaskId -cne $taskId -or
+          $remoteTaskType -notin @('remote-agent', 'ultraplan', 'ultrareview', 'autofix-pr', 'background-pr') -or
+          $remoteSessionId.Length -lt 1 -or $remoteSessionId.Length -gt 200 -or
+          $remoteSessionId -notmatch '^[A-Za-z0-9._:-]+$' -or
+          $null -eq $titleProperty -or $titleProperty.Value -isnot [string] -or ([string]$titleProperty.Value).Length -gt 262144 -or
+          $null -eq $commandProperty -or $commandProperty.Value -isnot [string] -or ([string]$commandProperty.Value).Length -gt 262144 -or
+          $null -eq $spawnedProperty -or
+          ($spawnedProperty.Value -isnot [int] -and $spawnedProperty.Value -isnot [long]) -or
+          [int64]$spawnedProperty.Value -le 0 -or
+          [int64]$spawnedProperty.Value -gt ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 300000)) {
+        return $unknown
+      }
+      foreach ($optionalStringName in @('toolUseId')) {
+        $property = $metadata.PSObject.Properties[$optionalStringName]
+        if ($null -ne $property -and $null -ne $property.Value -and
+            ($property.Value -isnot [string] -or ([string]$property.Value).Length -gt 256)) { return $unknown }
+      }
+      foreach ($optionalBoolName in @('isLongRunning', 'isUltraplan', 'isRemoteReview')) {
+        $property = $metadata.PSObject.Properties[$optionalBoolName]
+        if ($null -ne $property -and $null -ne $property.Value -and $property.Value -isnot [bool]) { return $unknown }
+      }
+      $metadataProperty = $metadata.PSObject.Properties['remoteTaskMetadata']
+      if ($null -ne $metadataProperty -and $null -ne $metadataProperty.Value -and
+          $metadataProperty.Value -isnot [System.Management.Automation.PSCustomObject]) { return $unknown }
+      $identityHash = Get-Sha256Hex (
+        "audncode-remote-agent/v1|$SessionId|$taskId|" + [string](Get-ObjectValue $snapshot 'content_hash' '')
+      )
+      $entries.Add([pscustomobject]@{
+          task_id = $taskId
+          remote_task_type = $remoteTaskType
+          spawned_unix_ms = [int64]$spawnedProperty.Value
+          is_remote_review = [bool](Get-ObjectValue $metadata 'isRemoteReview' $false)
+          identity_hash = $identityHash
+        })
+    }
+    $directoryAfter = Get-Item -LiteralPath $remoteDirectory -Force -ErrorAction Stop
+    $childNamesAfter = @(Get-ChildItem -LiteralPath $remoteDirectory -Force -ErrorAction Stop | ForEach-Object { $_.Name } | Sort-Object)
+    if (($directoryAfter.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [int64]$directoryBefore.CreationTimeUtc.Ticks -ne [int64]$directoryAfter.CreationTimeUtc.Ticks -or
+        [int64]$directoryBefore.LastWriteTimeUtc.Ticks -ne [int64]$directoryAfter.LastWriteTimeUtc.Ticks -or
+        ($childNames -join "`n") -ne ($childNamesAfter -join "`n") -or
+        -not (Test-AudnCodePathHasNoReparseComponents -RootPath $projectsRoot -TargetPath $remoteDirectory)) {
+      return $unknown
+    }
+    $fingerprintLines = @($entries | Sort-Object task_id | ForEach-Object {
+        ([string]$_.task_id) + '|' + ([string]$_.identity_hash)
+      })
+    return [pscustomobject]@{
+      state = 'ok'
+      entries = @($entries.ToArray())
+      fingerprint = Get-Sha256Hex ("audncode-remote-sidecars/v1|$SessionId|" + ($fingerprintLines -join "`n"))
+      reason = if ($entries.Count -gt 0) { 'audncode-remote-sidecars-active' } else { 'audncode-remote-sidecars-absent' }
+    }
+  } catch {
+    return $unknown
+  }
+}
+
+function Get-AudnCodeRemoteAgentState {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [object]$LockedSessionState = $null
+  )
+
+  $unknown = [pscustomobject]@{ state = 'unknown'; reason = 'audncode-remote-agents-unverifiable'; fingerprint = '' }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $unknown }
+  $action = {
+    param($lockedPath, $lockedSessionId, $lockedTranscriptPath, $lockedHomePath, $providedState)
+    if ($null -ne $providedState) {
+      $state = $providedState
+    } else {
+      try { $state = Read-JsonFile -Path $lockedPath } catch { return $unknown }
+    }
+    if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or
+        -not [string]::Equals([string](Get-ObjectValue $state 'transcript_path' ''), $lockedTranscriptPath, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([string](Get-ObjectValue $state 'audncode_home' ''), $lockedHomePath, [StringComparison]::OrdinalIgnoreCase)) {
+      return $unknown
+    }
+    $claimState = Get-AudnCodeRemoteClaimEnvelope -Record $state
+    if (-not [bool](Get-ObjectValue $claimState 'valid' $false)) { return $unknown }
+    $persistedClaimsProperty = $state.PSObject.Properties['audncode_remote_claims']
+    $persistedValidProperty = $state.PSObject.Properties['audncode_remote_claims_valid']
+    $persistedClaimsJson = if ($null -ne $persistedClaimsProperty -and $persistedClaimsProperty.Value -is [array]) {
+      ConvertTo-CompactJson ([pscustomobject]@{ claims = @($persistedClaimsProperty.Value) })
+    } else { '{"claims":[]}' }
+    $hadPersistedEnvelope = $null -ne $persistedClaimsProperty -or $null -ne $persistedValidProperty
+    $sidecarState = Read-AudnCodeRemoteAgentSidecars `
+      -SessionId $lockedSessionId `
+      -TranscriptPath $lockedTranscriptPath `
+      -HomePath $lockedHomePath
+    if ([string](Get-ObjectValue $sidecarState 'state' 'unknown') -ne 'ok') {
+      return $unknown
+    }
+    $claims = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($claim in @((Get-ObjectValue $claimState 'claims' @()))) { $claims.Add($claim) }
+    $sidecars = @((Get-ObjectValue $sidecarState 'entries' @()))
+    $boundTaskIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($claim in @($claims.ToArray())) {
+      $taskId = [string](Get-ObjectValue $claim 'task_id' '')
+      if ([string]::IsNullOrWhiteSpace($taskId)) { continue }
+      [void]$boundTaskIds.Add($taskId)
+      $matchingSidecars = @($sidecars | Where-Object { [string](Get-ObjectValue $_ 'task_id' '') -eq $taskId })
+      if ($matchingSidecars.Count -gt 1 -or
+          ($matchingSidecars.Count -eq 1 -and
+            [string](Get-ObjectValue $matchingSidecars[0] 'identity_hash' '') -ne [string](Get-ObjectValue $claim 'identity_hash' ''))) {
+        Set-RecordValue -Record $state -Name 'audncode_remote_claims_valid' -Value $false
+        Write-JsonAtomic -Path $lockedPath -Value $state
+        return $unknown
+      }
+    }
+    $pendingLaunches = @($claims.ToArray() | Where-Object {
+        [string](Get-ObjectValue $_ 'kind' '') -eq 'ultrareview-launch' -and
+        [string]::IsNullOrWhiteSpace([string](Get-ObjectValue $_ 'task_id' ''))
+      })
+    $unboundReviewSidecars = @($sidecars | Where-Object {
+        -not $boundTaskIds.Contains([string](Get-ObjectValue $_ 'task_id' '')) -and
+        [string](Get-ObjectValue $_ 'remote_task_type' '') -eq 'ultrareview' -and
+        [bool](Get-ObjectValue $_ 'is_remote_review' $false)
+      })
+    if ($pendingLaunches.Count -eq 1 -and $unboundReviewSidecars.Count -eq 1) {
+      $claim = $pendingLaunches[0]
+      $sidecar = $unboundReviewSidecars[0]
+      $claimTime = [int64](Get-ObjectValue $claim 'claimed_unix_ms' 0)
+      $spawnedAt = [int64](Get-ObjectValue $sidecar 'spawned_unix_ms' 0)
+      if ($spawnedAt -ge ($claimTime - 600000) -and $spawnedAt -le ($claimTime + 2000)) {
+        Set-RecordValue -Record $claim -Name 'task_id' -Value ([string](Get-ObjectValue $sidecar 'task_id' ''))
+        Set-RecordValue -Record $claim -Name 'identity_hash' -Value ([string](Get-ObjectValue $sidecar 'identity_hash' ''))
+        [void]$boundTaskIds.Add([string](Get-ObjectValue $sidecar 'task_id' ''))
+      }
+    }
+    foreach ($sidecar in $sidecars) {
+      $taskId = [string](Get-ObjectValue $sidecar 'task_id' '')
+      if ($boundTaskIds.Contains($taskId)) { continue }
+      if ($claims.Count -ge $AudnCodeRemoteAgentMaxClaims) {
+        Set-RecordValue -Record $state -Name 'audncode_remote_claims_valid' -Value $false
+        Write-JsonAtomic -Path $lockedPath -Value $state
+        return $unknown
+      }
+      $claims.Add([pscustomobject]@{
+          claim_id = [Guid]::NewGuid().ToString('N')
+          kind = 'remote-sidecar'
+          claimed_unix_ms = [int64](Get-ObjectValue $sidecar 'spawned_unix_ms' 0)
+          task_id = $taskId
+          identity_hash = [string](Get-ObjectValue $sidecar 'identity_hash' '')
+          terminal_proven = $false
+        })
+      [void]$boundTaskIds.Add($taskId)
+    }
+    $remaining = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($claim in @($claims.ToArray())) {
+      $taskId = [string](Get-ObjectValue $claim 'task_id' '')
+      if (-not [string]::IsNullOrWhiteSpace($taskId) -and -not [bool](Get-ObjectValue $claim 'terminal_proven' $false)) {
+        $terminalProof = Get-AudnCodeValidatedTerminalClaimIds `
+          -SessionId $lockedSessionId `
+          -TranscriptPath $lockedTranscriptPath `
+          -Claims @() `
+          -ClaimsValid $true `
+          -Cursor 0 `
+          -CursorAtLineBoundary $true `
+          -ActiveIds @($taskId) `
+          -HostStartedUnixMs ([int64](Get-ObjectValue $claim 'claimed_unix_ms' 0)) `
+          -RequiredTaskType 'remote_agent'
+        if ([string](Get-ObjectValue $terminalProof 'state' 'unknown') -eq 'unknown') { return $unknown }
+        if ($taskId -in @((Get-ObjectValue $terminalProof 'ids' @()))) {
+          Set-RecordValue -Record $claim -Name 'terminal_proven' -Value $true
+        }
+      }
+      $sidecarStillPresent = -not [string]::IsNullOrWhiteSpace($taskId) -and
+        @($sidecars | Where-Object { [string](Get-ObjectValue $_ 'task_id' '') -eq $taskId }).Count -eq 1
+      if ([bool](Get-ObjectValue $claim 'terminal_proven' $false) -and -not $sidecarStillPresent) { continue }
+      $remaining.Add($claim)
+    }
+    $remainingClaims = @($remaining.ToArray())
+    $remainingClaimsJson = ConvertTo-CompactJson ([pscustomobject]@{ claims = $remainingClaims })
+    $remoteStateChanged = $persistedClaimsJson -ne $remainingClaimsJson -or
+      ($hadPersistedEnvelope -and
+        ($null -eq $persistedValidProperty -or $persistedValidProperty.Value -isnot [bool] -or
+          -not [bool]$persistedValidProperty.Value))
+    if ($remoteStateChanged) {
+      Set-RecordValue -Record $state -Name 'audncode_remote_claims_valid' -Value $true
+      Set-RecordValue -Record $state -Name 'audncode_remote_claims' -Value $remainingClaims
+      Write-JsonAtomic -Path $lockedPath -Value $state
+    }
+    $fingerprint = Get-Sha256Hex (
+      'audncode-remote-gate/v1|' + [string](Get-ObjectValue $sidecarState 'fingerprint' '') + '|' +
+      ((@($remaining.ToArray() | Sort-Object claim_id | ForEach-Object {
+            [string](Get-ObjectValue $_ 'claim_id' '') + '|' +
+            [string](Get-ObjectValue $_ 'task_id' '') + '|' +
+            [string](Get-ObjectValue $_ 'identity_hash' '') + '|' +
+            [string][bool](Get-ObjectValue $_ 'terminal_proven' $false)
+          })) -join "`n")
+    )
+    if ($remaining.Count -gt 0 -or $sidecars.Count -gt 0) {
+      return [pscustomobject]@{ state = 'busy'; reason = 'audncode-remote-agents-active'; fingerprint = $fingerprint }
+    }
+    return [pscustomobject]@{ state = 'idle'; reason = 'audncode-remote-agents-idle'; fingerprint = $fingerprint }
+  }
+  if ($null -ne $LockedSessionState) {
+    return (& $action $info.path $SessionId $TranscriptPath $HomePath $LockedSessionState)
+  }
+  return Invoke-WithClaudeSessionLock -Info $info -Action $action `
+    -Arguments @($info.path, $SessionId, $TranscriptPath, $HomePath, $null)
+}
+
+function Get-AudnCodeBackgroundState {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [object]$LockedSessionState = $null
+  )
+
+  $sessionState = if ($null -ne $LockedSessionState) {
+    $LockedSessionState
+  } else {
+    Read-ClaudeSessionState -SessionId $SessionId
+  }
+  if ([bool](Get-ObjectValue $sessionState 'audncode_prompt_prearm_pending' $false)) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-prompt-prearm-incomplete' }
+  }
+  $expectedHostPid = [int](Get-ObjectValue $sessionState 'audncode_host_pid' 0)
+  $expectedHostStarted = [int64](Get-ObjectValue $sessionState 'audncode_host_started_unix_ms' 0)
+  if ($null -eq $sessionState -or $expectedHostPid -le 0 -or $expectedHostStarted -le 0 -or
+      -not [string]::Equals([string](Get-ObjectValue $sessionState 'audncode_home' ''), $HomePath, [StringComparison]::OrdinalIgnoreCase)) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-epoch-unverifiable' }
+  }
+  $hostLifetimesProperty = $sessionState.PSObject.Properties['audncode_host_lifetimes']
+  $multiHostProperty = $sessionState.PSObject.Properties['audncode_multi_host_conflict']
+  if (($null -ne $hostLifetimesProperty -and $hostLifetimesProperty.Value -isnot [array]) -or
+      ($null -ne $multiHostProperty -and $multiHostProperty.Value -isnot [bool])) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-host-lifetimes-unverifiable' }
+  }
+  $hostLifetimeState = Get-AudnCodeSessionHostLifetimeState `
+    -SessionId $SessionId `
+    -Lifetimes $(if ($null -eq $hostLifetimesProperty) { @() } else { @($hostLifetimesProperty.Value) }) `
+    -CurrentHome $HomePath `
+    -CurrentPid $expectedHostPid `
+    -CurrentStartedUnixMs $expectedHostStarted `
+    -StickyConflict ([bool](Get-ObjectValue $sessionState 'audncode_multi_host_conflict' $false)) `
+    -PruneExited
+  if ([string](Get-ObjectValue $hostLifetimeState 'state' 'unknown') -eq 'conflict') {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-multi-host-session-active' }
+  }
+  if ([string](Get-ObjectValue $hostLifetimeState 'state' 'unknown') -ne 'clear') {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-host-lifetimes-unverifiable' }
+  }
+  $audnHostSession = Get-AudnCodeHostSession `
+    -SessionId $SessionId `
+    -HomePath $HomePath `
+    -ExpectedHostPid $expectedHostPid `
+    -ExpectedHostStartedUnixMs $expectedHostStarted `
+    -AllowExitedHost
+  if (-not [bool]$audnHostSession.ok -or [int64]$audnHostSession.started_unix_ms -ne $expectedHostStarted) {
+    return [pscustomobject]@{ state = 'unknown'; reason = [string]$audnHostSession.reason }
+  }
+  if (-not [bool]$audnHostSession.live) {
+    return Get-AudnCodeExitedHostFinalityState `
+      -SessionState $sessionState `
+      -LockedSessionState $LockedSessionState
+  }
+  $runtimeInfo = Get-AudnCodeRuntimeStateInfo -HomePath $HomePath -HostPid $expectedHostPid -HostStartedUnixMs $expectedHostStarted
+  if ($null -eq $runtimeInfo -or [string]$runtimeInfo.key -ne [string](Get-ObjectValue $sessionState 'audncode_runtime_key' '')) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-epoch-unverifiable' }
+  }
+  if ([bool](Get-ObjectValue $sessionState 'audncode_background_lifecycle_unverifiable' $false)) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-lifecycle-unverifiable' }
+  }
+  $guardInfo = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $runtimeInfo -RegistryKind 'background'
+  $guardState = Get-AudnCodeLifecycleGuardState -GuardInfo $guardInfo
+  if ([string](Get-ObjectValue $guardState 'state' 'unknown') -ne 'clear') {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-lifecycle-unverifiable' }
+  }
+  $runtimeState = Read-AudnCodeRuntimeBackgroundState -RuntimeInfo $runtimeInfo
+  if ($null -eq $runtimeState -or -not [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-registry-unverifiable' }
+  }
+  if (@((Get-ObjectValue $runtimeState 'sessions' @())).Count -gt 64) {
+    $runtimeState = Update-AudnCodeRuntimeBackgroundState -RuntimeInfo $runtimeInfo
+    if ($null -eq $runtimeState -or -not [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)) {
+      return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-registry-unverifiable' }
+    }
+  }
+  $currentLineage = @(@((Get-ObjectValue $runtimeState 'sessions' @())) | Where-Object {
+      [string](Get-ObjectValue $_ 'session_id' '') -eq $SessionId -and
+      [string]::Equals([string](Get-ObjectValue $_ 'transcript_path' ''), $TranscriptPath, [StringComparison]::OrdinalIgnoreCase)
+    })
+  if ($currentLineage.Count -ne 1) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-session-lineage-unverifiable' }
+  }
+  $fingerprintParts = New-Object 'System.Collections.Generic.List[string]'
+  $fingerprintParts.Add("runtime|$($runtimeInfo.key)")
+  foreach ($lineageSession in @((Get-ObjectValue $runtimeState 'sessions' @()))) {
+    $lineageSessionId = [string](Get-ObjectValue $lineageSession 'session_id' '')
+    $lockedRemoteState = if ($null -ne $LockedSessionState -and $lineageSessionId -eq $SessionId) {
+      $LockedSessionState
+    } else { $null }
+    $remote = Get-AudnCodeRemoteAgentState `
+      -SessionId $lineageSessionId `
+      -TranscriptPath ([string](Get-ObjectValue $lineageSession 'transcript_path' '')) `
+      -HomePath $HomePath `
+      -LockedSessionState $lockedRemoteState
+    if ([string](Get-ObjectValue $remote 'state' 'unknown') -ne 'idle') {
+      return [pscustomobject]@{
+        state = [string](Get-ObjectValue $remote 'state' 'unknown')
+        reason = [string](Get-ObjectValue $remote 'reason' 'audncode-remote-agents-unverifiable')
+      }
+    }
+    $fingerprintParts.Add(
+      "remote|$([string](Get-ObjectValue $lineageSession 'session_id' ''))|$([string](Get-ObjectValue $remote 'fingerprint' ''))"
+    )
+  }
+  $observedSidechainIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  foreach ($lineageSession in @((Get-ObjectValue $runtimeState 'sessions' @()))) {
+    $sidechains = Get-AudnCodeMainSessionSidechainIds `
+      -TranscriptPath ([string](Get-ObjectValue $lineageSession 'transcript_path' '')) `
+      -PromptBusyUnixMs ([int64](Get-ObjectValue $sessionState 'busy_unix_ms' 0)) `
+      -HostStartedUnixMs $expectedHostStarted
+    if ([string]$sidechains.state -ne 'ok') {
+      return [pscustomobject]@{ state = 'unknown'; reason = [string]$sidechains.reason }
+    }
+    foreach ($sidechainId in @($sidechains.ids)) {
+      if (-not $observedSidechainIds.Add([string]$sidechainId)) {
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-main-session-unverifiable' }
+      }
+    }
+  }
+  if ($observedSidechainIds.Count -gt 0) {
+    $runtimeState = Update-AudnCodeRuntimeBackgroundState -RuntimeInfo $runtimeInfo -ObservedIds @($observedSidechainIds)
+    if ($null -eq $runtimeState -or -not [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)) {
+      return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-registry-unverifiable' }
+    }
+  }
+  $activeIds = @((Get-ObjectValue $runtimeState 'background_ids' @()))
+  if (@($activeIds | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) -or $_.Length -gt 160 }).Count -gt 0) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-registry-unverifiable' }
+  }
+  # A runtime can receive several task-notification turns before the worker
+  # polls. Reconcile every trusted terminal row in the bounded transcript tail
+  # first across the whole /clear-/resume lineage so a newer prompt cannot
+  # overwrite an older task's close evidence.
+  foreach ($lineageSession in @((Get-ObjectValue $runtimeState 'sessions' @()))) {
+    if ($activeIds.Count -eq 0) { break }
+    $historicalProof = Get-AudnCodeValidatedTerminalClaimIds `
+      -SessionId ([string](Get-ObjectValue $lineageSession 'session_id' '')) `
+      -TranscriptPath ([string](Get-ObjectValue $lineageSession 'transcript_path' '')) `
+      -Claims @() `
+      -ClaimsValid $true `
+      -Cursor 0 `
+      -CursorAtLineBoundary $true `
+      -ActiveIds $activeIds `
+      -HostStartedUnixMs $expectedHostStarted
+    if ([string]$historicalProof.state -ne 'ok') {
+      return [pscustomobject]@{ state = [string]$historicalProof.state; reason = [string]$historicalProof.reason }
+    }
+    if (@($historicalProof.ids).Count -gt 0) {
+      $runtimeState = Update-AudnCodeRuntimeBackgroundState `
+        -RuntimeInfo $runtimeInfo `
+        -CompletedReceipts @((Get-ObjectValue $historicalProof 'completions' @()))
+      if ($null -eq $runtimeState -or -not [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)) {
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-registry-unverifiable' }
+      }
+      $activeIds = @((Get-ObjectValue $runtimeState 'background_ids' @()))
+    }
+  }
+  # A task-notification may contain ordinary upstream text (for example the
+  # kill-all summary used to prove an invisible queue clear). It is terminal
+  # evidence only while there is a registered background id to reconcile.
+  if ($activeIds.Count -gt 0) {
+    $terminalProof = Get-AudnCodeValidatedTerminalClaimIds `
+      -SessionId $SessionId `
+      -TranscriptPath $TranscriptPath `
+      -Claims @((Get-ObjectValue $sessionState 'audncode_terminal_claims' @())) `
+      -ClaimsValid ([bool](Get-ObjectValue $sessionState 'audncode_terminal_claims_valid' $true)) `
+      -Cursor ([int64](Get-ObjectValue $sessionState 'audncode_terminal_claim_cursor' 0)) `
+      -CursorAtLineBoundary ([bool](Get-ObjectValue $sessionState 'audncode_terminal_claim_at_boundary' $true)) `
+      -ActiveIds $activeIds `
+      -HostStartedUnixMs $expectedHostStarted
+    if ([string]$terminalProof.state -ne 'ok') {
+      return [pscustomobject]@{ state = [string]$terminalProof.state; reason = [string]$terminalProof.reason }
+    }
+    if (@($terminalProof.ids).Count -gt 0) {
+      $runtimeState = Update-AudnCodeRuntimeBackgroundState `
+        -RuntimeInfo $runtimeInfo `
+        -CompletedReceipts @((Get-ObjectValue $terminalProof 'completions' @()))
+      if ($null -eq $runtimeState -or -not [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)) {
+        return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-background-registry-unverifiable' }
+      }
+      $activeIds = @((Get-ObjectValue $runtimeState 'background_ids' @()))
+    }
+  }
+  if ($activeIds.Count -gt 0) {
+    return [pscustomobject]@{ state = 'busy'; reason = 'audncode-background-tools-active' }
+  }
+  if ([bool](Get-ObjectValue $runtimeState 'local_agent_ui_uncertain' $false)) {
+    # Public AudnCode SendMessage queues input in AppState RAM without a durable
+    # consumed acknowledgement. Same-ID overlapping agent lifecycles can also
+    # suppress the newer terminal. Either uncertainty remains sticky because
+    # even exact host exit can leave an unregistered detached foreground shell.
+    return [pscustomobject]@{ state = 'busy'; reason = 'audncode-local-agent-ui-queue-unverifiable' }
+  }
+  $fingerprintParts.Add('background|' + (@($activeIds | Sort-Object) -join ','))
+  $closedFingerprint = [string](Get-ObjectValue $runtimeState 'closed_ids_fingerprint' '')
+  if ([string]::IsNullOrWhiteSpace($closedFingerprint)) {
+    # Backward-compatible state created before compact tombstone indexing.
+    $closedFingerprint = Get-Sha256Hex ('audn-closed-set/v1|' +
+      ((@((Get-ObjectValue $runtimeState 'closed_ids' @())) | Sort-Object) -join "`n"))
+  }
+  $fingerprintParts.Add("closed|$closedFingerprint")
+  $queue = Get-AudnCodeQueueState `
+    -Sessions @((Get-ObjectValue $runtimeState 'sessions' @())) `
+    -HostStartedUnixMs ([int64]$audnHostSession.started_unix_ms) `
+    -HomePath $HomePath
+  if ([string]$queue.state -ne 'idle') {
+    return [pscustomobject]@{ state = [string]$queue.state; reason = [string]$queue.reason }
+  }
+  $fingerprintParts.Add("queue|$([string](Get-ObjectValue $queue 'fingerprint' ''))|$([int](Get-ObjectValue $queue 'count' -1))")
+  foreach ($lineageSession in @((Get-ObjectValue $runtimeState 'sessions' @()))) {
+    $lineageSessionId = [string](Get-ObjectValue $lineageSession 'session_id' '')
+    $lineageTeamName = [string](Get-ObjectValue $lineageSession 'team_name' '')
+    $lineageTeamNameValid = [bool](Get-ObjectValue $lineageSession 'team_name_valid' $true)
+    $team = Get-AudnCodeTeamState `
+      -SessionId $lineageSessionId `
+      -HomePath $HomePath `
+      -AdditionalTeamName $lineageTeamName `
+      -AdditionalTeamNameValid $lineageTeamNameValid
+    if ([string]$team.state -ne 'idle') {
+      return [pscustomobject]@{ state = [string]$team.state; reason = [string]$team.reason }
+    }
+    $fingerprintParts.Add("team|$lineageSessionId|$([int](Get-ObjectValue $team 'count' -1))|$([string]$team.reason)")
+    $tasks = Get-AudnCodeTaskState `
+      -SessionId $lineageSessionId `
+      -HomePath $HomePath `
+      -AdditionalTaskListId ([string](Get-ObjectValue $lineageSession 'task_list_id' '')) `
+      -AdditionalTaskListValid ([bool](Get-ObjectValue $lineageSession 'task_list_valid' $true)) `
+      -AdditionalTeamName $lineageTeamName `
+      -AdditionalTeamNameValid $lineageTeamNameValid
+    if ([string]$tasks.state -ne 'idle') {
+      return [pscustomobject]@{ state = [string]$tasks.state; reason = [string]$tasks.reason }
+    }
+    $fingerprintParts.Add("tasks|$lineageSessionId|$([int](Get-ObjectValue $tasks 'count' -1))|$([string]$tasks.reason)")
+  }
+  if ([bool](Get-ObjectValue $sessionState 'audncode_cron_lifecycle_unverifiable' $false)) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-cron-lifecycle-unverifiable' }
+  }
+  if (-not [bool](Get-ObjectValue $sessionState 'audncode_cron_registry_valid' $false)) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-cron-state-unverifiable' }
+  }
+  $cron = Get-AudnCodeCronFinalityState `
+    -SessionId $SessionId `
+    -HomePath $HomePath `
+    -HostPid $expectedHostPid `
+    -HostStartedUnixMs $expectedHostStarted `
+    -HostProcessStartedUnixMs ([int64](Get-ObjectValue $sessionState 'audncode_host_process_started_unix_ms' 0)) `
+    -ExpectedRuntimeKey ([string](Get-ObjectValue $sessionState 'audncode_cron_runtime_key' '')) `
+    -ExpectedHookGeneration ([string](Get-ObjectValue $sessionState 'audncode_cron_hook_generation' '')) `
+    -ExpectedHookInstalledUnixMs ([int64](Get-ObjectValue $sessionState 'audncode_cron_hook_installed_unix_ms' 0))
+  if ([string]$cron.state -ne 'idle') {
+    return [pscustomobject]@{ state = [string]$cron.state; reason = [string]$cron.reason }
+  }
+  $cronFingerprint = [string](Get-ObjectValue $cron 'fingerprint' '')
+  if ([string]::IsNullOrWhiteSpace($cronFingerprint)) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-cron-snapshot-unverifiable' }
+  }
+  $fingerprintParts.Add("cron|$cronFingerprint")
+  return [pscustomobject]@{
+    state = 'idle'
+    reason = 'audncode-background-idle'
+    fingerprint = Get-Sha256Hex (($fingerprintParts.ToArray()) -join "`n")
+  }
+}
+
+function Test-AudnCodePendingCandidate {
+  param(
+    [string]$SessionId,
+    [string]$PromptId,
+    [int64]$SessionEpoch,
+    [string]$TranscriptPath,
+    [object]$SessionState,
+    [int64]$IdleHookStartTicks
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or
+      [string]::IsNullOrWhiteSpace($PromptId) -or
+      $SessionEpoch -le 0 -or
+      [string]::IsNullOrWhiteSpace($TranscriptPath) -or
+      $IdleHookStartTicks -le 0 -or
+      [bool](Get-ObjectValue $SessionState 'audncode_prompt_prearm_pending' $false)) {
+    return $false
+  }
+  $key = Get-StrongEventKey -Provider 'claude' -ThreadId $SessionId -TurnId $PromptId
+  $path = Join-Path $PendingDir ($key + '.json')
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+  try {
+    $candidate = Read-JsonFile -Path $path
+    $busyHookStartTicks = [int64](Get-ObjectValue $SessionState 'busy_hook_start_ticks' 0)
+    $stopHookStartTicks = [int64](Get-ObjectValue $candidate 'audncode_hook_start_ticks' 0)
+    return [string](Get-ObjectValue $candidate 'provider' '') -eq 'claude' -and
+      [string](Get-ObjectValue $candidate 'candidate_kind' '') -eq 'audncode_stop' -and
+      [string](Get-ObjectValue $candidate 'thread_id' '') -eq $SessionId -and
+      [string](Get-ObjectValue $candidate 'turn_id' '') -eq $PromptId -and
+      [int64](Get-ObjectValue $candidate 'claude_session_epoch' 0) -eq $SessionEpoch -and
+      $busyHookStartTicks -gt 0 -and
+      $stopHookStartTicks -gt 0 -and
+      $stopHookStartTicks -gt $busyHookStartTicks -and
+      $IdleHookStartTicks -gt $busyHookStartTicks -and
+      $IdleHookStartTicks -gt $stopHookStartTicks -and
+      [string]::Equals(
+        [string](Get-ObjectValue $candidate 'candidate_rollout_path' ''),
+        $TranscriptPath,
+        [StringComparison]::OrdinalIgnoreCase
+      )
+  } catch {
+    return $false
+  }
+}
+
+function Register-AudnCodePromptRuntimeLineage {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [int]$ExpectedHostPid = 0,
+    [int64]$ExpectedHostStartedUnixMs = 0,
+    [string]$TaskListId = '',
+    [bool]$TaskListValid = $true,
+    [string]$TeamName = '',
+    [bool]$TeamNameValid = $true
+  )
+
+  $result = [pscustomobject][ordered]@{
+    ok = $false
+    host_pid = 0
+    host_started_unix_ms = [int64]0
+    host_process_started_unix_ms = [int64]0
+    runtime_key = ''
+    background_registry_valid = $false
+    background_ids = @()
+    cron_runtime_key = ''
+    cron_registry_valid = $false
+    project_root = ''
+    cron_hook_generation = ''
+    cron_hook_installed_unix_ms = [int64]0
+  }
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or
+      [string]::IsNullOrWhiteSpace($TranscriptPath) -or
+      [string]::IsNullOrWhiteSpace($HomePath) -or
+      (($ExpectedHostPid -gt 0) -ne ($ExpectedHostStartedUnixMs -gt 0))) { return $result }
+  try {
+    $HomePath = [IO.Path]::GetFullPath($HomePath)
+    $TranscriptPath = [IO.Path]::GetFullPath($TranscriptPath)
+  } catch { return $result }
+
+  $audnHostSession = if ($ExpectedHostPid -gt 0) {
+    Get-AudnCodeHostSession `
+      -SessionId $SessionId `
+      -HomePath $HomePath `
+      -ExpectedHostPid $ExpectedHostPid `
+      -ExpectedHostStartedUnixMs $ExpectedHostStartedUnixMs `
+      -MaxWaitMilliseconds 1600
+  } else {
+    Get-AudnCodeHostSession `
+      -SessionId $SessionId `
+      -HomePath $HomePath `
+      -MaxWaitMilliseconds 1600
+  }
+  if (-not [bool](Get-ObjectValue $audnHostSession 'ok' $false) -or
+      -not [bool](Get-ObjectValue $audnHostSession 'live' $false) -or
+      ($ExpectedHostPid -gt 0 -and
+        ([int](Get-ObjectValue $audnHostSession 'pid' 0) -ne $ExpectedHostPid -or
+         [int64](Get-ObjectValue $audnHostSession 'started_unix_ms' 0) -ne $ExpectedHostStartedUnixMs))) {
+    return $result
+  }
+
+  $result.host_pid = [int](Get-ObjectValue $audnHostSession 'pid' 0)
+  $result.host_started_unix_ms = [int64](Get-ObjectValue $audnHostSession 'started_unix_ms' 0)
+  $result.host_process_started_unix_ms = [int64](Get-ObjectValue $audnHostSession 'process_started_unix_ms' 0)
+  $runtimeInfo = Get-AudnCodeRuntimeStateInfo `
+    -HomePath $HomePath `
+    -HostPid ([int]$result.host_pid) `
+    -HostStartedUnixMs ([int64]$result.host_started_unix_ms)
+  $runtimeState = Update-AudnCodeRuntimeBackgroundState `
+    -RuntimeInfo $runtimeInfo `
+    -RegisterSession ([pscustomobject]@{
+        session_id = $SessionId
+        transcript_path = $TranscriptPath
+        task_list_id = $TaskListId
+        task_list_valid = [bool]$TaskListValid
+        team_name = $TeamName
+        team_name_valid = [bool]$TeamNameValid
+      })
+  if ($null -eq $runtimeInfo -or $null -eq $runtimeState) { return $result }
+  $result.runtime_key = [string](Get-ObjectValue $runtimeInfo 'key' '')
+  $result.background_registry_valid = [bool](Get-ObjectValue $runtimeState 'registry_valid' $false)
+  $result.background_ids = @((Get-ObjectValue $runtimeState 'background_ids' @()))
+  if (-not [bool]$result.background_registry_valid) { return $result }
+
+  $projectInfo = Get-AudnCodeHostProjectRoot `
+    -SessionId $SessionId `
+    -HomePath $HomePath `
+    -HostPid ([int]$result.host_pid) `
+    -HostStartedUnixMs ([int64]$result.host_started_unix_ms)
+  $cronMarker = Get-AudnCodeCronObservationMarker `
+    -HomePath $HomePath `
+    -HostStartedUnixMs ([int64]$result.host_started_unix_ms) `
+    -HostProcessStartedUnixMs ([int64]$result.host_process_started_unix_ms)
+  $cronInfo = if ([bool](Get-ObjectValue $cronMarker 'ok' $false)) {
+    Get-AudnCodeCronRuntimeStateInfo `
+      -HomePath $HomePath `
+      -HostPid ([int]$result.host_pid) `
+      -HostStartedUnixMs ([int64]$result.host_started_unix_ms) `
+      -HookGeneration ([string](Get-ObjectValue $cronMarker 'generation' '')) `
+      -HookInstalledUnixMs ([int64](Get-ObjectValue $cronMarker 'installed_unix_ms' 0)) `
+      -ObservationAllowed ([bool](Get-ObjectValue $cronMarker 'host_observable' $false))
+  } else { $null }
+  if (-not [bool](Get-ObjectValue $projectInfo 'ok' $false) -or $null -eq $cronInfo) { return $result }
+
+  $result.project_root = [string](Get-ObjectValue $projectInfo 'project_root' '')
+  $result.cron_hook_generation = [string](Get-ObjectValue $cronMarker 'generation' '')
+  $result.cron_hook_installed_unix_ms = [int64](Get-ObjectValue $cronMarker 'installed_unix_ms' 0)
+  $cronGuardInfo = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $cronInfo -RegistryKind 'cron'
+  $cronProjectLockInfo = Get-AudnCodeCronProjectLockInfo -HomePath $HomePath -ProjectRoot ([string]$result.project_root)
+  if ($null -eq $cronGuardInfo -or $null -eq $cronProjectLockInfo) { return $result }
+  $cronState = Invoke-WithClaudeSessionLock -Info $cronProjectLockInfo -Action {
+    param($lockedProjectLockInfo, $lockedGuardInfo, $lockedCronInfo, $lockedSessionId, $lockedProjectRoot, $lockedProcessStartedUnixMs)
+    $lockedFileState = Read-AudnCodeDurableCronFileState -ProjectRoot $lockedProjectRoot
+    $lockedObserved = New-Object 'System.Collections.Generic.List[object]'
+    if ([string](Get-ObjectValue $lockedFileState 'state' 'unknown') -eq 'ok') {
+      foreach ($observedCron in @((Get-ObjectValue $lockedFileState 'entries' @()))) {
+        $lockedObserved.Add([pscustomobject]@{
+            id = [string](Get-ObjectValue $observedCron 'id' '')
+            session_id = $lockedSessionId
+            project_root = $lockedProjectRoot
+            recurring = [bool](Get-ObjectValue $observedCron 'recurring' $false)
+            definition_hash = [string](Get-ObjectValue $observedCron 'definition_hash' '')
+            incarnation_hash = [string](Get-ObjectValue $observedCron 'incarnation_hash' '')
+          })
+      }
+    }
+    $lockedObservedEnvelope = [pscustomobject]@{ entries = @($lockedObserved.ToArray()) }
+    return Invoke-WithClaudeSessionLock -Info $lockedGuardInfo -Action {
+      param($nestedGuardInfo, $nestedCronInfo, $nestedSessionId, $nestedProjectRoot, $nestedFileState, $nestedObservedEnvelope, $nestedProcessStartedUnixMs)
+      $lockedGuardState = Get-AudnCodeLifecycleGuardState -GuardInfo $nestedGuardInfo
+      return Update-AudnCodeCronRuntimeState `
+        -RuntimeInfo $nestedCronInfo `
+        -RegisterSession ([pscustomobject]@{
+            session_id = $nestedSessionId
+            project_root = $nestedProjectRoot
+          }) `
+        -ObservedDurableCrons @((Get-ObjectValue $nestedObservedEnvelope 'entries' @())) `
+        -FileSnapshot (Get-ObjectValue $nestedFileState 'snapshot') `
+        -HostProcessStartedUnixMs ([int64]$nestedProcessStartedUnixMs) `
+        -Invalidate:([string](Get-ObjectValue $nestedFileState 'state' 'unknown') -eq 'unknown' -or
+          [string](Get-ObjectValue $lockedGuardState 'state' 'unknown') -ne 'clear')
+    } -Arguments @($lockedGuardInfo, $lockedCronInfo, $lockedSessionId, $lockedProjectRoot, $lockedFileState, $lockedObservedEnvelope, $lockedProcessStartedUnixMs)
+  } -Arguments @($cronProjectLockInfo, $cronGuardInfo, $cronInfo, $SessionId, [string]$result.project_root, [int64]$result.host_process_started_unix_ms)
+  $result.cron_runtime_key = [string](Get-ObjectValue $cronInfo 'key' '')
+  $result.cron_registry_valid = $null -ne $cronState -and
+    [bool](Get-ObjectValue $cronState 'registry_valid' $false)
+  $result.ok = [bool]$result.background_registry_valid -and
+    [bool]$result.cron_registry_valid -and [bool]$TaskListValid -and [bool]$TeamNameValid
+  return $result
+}
+
 function Set-ClaudeSessionBusy {
   param(
     [string]$SessionId,
     [string]$PromptId,
-    [string]$TranscriptPath
+    [string]$TranscriptPath,
+    [int64]$HookStartTicks = 0,
+    [object[]]$AudnCodeTerminalClaims = @(),
+    [string]$AudnCodeHomePath = '',
+    [int]$AudnCodeIngressHostPid = 0,
+    [int64]$AudnCodeIngressHostStartedUnixMs = 0,
+    [string]$AudnCodeTaskListId = '',
+    [string]$AudnCodeTeamName = '',
+    [bool]$AudnCodeRemoteLaunchClaim = $false,
+    [int]$AudnCodeBusyEventRank = 0
   )
 
   $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
   if ($null -eq $info) { return [int64]0 }
-  # Take the session lock before reading the baseline. This is the linearization
-  # point between a new prompt and a worker promoting the previous prompt.
+  if ($HookStartTicks -gt 0 -and
+      $AudnCodeBusyEventRank -notin @($AudnCodeSessionStartBusyEventRank, $AudnCodeUserPromptBusyEventRank)) {
+    return [int64]0
+  }
+  $promptPrearmToken = ''
+  $promptPrearmEpoch = [int64]0
+  $promptPrearmHostLifetimes = @()
+  $stopFailureCursor = [pscustomobject]@{
+    ok = $false
+    file_existed = $false
+    cursor = [int64]0
+    at_boundary = $false
+    creation_ticks = [int64]0
+    anchor_offset = [int64]0
+    anchor_hash = ''
+  }
+  if ($HookStartTicks -gt 0) {
+    try { $AudnCodeHomePath = [IO.Path]::GetFullPath($AudnCodeHomePath) } catch { $AudnCodeHomePath = '' }
+    $stopFailureCursor = Get-AudnCodeTranscriptCursorSnapshot `
+      -TranscriptPath $TranscriptPath `
+      -SessionId $SessionId `
+      -HomePath $AudnCodeHomePath
+    $promptPrearmToken = [Guid]::NewGuid().ToString('N')
+    $prearm = Invoke-WithClaudeSessionLock -Info $info -Action {
+      param($lockedPath, $lockedSessionId, $lockedPromptId, $lockedTranscriptPath, $lockedHookStartTicks, $lockedEventRank, $lockedToken, $lockedAudnCodeHome, $lockedIngressHostPid, $lockedIngressHostStartedUnixMs, $lockedStopFailureCursor, $lockedRemoteLaunchClaim)
+      $previous = $null
+      try { $previous = Read-JsonFile -Path $lockedPath } catch { $previous = $null }
+      $previousWasPrearmed = [bool](Get-ObjectValue $previous 'audncode_prompt_prearm_pending' $false)
+      $previousBusyHookStartTicks = [int64](Get-ObjectValue $previous 'busy_hook_start_ticks' 0)
+      if ($previousBusyHookStartTicks -gt 0 -and
+          (Compare-AudnCodeBusyEventOrder `
+              -LeftHookStartTicks ([int64]$lockedHookStartTicks) `
+              -LeftEventRank ([int]$lockedEventRank) `
+              -RightHookStartTicks $previousBusyHookStartTicks `
+              -RightEventRank (Get-AudnCodeBusyEventRank -Record $previous)) -le 0) {
+        # Hooks may reach this first lock out of spawn order. Never let an
+        # older or equal-ranked ingress replace the pre-arm/finalized state of
+        # a newer prompt. At equal ticks UserPromptSubmit outranks the
+        # SessionStart placeholder deterministically.
+        return $null
+      }
+      $previousHostPid = if ($previousWasPrearmed) {
+        [int](Get-ObjectValue $previous 'audncode_prompt_previous_host_pid' 0)
+      } else { [int](Get-ObjectValue $previous 'audncode_host_pid' 0) }
+      $previousHostStarted = if ($previousWasPrearmed) {
+        [int64](Get-ObjectValue $previous 'audncode_prompt_previous_host_started_unix_ms' 0)
+      } else { [int64](Get-ObjectValue $previous 'audncode_host_started_unix_ms' 0) }
+      $previousHome = if ($previousWasPrearmed) {
+        [string](Get-ObjectValue $previous 'audncode_prompt_previous_home' '')
+      } else { [string](Get-ObjectValue $previous 'audncode_home' '') }
+      $previousHostLifetimes = @(if ($previousWasPrearmed) {
+          Get-ObjectValue $previous 'audncode_prompt_previous_host_lifetimes' @()
+        } else {
+          Get-ObjectValue $previous 'audncode_host_lifetimes' @()
+        })
+      $yieldedPreviousIdleHost = $false
+      $idleHostRetirementCandidate = $null
+      if (-not $previousWasPrearmed -and
+          [string](Get-ObjectValue $previous 'session_id' '') -eq $lockedSessionId -and
+          [string]::Equals(
+            [string](Get-ObjectValue $previous 'transcript_path' ''),
+            $lockedTranscriptPath,
+            [StringComparison]::OrdinalIgnoreCase
+          ) -and
+          [string](Get-ObjectValue $previous 'state' '') -eq 'idle' -and
+          [string](Get-ObjectValue $previous 'notification_type' '') -eq 'idle_prompt' -and
+          [int64](Get-ObjectValue $previous 'idle_hook_start_ticks' 0) -gt $previousBusyHookStartTicks -and
+          $previousBusyHookStartTicks -gt 0 -and
+          $lockedIngressHostPid -gt 0 -and $lockedIngressHostStartedUnixMs -gt 0 -and
+          -not [string]::IsNullOrWhiteSpace($lockedAudnCodeHome)) {
+        $conflictProperty = $previous.PSObject.Properties['audncode_multi_host_conflict']
+        $lifetimesProperty = $previous.PSObject.Properties['audncode_host_lifetimes']
+        $stopProofsProperty = $previous.PSObject.Properties['audncode_superseded_host_stop_proofs']
+        $sameIngressHost = $previousHostPid -eq [int]$lockedIngressHostPid -and
+          $previousHostStarted -eq [int64]$lockedIngressHostStartedUnixMs -and
+          [string]::Equals($previousHome, $lockedAudnCodeHome, [StringComparison]::OrdinalIgnoreCase)
+        if (-not $sameIngressHost -and
+            $null -ne $conflictProperty -and $conflictProperty.Value -is [bool] -and
+            -not [bool]$conflictProperty.Value -and
+            $null -ne $lifetimesProperty -and $lifetimesProperty.Value -is [array] -and
+            @($lifetimesProperty.Value).Count -eq 1 -and
+            $null -ne $stopProofsProperty -and $stopProofsProperty.Value -is [array] -and
+            @($stopProofsProperty.Value).Count -eq 0) {
+          $idleLifetimeState = Get-AudnCodeSessionHostLifetimeState `
+            -SessionId $lockedSessionId `
+            -Lifetimes @($lifetimesProperty.Value) `
+            -CurrentHome $previousHome `
+            -CurrentPid $previousHostPid `
+            -CurrentStartedUnixMs $previousHostStarted `
+            -ResetConflict
+          if ([string](Get-ObjectValue $idleLifetimeState 'state' 'unknown') -eq 'clear' -and
+              -not [bool](Get-ObjectValue $idleLifetimeState 'conflict' $true) -and
+              @((Get-ObjectValue $idleLifetimeState 'lifetimes' @())).Count -eq 1) {
+            # Stop + idle_prompt makes this exact owner a retirement candidate,
+            # but process-bound background/cron registries and lifecycle guards
+            # still have to be proven clear under their locks before the pre-arm
+            # may omit it.
+            $idleHostRetirementCandidate = [pscustomobject]@{
+              home = $previousHome
+              pid = [int]$previousHostPid
+              started_unix_ms = [int64]$previousHostStarted
+            }
+          }
+        }
+      }
+      if (-not $yieldedPreviousIdleHost -and $previousHostLifetimes.Count -eq 0 -and $previousHostPid -gt 0 -and
+          $previousHostStarted -gt 0 -and -not [string]::IsNullOrWhiteSpace($previousHome)) {
+        $previousHostLifetimes = @([pscustomobject]@{
+            home = $previousHome
+            pid = [int]$previousHostPid
+            started_unix_ms = [int64]$previousHostStarted
+          })
+      }
+      if ($lockedIngressHostPid -gt 0 -and $lockedIngressHostStartedUnixMs -gt 0 -and
+          -not [string]::IsNullOrWhiteSpace($lockedAudnCodeHome)) {
+        # The ingress guard already bound this hook to an exact AudnCode process
+        # lifetime before stdin was read. Persist that owner in the pre-arm so a
+        # concurrent newer prompt cannot erase a still-running window.
+        $previousHostLifetimes = @($previousHostLifetimes) + @([pscustomobject]@{
+            home = $lockedAudnCodeHome
+            pid = [int]$lockedIngressHostPid
+            started_unix_ms = [int64]$lockedIngressHostStartedUnixMs
+          })
+      }
+      $previousBackgroundLoss = if ($previousWasPrearmed) {
+        [bool](Get-ObjectValue $previous 'audncode_prompt_previous_background_lifecycle_unverifiable' $false)
+      } else { [bool](Get-ObjectValue $previous 'audncode_background_lifecycle_unverifiable' $false) }
+      $previousBackgroundReason = if ($previousWasPrearmed) {
+        [string](Get-ObjectValue $previous 'audncode_prompt_previous_background_lifecycle_failure_reason' '')
+      } else { [string](Get-ObjectValue $previous 'audncode_background_lifecycle_failure_reason' '') }
+      $previousCronLoss = if ($previousWasPrearmed) {
+        [bool](Get-ObjectValue $previous 'audncode_prompt_previous_cron_lifecycle_unverifiable' $false)
+      } else { [bool](Get-ObjectValue $previous 'audncode_cron_lifecycle_unverifiable' $false) }
+      $previousCronReason = if ($previousWasPrearmed) {
+        [string](Get-ObjectValue $previous 'audncode_prompt_previous_cron_lifecycle_failure_reason' '')
+      } else { [string](Get-ObjectValue $previous 'audncode_cron_lifecycle_failure_reason' '') }
+      $nextEpoch = [int64](Get-ObjectValue $previous 'epoch' 0) + 1
+      $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+      $previousRemoteState = if ($previousWasPrearmed) {
+        Get-AudnCodeRemoteClaimEnvelope `
+          -Record $previous `
+          -ClaimsProperty 'audncode_prompt_previous_remote_claims' `
+          -ValidProperty 'audncode_prompt_previous_remote_claims_valid'
+      } else {
+        Get-AudnCodeRemoteClaimEnvelope -Record $previous
+      }
+      $previousRemoteClaimsValid = [bool](Get-ObjectValue $previousRemoteState 'valid' $false)
+      $previousRemoteClaims = New-Object 'System.Collections.Generic.List[object]'
+      foreach ($remoteClaim in @((Get-ObjectValue $previousRemoteState 'claims' @()))) {
+        $previousRemoteClaims.Add($remoteClaim)
+      }
+      if ($lockedRemoteLaunchClaim) {
+        if (-not $previousRemoteClaimsValid -or $previousRemoteClaims.Count -ge $AudnCodeRemoteAgentMaxClaims) {
+          $previousRemoteClaimsValid = $false
+        } else {
+          # /ultrareview launches the CCR task before this synchronous prompt
+          # hook, while its identity sidecar is persisted fire-and-forget. The
+          # claim therefore has to be durable in this first pre-arm write; a
+          # killed hook or missing sidecar must never make the launch invisible.
+          $previousRemoteClaims.Add([pscustomobject]@{
+              claim_id = [Guid]::NewGuid().ToString('N')
+              kind = 'ultrareview-launch'
+              claimed_unix_ms = [int64]$now
+              task_id = ''
+              identity_hash = ''
+              terminal_proven = $false
+            })
+        }
+      }
+      # This is the first durable action for an AudnCode prompt. Correlation of
+      # the owning PID and its marker is deliberately later and may block. If
+      # the hook is killed in that window, the new epoch remains busy and all
+      # registries remain unverifiable, so an older Stop cannot be promoted.
+      $prearmState = [pscustomobject][ordered]@{
+          schema = 1
+          session_id = $lockedSessionId
+          epoch = $nextEpoch
+          state = 'busy'
+          prompt_id = $lockedPromptId
+          transcript_path = $lockedTranscriptPath
+          busy_unix_ms = $now
+          idle_unix_ms = 0
+          notification_type = ''
+          busy_hook_start_ticks = [int64]$lockedHookStartTicks
+          audncode_busy_event_rank = [int]$lockedEventRank
+          idle_hook_start_ticks = [int64]0
+          goal_baseline_state = 'unknown'
+          goal_baseline_marker = ''
+          goal_baseline_captured = $false
+          audncode_prompt_prearm_pending = $true
+          audncode_prompt_prearm_token = $lockedToken
+          audncode_prompt_prearm_event_rank = [int]$lockedEventRank
+          audncode_prompt_previous_host_pid = $previousHostPid
+          audncode_prompt_previous_host_started_unix_ms = $previousHostStarted
+          audncode_prompt_previous_home = $previousHome
+          audncode_prompt_previous_host_lifetimes = @($previousHostLifetimes)
+          audncode_prompt_previous_background_lifecycle_unverifiable = [bool]$previousBackgroundLoss
+          audncode_prompt_previous_background_lifecycle_failure_reason = $previousBackgroundReason
+          audncode_prompt_previous_cron_lifecycle_unverifiable = [bool]$previousCronLoss
+          audncode_prompt_previous_cron_lifecycle_failure_reason = $previousCronReason
+          audncode_prompt_previous_remote_claims_valid = [bool]$previousRemoteClaimsValid
+          audncode_prompt_previous_remote_claims = @($previousRemoteClaims.ToArray())
+          audncode_host_pid = 0
+          audncode_host_started_unix_ms = [int64]0
+          audncode_host_process_started_unix_ms = [int64]0
+          audncode_host_lifetimes = @()
+          audncode_multi_host_conflict = $true
+          audncode_superseded_host_stop_proofs = @()
+          audncode_home = $lockedAudnCodeHome
+          audncode_runtime_key = ''
+          audncode_background_registry_valid = $false
+          audncode_background_ids = @()
+          audncode_background_lifecycle_pending_tokens = @()
+          audncode_background_lifecycle_pending_token = ''
+          audncode_background_lifecycle_unverifiable = $false
+          audncode_background_lifecycle_failure_reason = ''
+          audncode_cron_runtime_key = ''
+          audncode_cron_registry_valid = $false
+          audncode_cron_lifecycle_pending_tokens = @()
+          audncode_cron_lifecycle_pending_token = ''
+          audncode_project_root = ''
+          audncode_cron_hook_generation = ''
+          audncode_cron_hook_installed_unix_ms = [int64]0
+          audncode_cron_lifecycle_unverifiable = $false
+          audncode_cron_lifecycle_failure_reason = ''
+          audncode_terminal_claims = @()
+          audncode_terminal_claims_valid = $false
+          audncode_terminal_claim_cursor = [int64]0
+          audncode_terminal_claim_at_boundary = $false
+          audncode_task_list_id = ''
+          audncode_task_list_valid = $false
+          audncode_team_name = ''
+          audncode_team_name_valid = $false
+          audncode_stop_failure_cursor_valid = [bool](Get-ObjectValue $lockedStopFailureCursor 'ok' $false)
+          audncode_stop_failure_cursor_file_existed = [bool](Get-ObjectValue $lockedStopFailureCursor 'file_existed' $false)
+          audncode_stop_failure_cursor = [int64](Get-ObjectValue $lockedStopFailureCursor 'cursor' 0)
+          audncode_stop_failure_cursor_at_boundary = [bool](Get-ObjectValue $lockedStopFailureCursor 'at_boundary' $false)
+          audncode_stop_failure_cursor_creation_ticks = [int64](Get-ObjectValue $lockedStopFailureCursor 'creation_ticks' 0)
+          audncode_stop_failure_cursor_anchor_offset = [int64](Get-ObjectValue $lockedStopFailureCursor 'anchor_offset' 0)
+          audncode_stop_failure_cursor_anchor_hash = [string](Get-ObjectValue $lockedStopFailureCursor 'anchor_hash' '')
+        }
+      $prearmWritten = $false
+      if ($null -ne $idleHostRetirementCandidate) {
+        $retirementOperation = [pscustomobject]@{
+          state = $prearmState
+          path = [string]$lockedPath
+          target = $idleHostRetirementCandidate
+          session_id = $lockedSessionId
+          current_home = $lockedAudnCodeHome
+          current_pid = [int]$lockedIngressHostPid
+          current_started_unix_ms = [int64]$lockedIngressHostStartedUnixMs
+        }
+        $retirement = Invoke-WithAudnCodeHostRetirementGate `
+          -SessionId $lockedSessionId `
+          -TranscriptPath $lockedTranscriptPath `
+          -HomePath ([string](Get-ObjectValue $idleHostRetirementCandidate 'home' '')) `
+          -HostPid ([int](Get-ObjectValue $idleHostRetirementCandidate 'pid' 0)) `
+          -HostStartedUnixMs ([int64](Get-ObjectValue $idleHostRetirementCandidate 'started_unix_ms' 0)) `
+          -Action {
+            param($lockedOperation)
+            $lockedState = Get-ObjectValue $lockedOperation 'state'
+            $lockedTarget = Get-ObjectValue $lockedOperation 'target'
+            $remaining = New-Object 'System.Collections.Generic.List[object]'
+            $removed = 0
+            foreach ($lifetime in @((Get-ObjectValue $lockedState 'audncode_prompt_previous_host_lifetimes' @()))) {
+              $isTarget = [int](Get-ObjectValue $lifetime 'pid' 0) -eq [int](Get-ObjectValue $lockedTarget 'pid' 0) -and
+                [int64](Get-ObjectValue $lifetime 'started_unix_ms' 0) -eq [int64](Get-ObjectValue $lockedTarget 'started_unix_ms' 0) -and
+                [string]::Equals(
+                  [string](Get-ObjectValue $lifetime 'home' ''),
+                  [string](Get-ObjectValue $lockedTarget 'home' ''),
+                  [StringComparison]::OrdinalIgnoreCase
+                )
+              if ($isTarget) { $removed++; continue }
+              $remaining.Add($lifetime)
+            }
+            if ($removed -ne 1) { return $false }
+            $lifetimeState = Get-AudnCodeSessionHostLifetimeState `
+              -SessionId ([string](Get-ObjectValue $lockedOperation 'session_id' '')) `
+              -Lifetimes @($remaining.ToArray()) `
+              -CurrentHome ([string](Get-ObjectValue $lockedOperation 'current_home' '')) `
+              -CurrentPid ([int](Get-ObjectValue $lockedOperation 'current_pid' 0)) `
+              -CurrentStartedUnixMs ([int64](Get-ObjectValue $lockedOperation 'current_started_unix_ms' 0)) `
+              -ResetConflict
+            if ([string](Get-ObjectValue $lifetimeState 'state' 'unknown') -ne 'clear' -or
+                [bool](Get-ObjectValue $lifetimeState 'conflict' $true)) { return $false }
+            Set-RecordValue `
+              -Record $lockedState `
+              -Name 'audncode_prompt_previous_host_lifetimes' `
+              -Value @((Get-ObjectValue $lifetimeState 'lifetimes' @()))
+            Write-JsonAtomic -Path ([string](Get-ObjectValue $lockedOperation 'path' '')) -Value $lockedState
+            return $true
+          } `
+          -Arguments @($retirementOperation)
+        $prearmWritten = [string](Get-ObjectValue $retirement 'state' 'unknown') -eq 'idle' -and
+          [bool](Get-ObjectValue $retirement 'value' $false)
+        $yieldedPreviousIdleHost = $prearmWritten
+      }
+      if (-not $prearmWritten) {
+        Write-JsonAtomic -Path $lockedPath -Value $prearmState
+      }
+      $previousHostLifetimes = @((Get-ObjectValue $prearmState 'audncode_prompt_previous_host_lifetimes' @()))
+      return [pscustomobject]@{
+        epoch = $nextEpoch
+        token = $lockedToken
+        host_lifetimes = @($previousHostLifetimes)
+      }
+    } -Arguments @($info.path, $SessionId, $PromptId, $TranscriptPath, $HookStartTicks, $AudnCodeBusyEventRank, $promptPrearmToken, $AudnCodeHomePath, $AudnCodeIngressHostPid, $AudnCodeIngressHostStartedUnixMs, $stopFailureCursor, [bool]$AudnCodeRemoteLaunchClaim)
+    if ($null -eq $prearm -or [int64](Get-ObjectValue $prearm 'epoch' 0) -le 0 -or
+        [string](Get-ObjectValue $prearm 'token' '') -ne $promptPrearmToken) {
+      return [int64]0
+    }
+    $promptPrearmEpoch = [int64]$prearm.epoch
+    $promptPrearmHostLifetimes = @((Get-ObjectValue $prearm 'host_lifetimes' @()))
+    $testPrearmDelayMs = 0
+    if ([int]::TryParse([string]$env:CODEX_NTFY_TEST_AFTER_AUDNCODE_PREARM_MS, [ref]$testPrearmDelayMs) -and
+        $testPrearmDelayMs -gt 0) {
+      $testPrearmDelayMs = [Math]::Min(15000, $testPrearmDelayMs)
+      $testPrearmMarker = [string]$env:CODEX_NTFY_TEST_AFTER_AUDNCODE_PREARM_MARKER
+      $testPrearmRelease = [string]$env:CODEX_NTFY_TEST_AFTER_AUDNCODE_PREARM_RELEASE
+      try {
+        if (-not [string]::IsNullOrWhiteSpace($testPrearmMarker)) {
+          [IO.File]::WriteAllText($testPrearmMarker, 'prearmed', [Text.Encoding]::ASCII)
+        }
+        $testPrearmDeadline = [DateTimeOffset]::UtcNow.AddMilliseconds($testPrearmDelayMs)
+        while ([DateTimeOffset]::UtcNow -lt $testPrearmDeadline -and
+            ([string]::IsNullOrWhiteSpace($testPrearmRelease) -or
+              -not (Test-Path -LiteralPath $testPrearmRelease -PathType Leaf))) {
+          Start-Sleep -Milliseconds 25
+        }
+      } catch { }
+    }
+  }
+  $audnCodeHostPid = 0
+  $audnCodeHostStartedUnixMs = [int64]0
+  $audnCodeHostProcessStartedUnixMs = [int64]0
+  $audnCodeRuntimeKey = ''
+  $audnCodeBackgroundRegistryValid = $true
+  $audnCodeBackgroundIds = @()
+  $audnCodeCronRuntimeKey = ''
+  $audnCodeCronRegistryValid = $true
+  $audnCodeProjectRoot = ''
+  $audnCodeCronHookGeneration = ''
+  $audnCodeCronHookInstalledUnixMs = [int64]0
+  $audnCodeTaskListValid = $true
+  $audnCodeTaskListSafe = ''
+  $audnCodeTeamNameValid = $true
+  $audnCodeTeamNameSafe = ''
+  $audnCodeTerminalClaimsValid = $true
+  $audnCodeTerminalClaimCursor = [int64]0
+  $audnCodeTerminalClaimAtBoundary = $true
+  $normalizedTerminalClaims = New-Object 'System.Collections.Generic.List[object]'
+  if ($HookStartTicks -gt 0) {
+    if (-not [string]::IsNullOrWhiteSpace($AudnCodeTaskListId)) {
+      if ($AudnCodeTaskListId.Length -gt 200) {
+        $audnCodeTaskListValid = $false
+      } else {
+        $audnCodeTaskListSafe = $AudnCodeTaskListId -replace '[^A-Za-z0-9_-]', '-'
+        if ([string]::IsNullOrWhiteSpace($audnCodeTaskListSafe)) { $audnCodeTaskListValid = $false }
+      }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($AudnCodeTeamName)) {
+      if ($AudnCodeTeamName.Length -gt 200) {
+        $audnCodeTeamNameValid = $false
+      } else {
+        $audnCodeTeamNameSafe = $AudnCodeTeamName -replace '[^A-Za-z0-9_-]', '-'
+        if ([string]::IsNullOrWhiteSpace($audnCodeTeamNameSafe)) { $audnCodeTeamNameValid = $false }
+      }
+    }
+    $runtimeLineage = Register-AudnCodePromptRuntimeLineage `
+      -SessionId $SessionId `
+      -TranscriptPath $TranscriptPath `
+      -HomePath $AudnCodeHomePath `
+      -ExpectedHostPid $AudnCodeIngressHostPid `
+      -ExpectedHostStartedUnixMs $AudnCodeIngressHostStartedUnixMs `
+      -TaskListId $audnCodeTaskListSafe `
+      -TaskListValid ([bool]$audnCodeTaskListValid) `
+      -TeamName $audnCodeTeamNameSafe `
+      -TeamNameValid ([bool]$audnCodeTeamNameValid)
+    $audnCodeHostPid = [int](Get-ObjectValue $runtimeLineage 'host_pid' 0)
+    $audnCodeHostStartedUnixMs = [int64](Get-ObjectValue $runtimeLineage 'host_started_unix_ms' 0)
+    $audnCodeHostProcessStartedUnixMs = [int64](Get-ObjectValue $runtimeLineage 'host_process_started_unix_ms' 0)
+    $audnCodeRuntimeKey = [string](Get-ObjectValue $runtimeLineage 'runtime_key' '')
+    $audnCodeBackgroundRegistryValid = [bool](Get-ObjectValue $runtimeLineage 'background_registry_valid' $false)
+    $audnCodeBackgroundIds = @((Get-ObjectValue $runtimeLineage 'background_ids' @()))
+    $audnCodeCronRuntimeKey = [string](Get-ObjectValue $runtimeLineage 'cron_runtime_key' '')
+    $audnCodeCronRegistryValid = [bool](Get-ObjectValue $runtimeLineage 'cron_registry_valid' $false)
+    $audnCodeProjectRoot = [string](Get-ObjectValue $runtimeLineage 'project_root' '')
+    $audnCodeCronHookGeneration = [string](Get-ObjectValue $runtimeLineage 'cron_hook_generation' '')
+    $audnCodeCronHookInstalledUnixMs = [int64](Get-ObjectValue $runtimeLineage 'cron_hook_installed_unix_ms' 0)
+    foreach ($claim in @($AudnCodeTerminalClaims)) {
+      $claimId = [string](Get-ObjectValue $claim 'id' '')
+      $claimStatus = ([string](Get-ObjectValue $claim 'status' '')).Trim().ToLowerInvariant()
+      if ($claimId.Length -gt 160 -or $claimId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$' -or
+          $claimStatus -notin @('completed', 'failed', 'killed') -or
+          @($normalizedTerminalClaims | Where-Object { [string]$_.id -eq $claimId }).Count -gt 0) {
+        $audnCodeTerminalClaimsValid = $false
+        continue
+      }
+      $normalizedTerminalClaims.Add([pscustomobject]@{ id = $claimId; status = $claimStatus })
+    }
+    if ($normalizedTerminalClaims.Count -gt 0) {
+      $claimStream = $null
+      try {
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $claimStream = [IO.File]::Open([IO.Path]::GetFullPath($TranscriptPath), [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $audnCodeTerminalClaimCursor = [int64]$claimStream.Length
+        if ($claimStream.Length -gt 0) {
+          [void]$claimStream.Seek(-1, [IO.SeekOrigin]::End)
+          $audnCodeTerminalClaimAtBoundary = $claimStream.ReadByte() -eq 10
+        }
+      } catch {
+        $audnCodeTerminalClaimsValid = $false
+      } finally {
+        if ($null -ne $claimStream) { $claimStream.Dispose() }
+      }
+    }
+  }
+  $terminalClaimEnvelope = [pscustomobject]@{ claims = @($normalizedTerminalClaims.ToArray()) }
+  $audnCodeHostLifetimeEnvelope = [pscustomobject]@{
+    lifetimes = @($promptPrearmHostLifetimes)
+  }
+  $audnCodeMultiHostConflict = $HookStartTicks -gt 0
+  # For Claude this lock is the prompt linearization point. AudnCode already
+  # linearized at the pre-arm above; this second lock may only finalize that
+  # exact token/epoch. A newer prompt therefore wins even if this older hook
+  # returns late from process/marker correlation.
   $epoch = Invoke-WithClaudeSessionLock -Info $info -Action {
-    param($lockedPath, $lockedSessionId, $lockedPromptId, $lockedTranscriptPath, $baselineMaxBytes)
+    param($lockedPath, $lockedSessionId, $lockedPromptId, $lockedTranscriptPath, $baselineMaxBytes, $lockedHookStartTicks, $lockedEventRank, $lockedHostPid, $lockedHostStartedUnixMs, $lockedHostProcessStartedUnixMs, $lockedRuntimeKey, $lockedRegistryValid, $lockedBackgroundIds, $lockedCronRuntimeKey, $lockedCronRegistryValid, $lockedProjectRoot, $lockedCronHookGeneration, $lockedCronHookInstalledUnixMs, $lockedTerminalClaimEnvelope, $lockedTerminalClaimsValid, $lockedTerminalClaimCursor, $lockedTerminalClaimAtBoundary, $lockedAudnCodeHome, $lockedTaskListId, $lockedTaskListValid, $lockedTeamName, $lockedTeamNameValid, $lockedHostLifetimeEnvelope, $lockedMultiHostConflict, $lockedPrearmEpoch, $lockedPrearmToken)
+    $previous = $null
+    try { $previous = Read-JsonFile -Path $lockedPath } catch { $previous = $null }
+    $isAudnPrearmed = [int64]$lockedPrearmEpoch -gt 0
+    if ($isAudnPrearmed -and
+        ([string](Get-ObjectValue $previous 'session_id' '') -ne $lockedSessionId -or
+          [int64](Get-ObjectValue $previous 'epoch' 0) -ne [int64]$lockedPrearmEpoch -or
+          [string](Get-ObjectValue $previous 'state' '') -ne 'busy' -or
+          [string](Get-ObjectValue $previous 'prompt_id' '') -ne $lockedPromptId -or
+          -not [string]::Equals([string](Get-ObjectValue $previous 'transcript_path' ''), $lockedTranscriptPath, [StringComparison]::OrdinalIgnoreCase) -or
+          [int64](Get-ObjectValue $previous 'busy_hook_start_ticks' 0) -ne [int64]$lockedHookStartTicks -or
+          (Get-AudnCodeBusyEventRank -Record $previous) -ne [int]$lockedEventRank -or
+          -not [bool](Get-ObjectValue $previous 'audncode_prompt_prearm_pending' $false) -or
+          [string](Get-ObjectValue $previous 'audncode_prompt_prearm_token' '') -ne $lockedPrearmToken)) {
+      return [int64]0
+    }
+    if ($isAudnPrearmed) {
+      $freshLifetimesProperty = $previous.PSObject.Properties['audncode_prompt_previous_host_lifetimes']
+      if ($null -eq $freshLifetimesProperty -or $freshLifetimesProperty.Value -isnot [array]) {
+        return [int64]0
+      }
+      # The pre-arm may have gained a superseded hook's exact host lifetime
+      # while this hook was doing discovery. Re-read and merge under the same
+      # session lock that commits the epoch; an outside-lock snapshot could
+      # otherwise erase that still-running window.
+      $freshLifetimeState = Get-AudnCodeSessionHostLifetimeState `
+        -SessionId $lockedSessionId `
+        -Lifetimes @($freshLifetimesProperty.Value) `
+        -CurrentHome $lockedAudnCodeHome `
+        -CurrentPid ([int]$lockedHostPid) `
+        -CurrentStartedUnixMs ([int64]$lockedHostStartedUnixMs) `
+        -ResetConflict
+      if ([string](Get-ObjectValue $freshLifetimeState 'state' 'unknown') -eq 'unknown') {
+        return [int64]0
+      }
+      $lockedHostLifetimeEnvelope = [pscustomobject]@{
+        lifetimes = @((Get-ObjectValue $freshLifetimeState 'lifetimes' @()))
+      }
+      $lockedMultiHostConflict = [bool](Get-ObjectValue $freshLifetimeState 'conflict' $true)
+    }
     $baseline = Get-ClaudeGoalTranscriptState -TranscriptPath $lockedTranscriptPath -MaxBytes ([int64]$baselineMaxBytes)
     $baselineCaptured = -not [string]::IsNullOrWhiteSpace($lockedTranscriptPath) -and
       (Test-Path -LiteralPath $lockedTranscriptPath -PathType Leaf) -and
       [string]$baseline.state -notin @('unknown', 'unverifiable')
-    $previous = $null
-    try { $previous = Read-JsonFile -Path $lockedPath } catch { $previous = $null }
-    $nextEpoch = [int64](Get-ObjectValue $previous 'epoch' 0) + 1
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $previousHostPid = if ($isAudnPrearmed) {
+      [int](Get-ObjectValue $previous 'audncode_prompt_previous_host_pid' 0)
+    } else { [int](Get-ObjectValue $previous 'audncode_host_pid' 0) }
+    $previousHostStarted = if ($isAudnPrearmed) {
+      [int64](Get-ObjectValue $previous 'audncode_prompt_previous_host_started_unix_ms' 0)
+    } else { [int64](Get-ObjectValue $previous 'audncode_host_started_unix_ms' 0) }
+    $previousHome = if ($isAudnPrearmed) {
+      [string](Get-ObjectValue $previous 'audncode_prompt_previous_home' '')
+    } else { [string](Get-ObjectValue $previous 'audncode_home' '') }
+    $sameAudnCodeHost = $lockedHostPid -gt 0 -and $lockedHostStartedUnixMs -gt 0 -and
+      $previousHostPid -eq [int]$lockedHostPid -and
+      $previousHostStarted -eq [int64]$lockedHostStartedUnixMs -and
+      [string]::Equals(
+        $previousHome,
+        [string]$lockedAudnCodeHome,
+        [StringComparison]::OrdinalIgnoreCase
+      )
+    $previousBackgroundLoss = if ($isAudnPrearmed) {
+      [bool](Get-ObjectValue $previous 'audncode_prompt_previous_background_lifecycle_unverifiable' $false)
+    } else { [bool](Get-ObjectValue $previous 'audncode_background_lifecycle_unverifiable' $false) }
+    $previousBackgroundReason = if ($isAudnPrearmed) {
+      [string](Get-ObjectValue $previous 'audncode_prompt_previous_background_lifecycle_failure_reason' '')
+    } else { [string](Get-ObjectValue $previous 'audncode_background_lifecycle_failure_reason' '') }
+    $previousCronLoss = if ($isAudnPrearmed) {
+      [bool](Get-ObjectValue $previous 'audncode_prompt_previous_cron_lifecycle_unverifiable' $false)
+    } else { [bool](Get-ObjectValue $previous 'audncode_cron_lifecycle_unverifiable' $false) }
+    $previousCronReason = if ($isAudnPrearmed) {
+      [string](Get-ObjectValue $previous 'audncode_prompt_previous_cron_lifecycle_failure_reason' '')
+    } else { [string](Get-ObjectValue $previous 'audncode_cron_lifecycle_failure_reason' '') }
+    $backgroundLifecycleUnverifiable = [bool]$sameAudnCodeHost -and
+      [bool]$previousBackgroundLoss
+    $backgroundLifecycleFailureReason = if ($backgroundLifecycleUnverifiable) {
+      if ([string]::IsNullOrWhiteSpace($previousBackgroundReason)) { 'audncode-background-lifecycle-unverifiable' } else { $previousBackgroundReason }
+    } else { '' }
+    $cronLifecycleUnverifiable = [bool]$sameAudnCodeHost -and
+      [bool]$previousCronLoss
+    $cronLifecycleFailureReason = if ($cronLifecycleUnverifiable) {
+      if ([string]::IsNullOrWhiteSpace($previousCronReason)) { 'audncode-cron-lifecycle-unverifiable' } else { $previousCronReason }
+    } else { '' }
+    $nextEpoch = if ($isAudnPrearmed) { [int64]$lockedPrearmEpoch } else { [int64](Get-ObjectValue $previous 'epoch' 0) + 1 }
+    $now = if ($isAudnPrearmed) {
+      [int64](Get-ObjectValue $previous 'busy_unix_ms' 0)
+    } else {
+      [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    }
+    if ($now -le 0) { return [int64]0 }
+    $terminalClaims = @((Get-ObjectValue $lockedTerminalClaimEnvelope 'claims' @()))
+    $remoteClaimState = if ($isAudnPrearmed) {
+      Get-AudnCodeRemoteClaimEnvelope `
+        -Record $previous `
+        -ClaimsProperty 'audncode_prompt_previous_remote_claims' `
+        -ValidProperty 'audncode_prompt_previous_remote_claims_valid'
+    } else {
+      Get-AudnCodeRemoteClaimEnvelope -Record $previous
+    }
     Write-JsonAtomic -Path $lockedPath -Value ([ordered]@{
         schema = 1
         session_id = $lockedSessionId
@@ -1142,12 +10346,63 @@ function Set-ClaudeSessionBusy {
         busy_unix_ms = $now
         idle_unix_ms = 0
         notification_type = ''
+        busy_hook_start_ticks = [int64]$lockedHookStartTicks
+        audncode_busy_event_rank = [int]$lockedEventRank
+        idle_hook_start_ticks = [int64]0
         goal_baseline_state = [string]$baseline.state
         goal_baseline_marker = [string]$baseline.marker
         goal_baseline_captured = [bool]$baselineCaptured
+        audncode_prompt_prearm_pending = $false
+        audncode_prompt_prearm_token = ''
+        audncode_prompt_prearm_event_rank = 0
+        audncode_host_pid = [int]$lockedHostPid
+        audncode_host_started_unix_ms = $lockedHostStartedUnixMs
+        audncode_host_process_started_unix_ms = $lockedHostProcessStartedUnixMs
+        audncode_host_lifetimes = @((Get-ObjectValue $lockedHostLifetimeEnvelope 'lifetimes' @()))
+        audncode_multi_host_conflict = [bool]$lockedMultiHostConflict
+        audncode_superseded_host_stop_proofs = @()
+        audncode_home = $lockedAudnCodeHome
+        audncode_runtime_key = $lockedRuntimeKey
+        audncode_background_registry_valid = [bool]$lockedRegistryValid -and -not [bool]$backgroundLifecycleUnverifiable
+        audncode_background_ids = @($lockedBackgroundIds)
+        audncode_background_lifecycle_pending_tokens = @()
+        audncode_background_lifecycle_pending_token = ''
+        audncode_background_lifecycle_unverifiable = [bool]$backgroundLifecycleUnverifiable
+        audncode_background_lifecycle_failure_reason = $backgroundLifecycleFailureReason
+        audncode_cron_runtime_key = $lockedCronRuntimeKey
+        audncode_cron_registry_valid = [bool]$lockedCronRegistryValid -and -not [bool]$cronLifecycleUnverifiable
+        audncode_cron_lifecycle_pending_tokens = @()
+        audncode_cron_lifecycle_pending_token = ''
+        audncode_project_root = $lockedProjectRoot
+        audncode_cron_hook_generation = $lockedCronHookGeneration
+        audncode_cron_hook_installed_unix_ms = [int64]$lockedCronHookInstalledUnixMs
+        audncode_cron_lifecycle_unverifiable = [bool]$cronLifecycleUnverifiable
+        audncode_cron_lifecycle_failure_reason = $cronLifecycleFailureReason
+        audncode_terminal_claims = $terminalClaims
+        audncode_terminal_claims_valid = [bool]$lockedTerminalClaimsValid
+        audncode_terminal_claim_cursor = [int64]$lockedTerminalClaimCursor
+        audncode_terminal_claim_at_boundary = [bool]$lockedTerminalClaimAtBoundary
+        audncode_remote_claims_valid = [bool](Get-ObjectValue $remoteClaimState 'valid' $false)
+        audncode_remote_claims = @((Get-ObjectValue $remoteClaimState 'claims' @()))
+        audncode_task_list_id = $lockedTaskListId
+        audncode_task_list_valid = [bool]$lockedTaskListValid
+        audncode_team_name = $lockedTeamName
+        audncode_team_name_valid = [bool]$lockedTeamNameValid
+        audncode_stop_failure_cursor_valid = [bool](Get-ObjectValue $previous 'audncode_stop_failure_cursor_valid' $false)
+        audncode_stop_failure_cursor_file_existed = [bool](Get-ObjectValue $previous 'audncode_stop_failure_cursor_file_existed' $false)
+        audncode_stop_failure_cursor = [int64](Get-ObjectValue $previous 'audncode_stop_failure_cursor' 0)
+        audncode_stop_failure_cursor_at_boundary = [bool](Get-ObjectValue $previous 'audncode_stop_failure_cursor_at_boundary' $false)
+        audncode_stop_failure_cursor_creation_ticks = [int64](Get-ObjectValue $previous 'audncode_stop_failure_cursor_creation_ticks' 0)
+        audncode_stop_failure_cursor_anchor_offset = [int64](Get-ObjectValue $previous 'audncode_stop_failure_cursor_anchor_offset' 0)
+        audncode_stop_failure_cursor_anchor_hash = [string](Get-ObjectValue $previous 'audncode_stop_failure_cursor_anchor_hash' '')
       })
     return $nextEpoch
-  } -Arguments @($info.path, $SessionId, $PromptId, $TranscriptPath, $ClaudePromptBaselineMaxBytes)
+  } -Arguments @($info.path, $SessionId, $PromptId, $TranscriptPath, $ClaudePromptBaselineMaxBytes, $HookStartTicks, $AudnCodeBusyEventRank, $audnCodeHostPid, $audnCodeHostStartedUnixMs, $audnCodeHostProcessStartedUnixMs, $audnCodeRuntimeKey, $audnCodeBackgroundRegistryValid, $audnCodeBackgroundIds, $audnCodeCronRuntimeKey, $audnCodeCronRegistryValid, $audnCodeProjectRoot, $audnCodeCronHookGeneration, $audnCodeCronHookInstalledUnixMs, $terminalClaimEnvelope, $audnCodeTerminalClaimsValid, $audnCodeTerminalClaimCursor, $audnCodeTerminalClaimAtBoundary, $AudnCodeHomePath, $audnCodeTaskListSafe, $audnCodeTaskListValid, $audnCodeTeamNameSafe, $audnCodeTeamNameValid, $audnCodeHostLifetimeEnvelope, $audnCodeMultiHostConflict, $promptPrearmEpoch, $promptPrearmToken)
+  if ([int64]$epoch -le 0) {
+    $hostLabel = if ($HookStartTicks -gt 0) { 'AudnCode' } else { 'Claude' }
+    Write-RuntimeLog "ignored superseded $hostLabel session-busy finalization session=$($SessionId.Substring(0, [Math]::Min(8, $SessionId.Length)))"
+    return [int64]0
+  }
 
   # A follow-up prompt means the session is no longer idle. Remove every older
   # unconfirmed Claude candidate for this session; no terminal receipt is left,
@@ -1156,22 +10411,138 @@ function Set-ClaudeSessionBusy {
   foreach ($file in $files) {
     $candidate = $null
     try { $candidate = Read-JsonFile -Path $file.FullName } catch { continue }
-    if ([string](Get-ObjectValue $candidate 'provider' '') -ne 'claude' -or
-        [string](Get-ObjectValue $candidate 'thread_id' '') -ne $SessionId) { continue }
+    if ([string](Get-ObjectValue $candidate 'provider' '') -ne 'claude') { continue }
+    $candidateSessionId = [string](Get-ObjectValue $candidate 'thread_id' '')
+    $sameSession = $candidateSessionId -eq $SessionId
+    $sameRuntime = $false
+    if (-not [string]::IsNullOrWhiteSpace($audnCodeRuntimeKey) -and
+        [string](Get-ObjectValue $candidate 'candidate_kind' '') -like 'audncode_*') {
+      $candidateSessionState = Read-ClaudeSessionState -SessionId $candidateSessionId
+      $sameRuntime = [string](Get-ObjectValue $candidateSessionState 'audncode_runtime_key' '') -eq $audnCodeRuntimeKey
+    }
+    if (-not $sameSession -and -not $sameRuntime) { continue }
     [void](Invoke-WithRecordMutationLock -Key ([string]$candidate.key) -Action {
-        param($lockedPath, $lockedSessionId)
+        param($lockedPath, $lockedSessionId, $lockedRuntimeKey)
         if (-not (Test-Path -LiteralPath $lockedPath)) { return }
         try {
           $current = Read-JsonFile -Path $lockedPath
-          if ([string](Get-ObjectValue $current 'provider' '') -eq 'claude' -and
-              [string](Get-ObjectValue $current 'thread_id' '') -eq $lockedSessionId) {
+          $currentSessionId = [string](Get-ObjectValue $current 'thread_id' '')
+          $removeForSession = $currentSessionId -eq $lockedSessionId
+          $removeForRuntime = $false
+          if (-not [string]::IsNullOrWhiteSpace($lockedRuntimeKey) -and
+              [string](Get-ObjectValue $current 'candidate_kind' '') -like 'audncode_*') {
+            $currentSessionState = Read-ClaudeSessionState -SessionId $currentSessionId
+            $removeForRuntime = [string](Get-ObjectValue $currentSessionState 'audncode_runtime_key' '') -eq $lockedRuntimeKey
+          }
+          if ([string](Get-ObjectValue $current 'provider' '') -eq 'claude' -and ($removeForSession -or $removeForRuntime)) {
             Remove-Item -LiteralPath $lockedPath -Force -ErrorAction SilentlyContinue
           }
         } catch { }
-      } -Arguments @($file.FullName, $SessionId))
+      } -Arguments @($file.FullName, $SessionId, $audnCodeRuntimeKey))
   }
   Write-RuntimeLog "Claude session marked busy; cancelled stale candidates session=$($SessionId.Substring(0, [Math]::Min(8, $SessionId.Length)))"
   return [int64]$epoch
+}
+
+function Complete-AudnCodeBusyIngressHandoff {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [int64]$BusyEpoch,
+    [object]$IngressArm,
+    [string]$HomePath,
+    [int64]$HookStartTicks,
+    [int]$BusyEventRank,
+    [string]$TaskListId = '',
+    [string]$TeamName = '',
+    [bool]$RemoteLaunchClaim = $false
+  )
+
+  if ($null -eq $IngressArm) { return $false }
+  $sessionHandoff = $false
+  $currentSessionState = Read-ClaudeSessionState -SessionId $SessionId
+  if ($BusyEpoch -gt 0) {
+    $sessionHandoff = $null -ne $currentSessionState -and
+      [int](Get-ObjectValue $currentSessionState 'audncode_host_pid' 0) -eq
+        [int](Get-ObjectValue $IngressArm 'host_pid' 0) -and
+      [int64](Get-ObjectValue $currentSessionState 'audncode_host_started_unix_ms' 0) -eq
+        [int64](Get-ObjectValue $IngressArm 'host_started_unix_ms' 0) -and
+      -not [bool](Get-ObjectValue $currentSessionState 'audncode_prompt_prearm_pending' $true)
+  } elseif ($null -ne $currentSessionState) {
+    # A newer synchronous ingress may have reached the session linearization
+    # point while this hook was discovering its host. Its query still starts
+    # after this hook returns, so preserve the exact losing process lifetime in
+    # the winner's bounded host envelope before clearing ingress.
+    $currentStateName = [string](Get-ObjectValue $currentSessionState 'state' '')
+    $winnerOwnsSession = $currentStateName -in @('busy', 'idle') -and
+      (Compare-AudnCodeBusyEventOrder `
+          -LeftHookStartTicks ([int64](Get-ObjectValue $currentSessionState 'busy_hook_start_ticks' 0)) `
+          -LeftEventRank (Get-AudnCodeBusyEventRank -Record $currentSessionState) `
+          -RightHookStartTicks $HookStartTicks `
+          -RightEventRank $BusyEventRank) -ge 0
+    if ($winnerOwnsSession) {
+      $taskListValid = $true
+      $taskListSafe = ''
+      if (-not [string]::IsNullOrWhiteSpace($TaskListId)) {
+        if ($TaskListId.Length -gt 200) {
+          $taskListValid = $false
+        } else {
+          $taskListSafe = $TaskListId -replace '[^A-Za-z0-9_-]', '-'
+          if ([string]::IsNullOrWhiteSpace($taskListSafe)) { $taskListValid = $false }
+        }
+      }
+      $teamNameValid = $true
+      $teamNameSafe = ''
+      if (-not [string]::IsNullOrWhiteSpace($TeamName)) {
+        if ($TeamName.Length -gt 200) {
+          $teamNameValid = $false
+        } else {
+          $teamNameSafe = $TeamName -replace '[^A-Za-z0-9_-]', '-'
+          if ([string]::IsNullOrWhiteSpace($teamNameSafe)) { $teamNameValid = $false }
+        }
+      }
+      $runtimeHandoffOk = $false
+      if (-not $RemoteLaunchClaim) {
+        # The synchronous prompt cannot start until this hook returns. Establish
+        # its exact host-bound runtime lineage while ingress is still pending, so
+        # later Stop + idle may retire it only after every registry remains clear.
+        $runtimeHandoff = Register-AudnCodePromptRuntimeLineage `
+          -SessionId $SessionId `
+          -TranscriptPath $TranscriptPath `
+          -HomePath $HomePath `
+          -ExpectedHostPid ([int](Get-ObjectValue $IngressArm 'host_pid' 0)) `
+          -ExpectedHostStartedUnixMs ([int64](Get-ObjectValue $IngressArm 'host_started_unix_ms' 0)) `
+          -TaskListId $taskListSafe `
+          -TaskListValid ([bool]$taskListValid) `
+          -TeamName $teamNameSafe `
+          -TeamNameValid ([bool]$teamNameValid)
+        $runtimeHandoffOk = [bool](Get-ObjectValue $runtimeHandoff 'ok' $false)
+      }
+      # Even an unverifiable runtime or a cross-attribution-prone remote launch
+      # must remain represented in the winner's envelope. Only a fully observed
+      # local lineage is allowed to clear ingress successfully.
+      $lifetimeRegistered = Register-AudnCodeSupersededPromptHostLifetime `
+        -SessionId $SessionId `
+        -TranscriptPath $TranscriptPath `
+        -HomePath $HomePath `
+        -HostPid ([int](Get-ObjectValue $IngressArm 'host_pid' 0)) `
+        -HostStartedUnixMs ([int64](Get-ObjectValue $IngressArm 'host_started_unix_ms' 0)) `
+        -HookStartTicks $HookStartTicks `
+        -BusyEventRank $BusyEventRank
+      $sessionHandoff = [bool]$lifetimeRegistered -and [bool]$runtimeHandoffOk
+      if (-not $lifetimeRegistered) {
+        [void](Set-AudnCodeIngressFallbackLost `
+            -HomePath $HomePath `
+            -HookStartTicks $HookStartTicks `
+            -Reason 'audncode-superseded-host-lifetime-registration-failed')
+      }
+    }
+  }
+  if ($sessionHandoff) {
+    return [bool](Complete-AudnCodeIngressMutation -IngressArm $IngressArm)
+  }
+  [void](Complete-AudnCodeIngressMutation -IngressArm $IngressArm -Fail)
+  return $false
 }
 
 function Set-ClaudeSessionIdle {
@@ -1179,19 +10550,27 @@ function Set-ClaudeSessionIdle {
     [string]$SessionId,
     [string]$PromptId,
     [string]$TranscriptPath,
-    [string]$NotificationType
+    [string]$NotificationType,
+    [int64]$HookStartTicks = 0
   )
 
   $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
   if ($null -eq $info) { return $false }
   $updated = Invoke-WithClaudeSessionLock -Info $info -Action {
-      param($lockedPath, $lockedSessionId, $lockedPromptId, $lockedTranscriptPath, $lockedNotificationType)
+      param($lockedPath, $lockedSessionId, $lockedPromptId, $lockedTranscriptPath, $lockedNotificationType, $lockedHookStartTicks)
       $previous = $null
       try { $previous = Read-JsonFile -Path $lockedPath } catch { $previous = $null }
+      if ([bool](Get-ObjectValue $previous 'audncode_prompt_prearm_pending' $false)) { return $false }
       $previousPrompt = [string](Get-ObjectValue $previous 'prompt_id' '')
       if (-not [string]::IsNullOrWhiteSpace($previousPrompt) -and
           -not [string]::IsNullOrWhiteSpace($lockedPromptId) -and
           $previousPrompt -ne $lockedPromptId) {
+        return $false
+      }
+      $previousBusyHookStartTicks = [int64](Get-ObjectValue $previous 'busy_hook_start_ticks' 0)
+      $audnCodeBusyEventRank = Get-AudnCodeBusyEventRank -Record $previous
+      if ($lockedHookStartTicks -gt 0 -and
+          ($previousBusyHookStartTicks -le 0 -or $lockedHookStartTicks -le $previousBusyHookStartTicks)) {
         return $false
       }
       $epoch = [int64](Get-ObjectValue $previous 'epoch' 0)
@@ -1200,6 +10579,60 @@ function Set-ClaudeSessionIdle {
       $baselineState = [string](Get-ObjectValue $previous 'goal_baseline_state' 'none')
       $baselineMarker = [string](Get-ObjectValue $previous 'goal_baseline_marker' '')
       $baselineCaptured = [bool](Get-ObjectValue $previous 'goal_baseline_captured' $false)
+      $audnCodeHostPid = [int](Get-ObjectValue $previous 'audncode_host_pid' 0)
+      $audnCodeHostStartedUnixMs = [int64](Get-ObjectValue $previous 'audncode_host_started_unix_ms' 0)
+      $audnCodeHostProcessStartedUnixMs = [int64](Get-ObjectValue $previous 'audncode_host_process_started_unix_ms' 0)
+      $audnCodeHostLifetimes = @((Get-ObjectValue $previous 'audncode_host_lifetimes' @()))
+      $audnCodeMultiHostConflict = [bool](Get-ObjectValue $previous 'audncode_multi_host_conflict' $true)
+      $audnCodeSupersededStopProofState = Get-AudnCodeSupersededHostStopProofState -Record $previous
+      [object[]]$audnCodeSupersededHostStopProofs = @(if ([bool](Get-ObjectValue $audnCodeSupersededStopProofState 'valid' $false)) {
+          @((Get-ObjectValue $audnCodeSupersededStopProofState 'proofs' @()))
+        })
+      $audnCodeHomePath = [string](Get-ObjectValue $previous 'audncode_home' '')
+      $audnCodeRuntimeKey = [string](Get-ObjectValue $previous 'audncode_runtime_key' '')
+      $audnCodeBackgroundRegistryValid = [bool](Get-ObjectValue $previous 'audncode_background_registry_valid' $true)
+      $audnCodeBackgroundIds = @((Get-ObjectValue $previous 'audncode_background_ids' @()))
+      $audnCodeBackgroundPendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $previous -RegistryKind 'background'
+      $audnCodeBackgroundLifecyclePendingTokens = @((Get-ObjectValue $audnCodeBackgroundPendingState 'tokens' @()))
+      $audnCodeBackgroundLifecyclePendingToken = if ($audnCodeBackgroundLifecyclePendingTokens.Count -eq 1) {
+        [string]$audnCodeBackgroundLifecyclePendingTokens[0]
+      } else { '' }
+      $audnCodeBackgroundLifecycleUnverifiable =
+        -not [bool](Get-ObjectValue $audnCodeBackgroundPendingState 'valid' $false) -or
+        [bool](Get-ObjectValue $previous 'audncode_background_lifecycle_unverifiable' $false)
+      $audnCodeBackgroundLifecycleFailureReason = [string](Get-ObjectValue $previous 'audncode_background_lifecycle_failure_reason' '')
+      $audnCodeCronRuntimeKey = [string](Get-ObjectValue $previous 'audncode_cron_runtime_key' '')
+      $audnCodeCronRegistryValid = [bool](Get-ObjectValue $previous 'audncode_cron_registry_valid' $false)
+      $audnCodeProjectRoot = [string](Get-ObjectValue $previous 'audncode_project_root' '')
+      $audnCodeCronHookGeneration = [string](Get-ObjectValue $previous 'audncode_cron_hook_generation' '')
+      $audnCodeCronHookInstalledUnixMs = [int64](Get-ObjectValue $previous 'audncode_cron_hook_installed_unix_ms' 0)
+      $audnCodeCronPendingState = Get-AudnCodeSessionLifecyclePendingTokenState -Record $previous -RegistryKind 'cron'
+      $audnCodeCronLifecyclePendingTokens = @((Get-ObjectValue $audnCodeCronPendingState 'tokens' @()))
+      $audnCodeCronLifecyclePendingToken = if ($audnCodeCronLifecyclePendingTokens.Count -eq 1) {
+        [string]$audnCodeCronLifecyclePendingTokens[0]
+      } else { '' }
+      $audnCodeCronLifecycleUnverifiable =
+        -not [bool](Get-ObjectValue $audnCodeCronPendingState 'valid' $false) -or
+        [bool](Get-ObjectValue $previous 'audncode_cron_lifecycle_unverifiable' $false)
+      $audnCodeCronLifecycleFailureReason = [string](Get-ObjectValue $previous 'audncode_cron_lifecycle_failure_reason' '')
+      $audnCodeTerminalClaims = @((Get-ObjectValue $previous 'audncode_terminal_claims' @()))
+      $audnCodeTerminalClaimsValid = [bool](Get-ObjectValue $previous 'audncode_terminal_claims_valid' $true)
+      $audnCodeTerminalClaimCursor = [int64](Get-ObjectValue $previous 'audncode_terminal_claim_cursor' 0)
+      $audnCodeTerminalClaimAtBoundary = [bool](Get-ObjectValue $previous 'audncode_terminal_claim_at_boundary' $true)
+      $audnCodeRemoteClaimState = Get-AudnCodeRemoteClaimEnvelope -Record $previous
+      $audnCodeTaskListId = [string](Get-ObjectValue $previous 'audncode_task_list_id' '')
+      $audnCodeTaskListValid = [bool](Get-ObjectValue $previous 'audncode_task_list_valid' $true)
+      $audnCodeTeamName = [string](Get-ObjectValue $previous 'audncode_team_name' '')
+      $audnCodeTeamNameValid = [bool](Get-ObjectValue $previous 'audncode_team_name_valid' $true)
+      $audnCodeStopFailureCursorValid = [bool](Get-ObjectValue $previous 'audncode_stop_failure_cursor_valid' $false)
+      $audnCodeStopFailureCursorFileExisted = [bool](Get-ObjectValue $previous 'audncode_stop_failure_cursor_file_existed' $false)
+      $audnCodeStopFailureCursor = [int64](Get-ObjectValue $previous 'audncode_stop_failure_cursor' 0)
+      $audnCodeStopFailureCursorAtBoundary = [bool](Get-ObjectValue $previous 'audncode_stop_failure_cursor_at_boundary' $false)
+      $audnCodeStopFailureCursorCreationTicks = [int64](Get-ObjectValue $previous 'audncode_stop_failure_cursor_creation_ticks' 0)
+      $audnCodeStopFailureCursorAnchorOffset = [int64](Get-ObjectValue $previous 'audncode_stop_failure_cursor_anchor_offset' 0)
+      $audnCodeStopFailureCursorAnchorHash = [string](Get-ObjectValue $previous 'audncode_stop_failure_cursor_anchor_hash' '')
+      $audnCodeStopFailureIdentity = [string](Get-ObjectValue $previous 'audncode_stop_failure_identity' '')
+      $audnCodeStopFailureAmbiguous = [bool](Get-ObjectValue $previous 'audncode_stop_failure_ambiguous' $false)
       Write-JsonAtomic -Path $lockedPath -Value ([ordered]@{
           schema = 1
           session_id = $lockedSessionId
@@ -1210,12 +10643,60 @@ function Set-ClaudeSessionIdle {
           busy_unix_ms = $busyAt
           idle_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
           notification_type = $lockedNotificationType
+          busy_hook_start_ticks = $previousBusyHookStartTicks
+          audncode_busy_event_rank = [int]$audnCodeBusyEventRank
+          idle_hook_start_ticks = [int64]$lockedHookStartTicks
           goal_baseline_state = $baselineState
           goal_baseline_marker = $baselineMarker
           goal_baseline_captured = $baselineCaptured
+          audncode_prompt_prearm_pending = $false
+          audncode_prompt_prearm_token = ''
+          audncode_prompt_prearm_event_rank = 0
+          audncode_host_pid = $audnCodeHostPid
+          audncode_host_started_unix_ms = $audnCodeHostStartedUnixMs
+          audncode_host_process_started_unix_ms = $audnCodeHostProcessStartedUnixMs
+          audncode_host_lifetimes = $audnCodeHostLifetimes
+          audncode_multi_host_conflict = $audnCodeMultiHostConflict
+          audncode_superseded_host_stop_proofs = @($audnCodeSupersededHostStopProofs)
+          audncode_home = $audnCodeHomePath
+          audncode_runtime_key = $audnCodeRuntimeKey
+          audncode_background_registry_valid = $audnCodeBackgroundRegistryValid
+          audncode_background_ids = $audnCodeBackgroundIds
+          audncode_background_lifecycle_pending_tokens = $audnCodeBackgroundLifecyclePendingTokens
+          audncode_background_lifecycle_pending_token = $audnCodeBackgroundLifecyclePendingToken
+          audncode_background_lifecycle_unverifiable = $audnCodeBackgroundLifecycleUnverifiable
+          audncode_background_lifecycle_failure_reason = $audnCodeBackgroundLifecycleFailureReason
+          audncode_cron_runtime_key = $audnCodeCronRuntimeKey
+          audncode_cron_registry_valid = $audnCodeCronRegistryValid
+          audncode_project_root = $audnCodeProjectRoot
+          audncode_cron_hook_generation = $audnCodeCronHookGeneration
+          audncode_cron_hook_installed_unix_ms = $audnCodeCronHookInstalledUnixMs
+          audncode_cron_lifecycle_pending_tokens = $audnCodeCronLifecyclePendingTokens
+          audncode_cron_lifecycle_pending_token = $audnCodeCronLifecyclePendingToken
+          audncode_cron_lifecycle_unverifiable = $audnCodeCronLifecycleUnverifiable
+          audncode_cron_lifecycle_failure_reason = $audnCodeCronLifecycleFailureReason
+          audncode_terminal_claims = $audnCodeTerminalClaims
+          audncode_terminal_claims_valid = $audnCodeTerminalClaimsValid
+          audncode_terminal_claim_cursor = $audnCodeTerminalClaimCursor
+          audncode_terminal_claim_at_boundary = $audnCodeTerminalClaimAtBoundary
+          audncode_remote_claims_valid = [bool](Get-ObjectValue $audnCodeRemoteClaimState 'valid' $false)
+          audncode_remote_claims = @((Get-ObjectValue $audnCodeRemoteClaimState 'claims' @()))
+          audncode_task_list_id = $audnCodeTaskListId
+          audncode_task_list_valid = $audnCodeTaskListValid
+          audncode_team_name = $audnCodeTeamName
+          audncode_team_name_valid = $audnCodeTeamNameValid
+          audncode_stop_failure_cursor_valid = $audnCodeStopFailureCursorValid
+          audncode_stop_failure_cursor_file_existed = $audnCodeStopFailureCursorFileExisted
+          audncode_stop_failure_cursor = $audnCodeStopFailureCursor
+          audncode_stop_failure_cursor_at_boundary = $audnCodeStopFailureCursorAtBoundary
+          audncode_stop_failure_cursor_creation_ticks = $audnCodeStopFailureCursorCreationTicks
+          audncode_stop_failure_cursor_anchor_offset = $audnCodeStopFailureCursorAnchorOffset
+          audncode_stop_failure_cursor_anchor_hash = $audnCodeStopFailureCursorAnchorHash
+          audncode_stop_failure_identity = $audnCodeStopFailureIdentity
+          audncode_stop_failure_ambiguous = $audnCodeStopFailureAmbiguous
         })
       return $true
-    } -Arguments @($info.path, $SessionId, $PromptId, $TranscriptPath, $NotificationType)
+    } -Arguments @($info.path, $SessionId, $PromptId, $TranscriptPath, $NotificationType, $HookStartTicks)
   if ([bool]$updated) {
     Write-RuntimeLog "Claude session confirmed idle type=$(Sanitize-NotificationText -Text $NotificationType -MaxLength 40) session=$($SessionId.Substring(0, [Math]::Min(8, $SessionId.Length)))"
   } else {
@@ -1240,23 +10721,63 @@ function Get-DefaultOrigin {
 function Get-Utf8HeadLinesFast {
   param(
     [string]$Path,
-    [int]$MaxLines
+    [int]$MaxLines,
+    [int64]$MaxBytes = $ClaudeTitleHeadMaxBytes,
+    [int64]$MaxLineBytes = $NotificationTitleMaxLineBytes
   )
 
-  if ($MaxLines -le 0) { return @() }
+  if ($MaxLines -le 0 -or $MaxBytes -le 0) { return @() }
   $stream = $null
-  $reader = $null
   try {
     $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
-    $reader = New-Object System.IO.StreamReader($stream, $Utf8NoBom, $true, 65536, $false)
+    $count = [int][Math]::Min([int64][int]::MaxValue, [Math]::Min($stream.Length, $MaxBytes))
+    $bytes = New-Object byte[] $count
+    $read = 0
+    while ($read -lt $count) {
+      $n = $stream.Read($bytes, $read, $count - $read)
+      if ($n -le 0) { break }
+      $read += $n
+    }
     $lines = New-Object 'System.Collections.Generic.List[string]'
-    while ($lines.Count -lt $MaxLines -and -not $reader.EndOfStream) {
-      $lines.Add([string]$reader.ReadLine())
+    $position = 0
+    $physical = 0
+    while ($position -lt $read -and $physical -lt $MaxLines) {
+      $newline = [Array]::IndexOf($bytes, [byte]10, $position, $read - $position)
+      if ($newline -lt 0) { break }
+      $length = $newline - $position
+      if ($length -gt 0 -and $bytes[$newline - 1] -eq 13) { $length-- }
+      $offset = $position
+      if ($position -eq 0 -and $length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $offset += 3; $length -= 3
+      }
+      if ($length -le $MaxLineBytes) {
+        try {
+          $line = $Utf8StrictNoBom.GetString($bytes, $offset, $length)
+          Assert-SafeUnicodeScalarText -Value $line -Context 'JSONL line'
+          $lines.Add($line)
+        } catch { }
+      }
+      $physical++
+      $position = $newline + 1
+    }
+    if ($position -lt $read -and $physical -lt $MaxLines) {
+      $length = $read - $position
+      $offset = $position
+      if ($position -eq 0 -and $length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $offset += 3; $length -= 3
+      }
+      if ($length -le $MaxLineBytes) {
+        try {
+          $line = $Utf8StrictNoBom.GetString($bytes, $offset, $length)
+          Assert-SafeUnicodeScalarText -Value $line -Context 'JSONL line'
+          $lines.Add($line)
+        } catch { }
+      }
     }
     return @($lines.ToArray())
   } finally {
-    if ($null -ne $reader) { $reader.Dispose() } elseif ($null -ne $stream) { $stream.Dispose() }
+    if ($null -ne $stream) { $stream.Dispose() }
   }
 }
 
@@ -1306,43 +10827,68 @@ function ConvertFrom-ReverseUtf8Chunk {
 function Get-Utf8TailLinesFast {
   param(
     [string]$Path,
-    [int]$MaxLines
+    [int]$MaxLines,
+    [int64]$MaxBytes = $ClaudeTitleTailMaxBytes,
+    [int64]$MaxLineBytes = $NotificationTitleMaxLineBytes
   )
 
-  if ($MaxLines -le 0) { return @() }
+  if ($MaxLines -le 0 -or $MaxBytes -le 0) { return @() }
   $stream = $null
   try {
     $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
-    $reversed = New-Object 'System.Collections.Generic.List[string]'
-    $buffer = New-Object byte[] 65536
-    $position = [int64]$stream.Length
-    $carry = ''
-    $rightPrefix = [byte[]]@()
-    while ($position -gt 0 -and $reversed.Count -lt $MaxLines) {
-      $count = [int][Math]::Min($buffer.Length, $position)
-      $position -= $count
-      [void]$stream.Seek($position, [IO.SeekOrigin]::Begin)
-      $read = $stream.Read($buffer, 0, $count)
-      if ($read -le 0) { break }
-      $decoded = ConvertFrom-ReverseUtf8Chunk -Buffer $buffer -Count $read -RightPrefix $rightPrefix
-      $rightPrefix = [byte[]]$decoded.prefix
-      $combined = [string]$decoded.text + $carry
-      $parts = $combined.Split([char]10)
-      $carry = [string]$parts[0]
-      for ($index = $parts.Length - 1; $index -ge 1 -and $reversed.Count -lt $MaxLines; $index--) {
-        $reversed.Add(([string]$parts[$index]).TrimEnd([char]13))
+    $start = [int64][Math]::Max(0, $stream.Length - $MaxBytes)
+    $count = [int][Math]::Min([int64][int]::MaxValue, $stream.Length - $start)
+    $stream.Position = $start
+    $bytes = New-Object byte[] $count
+    $read = 0
+    while ($read -lt $count) {
+      $n = $stream.Read($bytes, $read, $count - $read)
+      if ($n -le 0) { break }
+      $read += $n
+    }
+    $position = 0
+    if ($start -gt 0) {
+      $firstNewline = [Array]::IndexOf($bytes, [byte]10, 0, $read)
+      if ($firstNewline -lt 0) { return @() }
+      $position = $firstNewline + 1
+    }
+    $queue = New-Object 'System.Collections.Generic.Queue[string]'
+    while ($position -lt $read) {
+      $newline = [Array]::IndexOf($bytes, [byte]10, $position, $read - $position)
+      if ($newline -lt 0) { break }
+      $length = $newline - $position
+      if ($length -gt 0 -and $bytes[$newline - 1] -eq 13) { $length-- }
+      $offset = $position
+      if ($start -eq 0 -and $position -eq 0 -and $length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $offset += 3; $length -= 3
+      }
+      if ($length -le $MaxLineBytes) {
+        try {
+          $line = $Utf8StrictNoBom.GetString($bytes, $offset, $length)
+          Assert-SafeUnicodeScalarText -Value $line -Context 'JSONL line'
+          $queue.Enqueue($line)
+          while ($queue.Count -gt $MaxLines) { [void]$queue.Dequeue() }
+        } catch { }
+      }
+      $position = $newline + 1
+    }
+    if ($position -lt $read) {
+      $length = $read - $position
+      $offset = $position
+      if ($start -eq 0 -and $position -eq 0 -and $length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $offset += 3; $length -= 3
+      }
+      if ($length -le $MaxLineBytes) {
+        try {
+          $line = $Utf8StrictNoBom.GetString($bytes, $offset, $length)
+          Assert-SafeUnicodeScalarText -Value $line -Context 'JSONL line'
+          $queue.Enqueue($line)
+          while ($queue.Count -gt $MaxLines) { [void]$queue.Dequeue() }
+        } catch { }
       }
     }
-    if ($position -eq 0 -and $rightPrefix.Length -gt 0) {
-      throw 'transcript begins with invalid UTF-8 continuation bytes'
-    }
-    if ($position -eq 0 -and $reversed.Count -lt $MaxLines -and -not [string]::IsNullOrEmpty($carry)) {
-      $reversed.Add($carry.TrimEnd([char]13))
-    }
-    $result = $reversed.ToArray()
-    [Array]::Reverse($result)
-    return @($result)
+    return @($queue.ToArray())
   } finally {
     if ($null -ne $stream) { $stream.Dispose() }
   }
@@ -1372,7 +10918,7 @@ function Get-ClaudeThreadTitle {
     foreach ($line in $lines) {
       if ($line -notmatch '"type"\s*:\s*"(?:ai-title|custom-title)"') { continue }
       try {
-        $metadata = $line | ConvertFrom-Json -ErrorAction Stop
+        $metadata = ConvertFrom-StrictJsonText -Text $line
         $metadataSession = [string](Get-FirstObjectValue $metadata @('sessionId', 'session_id'))
         if (-not [string]::IsNullOrWhiteSpace($metadataSession) -and
             -not [string]::Equals($metadataSession, $SessionId, [StringComparison]::OrdinalIgnoreCase)) {
@@ -1400,7 +10946,7 @@ function ConvertFrom-ClaudeGoalStatusLine {
   if ([string]::IsNullOrWhiteSpace($Line) -or $Line -notmatch '"goal_status"') { return $null }
   $marker = Get-Sha256Hex $Line
   try {
-    $entry = $Line | ConvertFrom-Json -ErrorAction Stop
+    $entry = ConvertFrom-StrictJsonText -Text $Line
   } catch {
     return [pscustomobject]@{ state = 'unknown'; marker = $marker; marker_unix_ms = [int64]0 }
   }
@@ -1657,6 +11203,38 @@ function Get-CodexTaskUrl {
   return $ChatGptTaskUrlPrefix + $parsed.ToString('D')
 }
 
+function Get-NotificationTitle {
+  param(
+    [AllowEmptyString()][string]$Value,
+    [AllowEmptyString()][string]$Fallback = 'workspace'
+  )
+
+  $candidate = Sanitize-NotificationText -Text $Value -MaxLength 60
+  if ([string]::IsNullOrWhiteSpace($candidate)) {
+    $candidate = Sanitize-NotificationText -Text $Fallback -MaxLength 60
+  }
+  if ([string]::IsNullOrWhiteSpace($candidate)) { $candidate = 'workspace' }
+  $bounded = Limit-Utf8Text -Value $candidate -MaxBytes $MaxNtfyTitleBytes
+  if ($bounded -eq [string]$Ellipsis) {
+    $fallbackBounded = Limit-Utf8Text -Value (Sanitize-NotificationText -Text $Fallback -MaxLength 60) -MaxBytes $MaxNtfyTitleBytes
+    if (-not [string]::IsNullOrWhiteSpace($fallbackBounded) -and $fallbackBounded -ne [string]$Ellipsis) {
+      return $fallbackBounded
+    }
+  }
+  if ([string]::IsNullOrWhiteSpace($bounded)) { return 'workspace' }
+  return $bounded
+}
+
+function Test-TerminalFailure {
+  param([object]$Record)
+
+  if (([string](Get-ObjectValue $Record 'completion_event_type' '')).Trim().ToLowerInvariant() -eq 'turn_aborted') {
+    return $true
+  }
+  $goal = ([string](Get-ObjectValue $Record 'goal_status' '')).Trim().ToLowerInvariant()
+  return -not [string]::IsNullOrWhiteSpace($goal) -and $goal -notin @('complete', 'achieved')
+}
+
 function New-NtfyPayload {
   param(
     [object]$Record,
@@ -1665,7 +11243,7 @@ function New-NtfyPayload {
 
   $event = $Record.event
   $cwd = [string](Get-FirstObjectValue $event @('cwd', 'working-directory', 'working_directory'))
-  $project = Sanitize-NotificationText -Text (Get-ProjectName $cwd) -MaxLength 60
+  $project = Get-NotificationTitle -Value (Get-ProjectName $cwd) -Fallback 'workspace'
   $sessionHome = [string](Get-ObjectValue $Record 'session_codex_home' $CodexHome)
   if ([string]::IsNullOrWhiteSpace($sessionHome)) {
     $sessionHome = $CodexHome
@@ -1673,15 +11251,16 @@ function New-NtfyPayload {
   $sessionSqliteHome = [string](Get-ObjectValue $Record 'session_sqlite_home' $sessionHome)
   if ([string]::IsNullOrWhiteSpace($sessionSqliteHome)) { $sessionSqliteHome = $sessionHome }
   $displayName = $project
+  $providerProperty = $Record.PSObject.Properties['provider']
+  $provider = if ($null -eq $providerProperty) { 'codex' } else { ([string]$providerProperty.Value).Trim().ToLowerInvariant() }
   $hasDistinctThreadTitle = $false
   if ($Config.includeThreadTitle) {
-    $provider = [string](Get-ObjectValue $Record 'provider' 'codex')
     $threadTitleValue = if ($provider -eq 'claude') {
       Get-ClaudeThreadTitle -TranscriptPath ([string](Get-ObjectValue $Record 'candidate_rollout_path' '')) -SessionId ([string]$Record.thread_id)
-    } else {
+    } elseif ($provider -eq 'codex') {
       Get-ThreadTitle -ThreadId $Record.thread_id -SessionHome $sessionHome -SqliteHome $sessionSqliteHome
-    }
-    $threadTitle = Sanitize-NotificationText -Text $threadTitleValue -MaxLength 60
+    } else { '' }
+    $threadTitle = Get-NotificationTitle -Value $threadTitleValue -Fallback $project
     if (-not [string]::IsNullOrWhiteSpace($threadTitle)) {
       $displayName = $threadTitle
       $hasDistinctThreadTitle = -not [string]::Equals($threadTitle, $project, [StringComparison]::OrdinalIgnoreCase)
@@ -1739,11 +11318,11 @@ function New-NtfyPayload {
 
   $payload = [ordered]@{
     topic = $Config.topic
-    title = $displayName
+    title = Get-NotificationTitle -Value $displayName -Fallback $project
     message = $body
     sequence_id = $Record.sequence_id
   }
-  if ($Config.includeTaskLink -and [string](Get-ObjectValue $Record 'provider' 'codex') -eq 'codex') {
+  if ($Config.includeTaskLink -and $provider -eq 'codex') {
     $taskUrl = Get-CodexTaskUrl -ThreadId $Record.thread_id
     if (-not [string]::IsNullOrWhiteSpace($taskUrl)) {
       $payload['click'] = $taskUrl
@@ -1757,13 +11336,14 @@ function New-NtfyPayload {
       }
     }
   }
-  if ([string](Get-ObjectValue $Record 'completion_event_type' '') -eq 'turn_aborted' -or
-      [string](Get-ObjectValue $Record 'goal_status' '') -eq 'blocked') {
+  if (Test-TerminalFailure -Record $Record) {
     # One compact error glyph keeps failed turns distinguishable even when the
     # user has disabled assistant-message previews for privacy.
     $payload['tags'] = @('warning')
-  } elseif (@($Config.tags).Count -gt 0) {
-    $payload['tags'] = @($Config.tags)
+  } else {
+    $configuredTag = if (@($Config.tags).Count -gt 0) { [string]@($Config.tags)[0] } else { 'white_check_mark' }
+    if ([string]::IsNullOrWhiteSpace($configuredTag)) { $configuredTag = 'white_check_mark' }
+    $payload['tags'] = @($configuredTag)
   }
   if ([int]$Config.priority -ne 3) { $payload['priority'] = [int]$Config.priority }
   if ($Config.markdown -and -not [string]::IsNullOrWhiteSpace($summary)) { $payload['markdown'] = $true }
@@ -1781,6 +11361,11 @@ function Send-NtfyEvent {
   }
   if ([string]::IsNullOrWhiteSpace($Config.server)) {
     throw 'ntfy server is empty'
+  }
+  foreach ($headerSource in @([string]$Config.token, [string]$Config.username, [string]$Config.password)) {
+    if (-not (Test-SafeUnicodeScalarText -Value $headerSource) -or $headerSource.Contains("`r") -or $headerSource.Contains("`n")) {
+      throw 'ntfy authentication contains unsafe header characters'
+    }
   }
   $serverUri = $null
   if (-not [Uri]::TryCreate([string]$Config.server, [UriKind]::Absolute, [ref]$serverUri) -or
@@ -1862,7 +11447,7 @@ function Send-NtfyEvent {
       return [pscustomobject]@{}
     }
     try {
-      return $responseBody | ConvertFrom-Json
+      return ConvertFrom-StrictJsonText -Text $responseBody
     } catch {
       return [pscustomobject]@{}
     }
@@ -2031,6 +11616,40 @@ function Test-ClaudeSessionHasPendingRecord {
   return $false
 }
 
+function Test-AudnCodeRuntimeHasPendingRecord {
+  param([object]$RuntimeState)
+
+  if ($null -eq $RuntimeState -or [string](Get-ObjectValue $RuntimeState 'kind' '') -notin @(
+      'audncode-runtime',
+      'audncode-cron-runtime',
+      'audncode-lifecycle-guard'
+    )) { return $false }
+  $homePath = [string](Get-ObjectValue $RuntimeState 'audncode_home' '')
+  $hostPid = [int](Get-ObjectValue $RuntimeState 'host_pid' 0)
+  $hostStartedUnixMs = [int64](Get-ObjectValue $RuntimeState 'host_started_unix_ms' 0)
+  if ([string]::IsNullOrWhiteSpace($homePath) -or $hostPid -le 0 -or $hostStartedUnixMs -le 0) { return $false }
+  foreach ($file in @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+    try {
+      $record = Read-JsonFile -Path $file.FullName
+      if ([string](Get-ObjectValue $record 'provider' '') -ne 'claude' -or
+          [string](Get-ObjectValue $record 'candidate_kind' '') -notin @('audncode_stop', 'audncode_stop_failure')) { continue }
+      $sessionInfo = Get-ClaudeSessionStateInfo -SessionId ([string](Get-ObjectValue $record 'thread_id' ''))
+      if ($null -eq $sessionInfo -or -not (Test-Path -LiteralPath $sessionInfo.path -PathType Leaf)) { continue }
+      $sessionState = Read-JsonFile -Path $sessionInfo.path
+      if ([string]::Equals([string](Get-ObjectValue $sessionState 'audncode_home' ''), $homePath, [StringComparison]::OrdinalIgnoreCase) -and
+          [int](Get-ObjectValue $sessionState 'audncode_host_pid' 0) -eq $hostPid -and
+          [int64](Get-ObjectValue $sessionState 'audncode_host_started_unix_ms' 0) -eq $hostStartedUnixMs) {
+        return $true
+      }
+    } catch {
+      # Until the worker isolates an unreadable pending record, do not erase
+      # the only durable cron expectations that could prove its safe outcome.
+      return $true
+    }
+  }
+  return $false
+}
+
 function Clean-RuntimeState {
   param(
     [int]$ReceiptRetentionDays,
@@ -2059,6 +11678,24 @@ function Clean-RuntimeState {
         if (-not (Test-Path -LiteralPath $lockedInfo.path -PathType Leaf)) { return }
         $current = Get-Item -LiteralPath $lockedInfo.path -ErrorAction Stop
         if ($current.LastWriteTimeUtc -ge $lockedCutoff) { return }
+        $state = $null
+        try { $state = Read-JsonFile -Path $lockedInfo.path } catch { $state = $null }
+        if ([string](Get-ObjectValue $state 'kind' '') -in @(
+            'audncode-runtime',
+            'audncode-cron-runtime',
+            'audncode-lifecycle-guard'
+          )) {
+          $hostPid = [int](Get-ObjectValue $state 'host_pid' 0)
+          $hostStarted = [int64](Get-ObjectValue $state 'host_started_unix_ms' 0)
+          $hostProcess = if ($hostPid -gt 0) { Get-Process -Id $hostPid -ErrorAction SilentlyContinue } else { $null }
+          if ($null -ne $hostProcess) {
+            try {
+              $processStarted = ([DateTimeOffset]$hostProcess.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+              if ([Math]::Abs($processStarted - $hostStarted) -le 120000) { return }
+            } catch { return }
+          }
+          if (Test-AudnCodeRuntimeHasPendingRecord -RuntimeState $state) { return }
+        }
         if (Test-ClaudeSessionHasPendingRecord -SessionKey $lockedInfo.key) { return }
         Remove-Item -LiteralPath $lockedInfo.path -Force -ErrorAction SilentlyContinue
       } -Arguments @($sessionInfo, $cutoff))
@@ -2130,6 +11767,7 @@ function Initialize-WinSqlite {
   }
   Add-Type -ReferencedAssemblies 'System.Web.Extensions' -TypeDefinition @'
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -2172,6 +11810,7 @@ public static class CodexNtfyWinSqlite {
     private const int SQLITE_ROW = 100;
     private const int SQLITE_DONE = 101;
     private const int SQLITE_OPEN_READONLY = 1;
+    private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int sqlite3_open_v2(byte[] filename, out IntPtr database, int flags, IntPtr vfs);
@@ -2195,10 +11834,57 @@ public static class CodexNtfyWinSqlite {
     private static extern IntPtr sqlite3_errmsg(IntPtr database);
 
     private static byte[] Utf8Z(string value) {
-        byte[] bytes = Encoding.UTF8.GetBytes(value ?? String.Empty);
+        value = value ?? String.Empty;
+        if (!IsSafeString(value)) throw new InvalidDataException("invalid Unicode scalar data");
+        byte[] bytes = StrictUtf8.GetBytes(value);
         byte[] terminated = new byte[bytes.Length + 1];
         Buffer.BlockCopy(bytes, 0, terminated, 0, bytes.Length);
         return terminated;
+    }
+
+    private static bool IsSafeString(string value) {
+        if (value == null) return true;
+        for (int index = 0; index < value.Length; index++) {
+            char current = value[index];
+            if (current == '\uFFFD') return false;
+            if (Char.IsHighSurrogate(current)) {
+                if (index + 1 >= value.Length || !Char.IsLowSurrogate(value[index + 1])) return false;
+                index++;
+            } else if (Char.IsLowSurrogate(current)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HasSafeJsonStrings(object value, int depth) {
+        if (depth > 64) return false;
+        if (value == null) return true;
+        string text = value as string;
+        if (text != null) return IsSafeString(text);
+        IDictionary dictionary = value as IDictionary;
+        if (dictionary != null) {
+            foreach (DictionaryEntry entry in dictionary) {
+                string key = entry.Key as string;
+                if (key != null && !IsSafeString(key)) return false;
+                if (!HasSafeJsonStrings(entry.Value, depth + 1)) return false;
+            }
+            return true;
+        }
+        IEnumerable sequence = value as IEnumerable;
+        if (sequence != null) {
+            foreach (object item in sequence) if (!HasSafeJsonStrings(item, depth + 1)) return false;
+        }
+        return true;
+    }
+
+    private static string DecodeColumn(IntPtr pointer, int length) {
+        if (pointer == IntPtr.Zero || length <= 0) return String.Empty;
+        byte[] bytes = new byte[length];
+        Marshal.Copy(pointer, bytes, 0, length);
+        string value = StrictUtf8.GetString(bytes);
+        if (!IsSafeString(value)) throw new InvalidDataException("invalid Unicode scalar data in SQLite text");
+        return value;
     }
 
     private static string Error(IntPtr database, string operation, int code) {
@@ -2231,9 +11917,7 @@ public static class CodexNtfyWinSqlite {
                     values[index] = String.Empty;
                     continue;
                 }
-                byte[] bytes = new byte[length];
-                Marshal.Copy(pointer, bytes, 0, length);
-                values[index] = Encoding.UTF8.GetString(bytes);
+                values[index] = DecodeColumn(pointer, length);
             }
             return values;
         } finally {
@@ -2269,9 +11953,7 @@ public static class CodexNtfyWinSqlite {
                         values[index] = String.Empty;
                         continue;
                     }
-                    byte[] bytes = new byte[length];
-                    Marshal.Copy(pointer, bytes, 0, length);
-                    values[index] = Encoding.UTF8.GetString(bytes);
+                    values[index] = DecodeColumn(pointer, length);
                 }
                 rows.Add(values);
             }
@@ -2285,7 +11967,9 @@ public static class CodexNtfyWinSqlite {
     private static int TryParseLifecyclePayload(JavaScriptSerializer serializer, string line, out Dictionary<string, object> payload) {
         payload = null;
         try {
-            Dictionary<string, object> envelope = serializer.DeserializeObject(line) as Dictionary<string, object>;
+            object decoded = serializer.DeserializeObject(line);
+            if (!HasSafeJsonStrings(decoded, 0)) return -1;
+            Dictionary<string, object> envelope = decoded as Dictionary<string, object>;
             if (envelope == null) return 0;
             object envelopeType;
             if (!envelope.TryGetValue("type", out envelopeType) || !String.Equals(envelopeType as string, "event_msg", StringComparison.Ordinal))
@@ -2379,13 +12063,14 @@ public static class CodexNtfyWinSqlite {
                     firstLine = false;
                     if (line.Length > 0 && line[0] == '\uFEFF') line = line.Substring(1);
                 }
-                if (line.IndexOf("\"event_msg\"", StringComparison.Ordinal) < 0 ||
-                    line.IndexOf("\"payload\"", StringComparison.Ordinal) < 0) continue;
+                bool hasUnicodeEscape = line.IndexOf("\\u", StringComparison.Ordinal) >= 0;
+                if ((line.IndexOf("\"event_msg\"", StringComparison.Ordinal) < 0 ||
+                     line.IndexOf("\"payload\"", StringComparison.Ordinal) < 0) && !hasUnicodeEscape) continue;
                 if (line.IndexOf("\"task_started\"", StringComparison.Ordinal) < 0 &&
                     line.IndexOf("\"task_complete\"", StringComparison.Ordinal) < 0 &&
                     line.IndexOf("\"turn_aborted\"", StringComparison.Ordinal) < 0 &&
                     line.IndexOf("\"user_message\"", StringComparison.Ordinal) < 0 &&
-                    line.IndexOf("\"thread_goal_updated\"", StringComparison.Ordinal) < 0) continue;
+                    line.IndexOf("\"thread_goal_updated\"", StringComparison.Ordinal) < 0 && !hasUnicodeEscape) continue;
                 Dictionary<string, object> payload;
                 int parseStatus = TryParseLifecyclePayload(serializer, line, out payload);
                 // A malformed line that advertises a lifecycle marker must not
@@ -2580,17 +12265,24 @@ function Get-RecentThreadRolloutPaths {
 function Resolve-RolloutPath {
   param(
     [string]$DatabasePathValue,
-    [string]$SessionHome
+    [string]$SessionHome,
+    [string]$ThreadId = ''
   )
 
   if ([string]::IsNullOrWhiteSpace($DatabasePathValue)) { return '' }
-  if (Test-Path -LiteralPath $DatabasePathValue) { return $DatabasePathValue }
+  $trusted = Resolve-TrustedRolloutPath -CandidatePath $DatabasePathValue -SessionHome $SessionHome -ThreadId $ThreadId
+  if (-not [string]::IsNullOrWhiteSpace($trusted)) { return $trusted }
   $normalized = $DatabasePathValue.Replace('\', '/')
   $marker = $normalized.IndexOf('/.codex/', [StringComparison]::OrdinalIgnoreCase)
   if ($marker -ge 0 -and -not [string]::IsNullOrWhiteSpace($SessionHome)) {
-    $relative = $normalized.Substring($marker + '/.codex/'.Length).Replace('/', [IO.Path]::DirectorySeparatorChar)
-    $translated = Join-Path $SessionHome $relative
-    if (Test-Path -LiteralPath $translated) { return $translated }
+    $relativeValue = $normalized.Substring($marker + '/.codex/'.Length)
+    if (-not [string]::IsNullOrWhiteSpace($relativeValue) -and -not [IO.Path]::IsPathRooted($relativeValue) -and
+        @($relativeValue -split '/').Where({ $_ -notin @('', '.', '..') }).Count -eq @($relativeValue -split '/').Count) {
+      $relative = $relativeValue.Replace('/', [IO.Path]::DirectorySeparatorChar)
+      $translated = Join-Path $SessionHome $relative
+      $trusted = Resolve-TrustedRolloutPath -CandidatePath $translated -SessionHome $SessionHome -ThreadId $ThreadId
+      if (-not [string]::IsNullOrWhiteSpace($trusted)) { return $trusted }
+    }
   }
   $leaf = Split-Path -Leaf $DatabasePathValue
   if (-not [string]::IsNullOrWhiteSpace($leaf)) {
@@ -2598,7 +12290,10 @@ function Resolve-RolloutPath {
       $root = Join-Path $SessionHome $rootName
       if (-not (Test-Path -LiteralPath $root)) { continue }
       $match = Get-ChildItem -LiteralPath $root -Filter $leaf -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-      if ($null -ne $match) { return $match.FullName }
+      if ($null -ne $match) {
+        $trusted = Resolve-TrustedRolloutPath -CandidatePath $match.FullName -SessionHome $SessionHome -ThreadId $ThreadId
+        if (-not [string]::IsNullOrWhiteSpace($trusted)) { return $trusted }
+      }
     }
   }
   return ''
@@ -2613,8 +12308,10 @@ function Find-RolloutPathByThread {
   foreach ($rootName in @('sessions', 'archived_sessions')) {
     $root = Join-Path $SessionHome $rootName
     if (-not (Test-Path -LiteralPath $root)) { continue }
-    $match = Get-ChildItem -LiteralPath $root -Filter "*$ThreadId*.jsonl" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $match) { return $match.FullName }
+    foreach ($match in @(Get-ChildItem -LiteralPath $root -Filter "*$ThreadId*.jsonl" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 64)) {
+      $trusted = Resolve-TrustedRolloutPath -CandidatePath $match.FullName -SessionHome $SessionHome -ThreadId $ThreadId
+      if (-not [string]::IsNullOrWhiteSpace($trusted)) { return $trusted }
+    }
   }
   return ''
 }
@@ -2643,9 +12340,12 @@ function Get-ThreadDatabaseInfo {
   }
   $threadSource = [string]$row.values[1]
   $source = [string]$row.values[2]
-  $classification = if ($threadSource -eq 'subagent' -or $source -match '(?i)"subagent"') {
+  $edge = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT child_thread_id FROM thread_spawn_edges WHERE child_thread_id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 1
+  $classification = if ($threadSource -eq 'subagent' -or $source -match '(?i)"subagent"' -or
+      ($edge.ok -and $edge.found)) {
     'subagent'
-  } elseif (-not [string]::IsNullOrWhiteSpace($threadSource) -or -not [string]::IsNullOrWhiteSpace($source)) {
+  } elseif (-not [string]::IsNullOrWhiteSpace($threadSource) -or
+      (-not [string]::IsNullOrWhiteSpace($source) -and $edge.ok)) {
     'root'
   } else {
     'unknown'
@@ -2654,7 +12354,7 @@ function Get-ThreadDatabaseInfo {
     ok = $true
     found = $true
     classification = $classification
-    rolloutPath = Resolve-RolloutPath -DatabasePathValue ([string]$row.values[0]) -SessionHome $SessionHome
+    rolloutPath = Resolve-RolloutPath -DatabasePathValue ([string]$row.values[0]) -SessionHome $SessionHome -ThreadId $ThreadId
     error = ''
   }
   if (-not [string]::IsNullOrWhiteSpace($info.rolloutPath)) {
@@ -2877,9 +12577,10 @@ function Update-RolloutProbeStateFromLine {
     [bool]$IncludeMessage = $false
   )
 
-  if ($Line -notmatch '"(?:task_started|task_complete|turn_aborted|thread_goal_updated|user_message)"') { return }
+  if ($Line -notmatch '"(?:task_started|task_complete|turn_aborted|thread_goal_updated|user_message)"' -and
+      -not $Line.Contains('\u')) { return }
   try {
-    $item = $Line | ConvertFrom-Json -ErrorAction Stop
+    $item = ConvertFrom-StrictJsonText -Text $Line
     if ([string](Get-ObjectValue $item 'type' '') -ne 'event_msg') { return }
     $payload = Get-ObjectValue $item 'payload'
     if ($null -eq $payload) {
@@ -3266,11 +12967,27 @@ function Test-RecordIdleGate {
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   if ([string](Get-ObjectValue $Record 'provider' 'codex') -eq 'claude') {
     $candidateKind = [string](Get-ObjectValue $Record 'candidate_kind' '')
+    $isAudnStopFailure = $candidateKind -eq 'audncode_stop_failure'
+    $isStopFailure = $candidateKind -in @('claude_stop_failure', 'audncode_stop_failure')
+    $requiresAudnCodeIdle = $candidateKind -eq 'audncode_stop'
     $recordGoalState = ([string](Get-ObjectValue $Record 'claude_goal_state' '')).Trim().ToLowerInvariant()
     $recordGoalMarker = [string](Get-ObjectValue $Record 'claude_goal_marker' '')
     $needsIdleFallback = $recordGoalState -eq 'unknown'
     $sessionState = $null
-    if ($candidateKind -ne 'claude_stop_failure') {
+    if ($isAudnStopFailure) {
+      $sessionState = Read-ClaudeSessionState -SessionId ([string](Get-ObjectValue $Record 'thread_id' ''))
+      $failureProof = Test-AudnCodeStopFailureRecordProof `
+        -Record $Record `
+        -SessionState $sessionState `
+        -MarkAmbiguous
+      if (-not [bool](Get-ObjectValue $failureProof 'ok' $false)) {
+        return New-GateResult -State 'unverifiable' -Reason 'audncode-stop-failure-proof-unverifiable' -RetryAtUnixMs $now
+      }
+    }
+    # Claude Code's legacy StopFailure remains outside goal tracking. AudnCode's
+    # transcript-proven StopFailure must pass every goal-state transition gate;
+    # it replaces only the idle_prompt prerequisite below.
+    if (-not $isStopFailure -or $isAudnStopFailure) {
       if ($recordGoalState -eq 'unverifiable') {
         return New-GateResult -State 'unverifiable' -Reason 'claude-goal-record-oversize' -RetryAtUnixMs $now
       }
@@ -3341,11 +13058,16 @@ function Test-RecordIdleGate {
           # A terminal marker equal to the prompt baseline is historical. Both
           # historical and newly proven terminal states are non-running.
           $needsIdleFallback = $false
+        } elseif ($isAudnStopFailure) {
+          # StopFailure replaces only AudnCode's optional idle_prompt proof. An
+          # unreadable/unstable goal lifecycle is independent finality evidence
+          # and must be retried until the transcript proves none or terminal.
+          return New-GateResult -State 'busy' -Reason 'claude-goal-state-unverifiable' -RetryAtUnixMs ($now + 500)
         }
       }
     }
 
-    if ($candidateKind -ne 'claude_stop_failure' -and $needsIdleFallback) {
+    if (-not $isStopFailure -and ($needsIdleFallback -or $requiresAudnCodeIdle)) {
       if ($null -eq $sessionState) {
         $sessionState = Read-ClaudeSessionState -SessionId ([string](Get-ObjectValue $Record 'thread_id' ''))
       }
@@ -3368,8 +13090,88 @@ function Test-RecordIdleGate {
       $idleAt = [int64](Get-ObjectValue $sessionState 'idle_unix_ms' 0)
       $createdAt = [int64](Get-ObjectValue $Record 'created_unix_ms' $now)
       if ($idleAt -le 0 -or $idleAt -lt ($createdAt - 30000)) { $idleConfirmed = $false }
+      if ($requiresAudnCodeIdle -and
+          [string](Get-ObjectValue $sessionState 'notification_type' '') -ne 'idle_prompt') {
+        $idleConfirmed = $false
+      }
+      if ($requiresAudnCodeIdle) {
+        $idleHookStartTicks = [int64](Get-ObjectValue $sessionState 'idle_hook_start_ticks' 0)
+        $stopHookStartTicks = [int64](Get-ObjectValue $Record 'audncode_hook_start_ticks' 0)
+        if ($idleHookStartTicks -le 0 -or
+            $stopHookStartTicks -le 0 -or
+            $idleHookStartTicks -le $stopHookStartTicks) {
+          $idleConfirmed = $false
+        }
+      }
       if (-not $idleConfirmed) {
-        return New-GateResult -State 'busy' -Reason 'claude-goal-awaiting-finality' -RetryAtUnixMs ($now + 500)
+        $reason = if ($requiresAudnCodeIdle) { 'audncode-awaiting-idle' } else { 'claude-goal-awaiting-finality' }
+        return New-GateResult -State 'busy' -Reason $reason -RetryAtUnixMs ($now + 500)
+      }
+      if ($requiresAudnCodeIdle) {
+        # AudnCode batches transcript writes and polls teammate inboxes at one
+        # second intervals. Let both channels settle before the stable reads
+        # below; this floor applies even when the general grace is set to zero.
+        $audnSettleAt = $idleAt + 1250
+        if ($now -lt $audnSettleAt) {
+          return New-GateResult -State 'busy' -Reason 'audncode-background-settling' -RetryAtUnixMs $audnSettleAt
+        }
+        # AudnCode's idle_prompt timer currently observes only the foreground
+        # query loop. Command-queue entries and teammates can still be active,
+        # so promote the candidate only after their persisted state is idle.
+        $background = Get-AudnCodeBackgroundState `
+          -SessionId ([string](Get-ObjectValue $Record 'thread_id' '')) `
+          -TranscriptPath $recordTranscript `
+          -HomePath ([string](Get-ObjectValue $sessionState 'audncode_home' ''))
+        if ([string]$background.state -ne 'idle') {
+          return New-GateResult -State 'busy' -Reason ([string]$background.reason) -RetryAtUnixMs ($now + 500)
+        }
+        $backgroundFingerprint = [string](Get-ObjectValue $background 'fingerprint' '')
+        if ([string]::IsNullOrWhiteSpace($backgroundFingerprint)) {
+          return New-GateResult -State 'busy' -Reason 'audncode-background-snapshot-unverifiable' -RetryAtUnixMs ($now + 500)
+        }
+        $previousFingerprint = [string](Get-ObjectValue $Record 'audncode_idle_fingerprint' '')
+        $stableAt = [int64](Get-ObjectValue $Record 'audncode_idle_fingerprint_stable_at' 0)
+        if ($previousFingerprint -ne $backgroundFingerprint -or $stableAt -le 0) {
+          $stableAt = $now + 150
+          Set-RecordValue -Record $Record -Name 'audncode_idle_fingerprint' -Value $backgroundFingerprint
+          Set-RecordValue -Record $Record -Name 'audncode_idle_fingerprint_stable_at' -Value $stableAt
+          return New-GateResult -State 'busy' -Reason 'audncode-background-snapshot-settling' -RetryAtUnixMs $stableAt
+        }
+        if ($now -lt $stableAt) {
+          return New-GateResult -State 'busy' -Reason 'audncode-background-snapshot-settling' -RetryAtUnixMs $stableAt
+        }
+      }
+    }
+    if ($isAudnStopFailure) {
+      # StopFailure replaces only idle_prompt. Keep the same lower bound used
+      # by Stop so the 1 s queue/team persistence loops have settled before
+      # the first external-state snapshot.
+      $failureSettleAt = [int64](Get-ObjectValue $Record 'created_unix_ms' $now) + 1250
+      if ($now -lt $failureSettleAt) {
+        return New-GateResult -State 'busy' -Reason 'audncode-background-settling' -RetryAtUnixMs $failureSettleAt
+      }
+      $recordTranscript = [string](Get-ObjectValue $Record 'candidate_rollout_path' '')
+      $background = Get-AudnCodeBackgroundState `
+        -SessionId ([string](Get-ObjectValue $Record 'thread_id' '')) `
+        -TranscriptPath $recordTranscript `
+        -HomePath ([string](Get-ObjectValue $sessionState 'audncode_home' ''))
+      if ([string]$background.state -ne 'idle') {
+        return New-GateResult -State 'busy' -Reason ([string]$background.reason) -RetryAtUnixMs ($now + 500)
+      }
+      $backgroundFingerprint = [string](Get-ObjectValue $background 'fingerprint' '')
+      if ([string]::IsNullOrWhiteSpace($backgroundFingerprint)) {
+        return New-GateResult -State 'busy' -Reason 'audncode-background-snapshot-unverifiable' -RetryAtUnixMs ($now + 500)
+      }
+      $previousFingerprint = [string](Get-ObjectValue $Record 'audncode_idle_fingerprint' '')
+      $stableAt = [int64](Get-ObjectValue $Record 'audncode_idle_fingerprint_stable_at' 0)
+      if ($previousFingerprint -ne $backgroundFingerprint -or $stableAt -le 0) {
+        $stableAt = $now + 150
+        Set-RecordValue -Record $Record -Name 'audncode_idle_fingerprint' -Value $backgroundFingerprint
+        Set-RecordValue -Record $Record -Name 'audncode_idle_fingerprint_stable_at' -Value $stableAt
+        return New-GateResult -State 'busy' -Reason 'audncode-background-snapshot-settling' -RetryAtUnixMs $stableAt
+      }
+      if ($now -lt $stableAt) {
+        return New-GateResult -State 'busy' -Reason 'audncode-background-snapshot-settling' -RetryAtUnixMs $stableAt
       }
     }
     $createdAt = [int64](Get-ObjectValue $Record 'created_unix_ms' $now)
@@ -3425,7 +13227,7 @@ function Test-RecordIdleGate {
     # A Stop hook can arrive before Codex persists its session row/rollout.
     # Reclassify on every strict probe so a later child session is suppressed
     # instead of remaining unknown forever (or being assumed to be root).
-    $rolloutClassification = Get-EventClassification -Event $Record.event -ThreadId $threadId -SessionHome $sessionHome
+    $rolloutClassification = Get-EventClassification -Event $Record.event -ThreadId $threadId -SessionHome $sessionHome -SqliteHome $sqliteHome
     if ($rolloutClassification -in @('root', 'subagent')) {
       $classification = $rolloutClassification
       Set-RecordValue -Record $Record -Name 'session_classification' -Value $classification
@@ -3440,7 +13242,7 @@ function Test-RecordIdleGate {
   $rolloutPath = if ($databaseInfo.found) { [string]$databaseInfo.rolloutPath } else { '' }
   if ([string]::IsNullOrWhiteSpace($rolloutPath)) {
     $rolloutPath = [string](Get-ObjectValue $Record 'candidate_rollout_path' '')
-    $rolloutPath = Resolve-RolloutPath -DatabasePathValue $rolloutPath -SessionHome $sessionHome
+    $rolloutPath = Resolve-RolloutPath -DatabasePathValue $rolloutPath -SessionHome $sessionHome -ThreadId $threadId
   }
   if ([string]::IsNullOrWhiteSpace($rolloutPath)) {
     $rolloutPath = Find-RolloutPathByThread -ThreadId $threadId -SessionHome $sessionHome
@@ -3908,12 +13710,46 @@ function Get-RolloutMetadata {
   try {
     $line = Read-FirstLineShared -Path $Path
     if ([string]::IsNullOrWhiteSpace($line)) { return [pscustomobject]@{} }
-    $envelope = $line | ConvertFrom-Json -ErrorAction Stop
+    $envelope = ConvertFrom-StrictJsonText -Text $line
     $payload = Get-ObjectValue $envelope 'payload'
     if ($null -eq $payload -or $payload -is [string]) { return [pscustomobject]@{} }
     return $payload
   } catch {
     return [pscustomobject]@{}
+  }
+}
+
+function Read-RolloutWatchEnvelope {
+  param(
+    [string]$Path,
+    [int64]$Start,
+    [int64]$Length
+  )
+
+  if ($Start -lt 0 -or $Length -le 0 -or $Length -gt $RolloutWatchMaxLineBytes) { return $null }
+  $stream = $null
+  try {
+    $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharing)
+    if ($Start + $Length -gt $stream.Length) { return $null }
+    $stream.Position = $Start
+    $bytes = New-Object byte[] ([int]$Length)
+    $read = 0
+    while ($read -lt $bytes.Length) {
+      $count = $stream.Read($bytes, $read, $bytes.Length - $read)
+      if ($count -le 0) { return $null }
+      $read += $count
+    }
+    $script:RolloutWatchBytesRead += [int64]$read
+    if ($bytes[$bytes.Length - 1] -ne 10) { return $null }
+    $textLength = $bytes.Length - 1
+    if ($textLength -gt 0 -and $bytes[$textLength - 1] -eq 13) { $textLength-- }
+    $text = $Utf8StrictNoBom.GetString($bytes, 0, $textLength)
+    return ConvertFrom-StrictJsonText -Text $text
+  } catch {
+    return $null
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
   }
 }
 
@@ -3933,6 +13769,12 @@ function Scan-RolloutFile {
   if ([string]::IsNullOrWhiteSpace($sqliteHome)) { $sqliteHome = $sessionHome }
   $rootOrigin = [string](Get-ObjectValue $Entry 'origin' '')
   $forceReplay = [bool](Get-ObjectValue $Entry 'force_replay' $false)
+  $initialMetadata = Get-RolloutMetadata -Path $File.FullName
+  $initialThreadId = [string](Get-ObjectValue $initialMetadata 'id' '')
+  if ([string]::IsNullOrWhiteSpace($initialThreadId)) { return 0 }
+  $trustedPath = Resolve-TrustedRolloutPath -CandidatePath $File.FullName -SessionHome $sessionHome -ThreadId $initialThreadId
+  if ([string]::IsNullOrWhiteSpace($trustedPath)) { return 0 }
+  try { $File = Get-Item -LiteralPath $trustedPath -ErrorAction Stop } catch { return 0 }
   $stateId = Get-Sha256Hex $File.FullName
   $statePath = Join-Path $WatchDir ($stateId + '.json')
   $state = $null
@@ -3940,37 +13782,88 @@ function Scan-RolloutFile {
   $stateWasMissing = $null -eq $state
   $fileInfo = $null
   try { $fileInfo = Get-Item -LiteralPath $File.FullName } catch { return 0 }
+  $discardMode = ''
+  $corruptEpoch = $false
+  $incompleteTail = $false
+  $stagedType = ''
+  $stagedTurnId = ''
+  $stagedStart = [int64]-1
+  $stagedLength = [int64]0
+  $threadId = ''
   if ($null -eq $state) {
     $modifiedMs = ([DateTimeOffset]$fileInfo.LastWriteTimeUtc).ToUnixTimeMilliseconds()
     $replayMs = [int64]([Math]::Max(0, $Config.watchInitialReplaySeconds) * 1000)
-    $offset = if ($forceReplay -or $NowUnixMs - $modifiedMs -le $replayMs) { [int64]0 } else { [int64]$fileInfo.Length }
+    $shouldReplay = $forceReplay -or $NowUnixMs - $modifiedMs -le $replayMs
+    $offset = if ($shouldReplay) {
+      # Reserve one byte for checking whether the tail starts on a record
+      # boundary; total physical reads still stay within the configured cap.
+      [int64][Math]::Max(0, [int64]$fileInfo.Length - [Math]::Max(1, $RolloutWatchMaxReadBytes - 1))
+    } else {
+      [int64]$fileInfo.Length
+    }
+    if ($shouldReplay -and $offset -gt 0) {
+      $discardMode = 'initial'
+      $script:RolloutWatchTruncatedReplays++
+    }
   } else {
     $offset = [int64](Get-ObjectValue $state 'offset' 0)
-    if ($offset -lt 0 -or $offset -gt [int64]$fileInfo.Length) { $offset = [int64]$fileInfo.Length }
+    $discardMode = [string](Get-ObjectValue $state 'discard_mode' '')
+    $corruptEpoch = [bool](Get-ObjectValue $state 'corrupt_epoch' $false)
+    $incompleteTail = [bool](Get-ObjectValue $state 'incomplete_tail' $false)
+    $stagedType = [string](Get-ObjectValue $state 'staged_type' '')
+    $stagedTurnId = [string](Get-ObjectValue $state 'staged_turn_id' '')
+    $stagedStart = [int64](Get-ObjectValue $state 'staged_start' -1)
+    $stagedLength = [int64](Get-ObjectValue $state 'staged_length' 0)
+    $threadId = [string](Get-ObjectValue $state 'thread_id' '')
+    if ($offset -lt 0 -or $offset -gt [int64]$fileInfo.Length) {
+      $offset = [int64]$fileInfo.Length
+      $discardMode = ''
+      $corruptEpoch = $true
+      $incompleteTail = $false
+      $stagedType = ''
+      $stagedTurnId = ''
+      $stagedStart = [int64]-1
+      $stagedLength = [int64]0
+    }
     $observedLengthProperty = $state.PSObject.Properties['observed_length']
     $observedTicksProperty = $state.PSObject.Properties['observed_write_ticks']
     $snapshotUnchanged = $null -ne $observedLengthProperty -and
       $null -ne $observedTicksProperty -and
       [int64]$observedLengthProperty.Value -eq [int64]$fileInfo.Length -and
       [int64]$observedTicksProperty.Value -eq [int64]$fileInfo.LastWriteTimeUtc.Ticks
-    # Rollouts are append-only. Legacy cursors do not have snapshot metadata,
-    # but offset==length is still a safe no-op and avoids one mass rewrite on
-    # upgrade. New cursors also skip unchanged partial-line snapshots.
-    if ($snapshotUnchanged -or
-        ($null -eq $observedLengthProperty -and $offset -eq [int64]$fileInfo.Length)) {
+    # A caught-up cursor is a no-op. A staged terminal must still be retried,
+    # while an unchanged incomplete tail waits for the writer without reread.
+    if (($snapshotUnchanged -and $stagedLength -le 0 -and
+          ($offset -eq [int64]$fileInfo.Length -or $incompleteTail)) -or
+        ($null -eq $observedLengthProperty -and $offset -eq [int64]$fileInfo.Length -and $stagedLength -le 0)) {
       return 0
     }
   }
 
   $stream = $null
   $memory = $null
+  $snapshotLength = [int64]0
+  $snapshotWriteTicks = [int64]0
+  $data = [byte[]]@()
+  $boundaryBytes = 0
   try {
     $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
     $stream = [IO.FileStream]::new($File.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharing)
     $snapshotLength = $stream.Length
     if ($offset -gt $snapshotLength) { $offset = $snapshotLength }
+    $snapshotWriteTicks = [IO.File]::GetLastWriteTimeUtc($File.FullName).Ticks
+    $readBudget = $RolloutWatchMaxReadBytes
+    if ($stateWasMissing -and $discardMode -eq 'initial' -and $offset -gt 0) {
+      $stream.Position = $offset - 1
+      $previousByte = $stream.ReadByte()
+      if ($previousByte -ge 0) {
+        $boundaryBytes = 1
+        $readBudget--
+        if ($previousByte -eq 10) { $discardMode = '' }
+      }
+    }
     $stream.Position = $offset
-    $remaining = [int64]$snapshotLength - $offset
+    $remaining = [int64][Math]::Min([int64]$snapshotLength - $offset, $readBudget)
     $memory = New-Object IO.MemoryStream
     $buffer = New-Object byte[] 65536
     while ($remaining -gt 0) {
@@ -3981,6 +13874,7 @@ function Scan-RolloutFile {
       $remaining -= $count
     }
     $data = $memory.ToArray()
+    $script:RolloutWatchBytesRead += [int64]$data.Length + $boundaryBytes
   } catch {
     return 0
   } finally {
@@ -3988,132 +13882,214 @@ function Scan-RolloutFile {
     if ($null -ne $stream) { $stream.Dispose() }
   }
 
-  $lastNewline = -1
-  for ($index = $data.Length - 1; $index -ge 0; $index--) {
-    if ($data[$index] -eq 10) { $lastNewline = $index; break }
+  $chunkStart = $offset
+  $parseIndex = 0
+  $corruptionObserved = $false
+  $incompleteTail = $false
+  if (-not [string]::IsNullOrWhiteSpace($discardMode) -and $data.Length -gt 0) {
+    $discardNewline = [Array]::IndexOf($data, [byte]10, 0)
+    if ($discardNewline -lt 0) {
+      $parseIndex = $data.Length
+    } else {
+      $parseIndex = $discardNewline + 1
+      $discardMode = ''
+    }
   }
-  if ($lastNewline -lt 0) {
-    if (-not (Test-RolloutScanParentAlive)) { return 0 }
-    Write-JsonAtomic -Path $statePath -Value ([ordered]@{
-        schema = 1
-        rollout_path = $File.FullName
-        session_codex_home = $sessionHome
-        session_sqlite_home = $sqliteHome
-        origin = $rootOrigin
-        offset = $offset
-        seen_unix_ms = $NowUnixMs
-        observed_length = [int64]$snapshotLength
-        observed_write_ticks = [int64]$fileInfo.LastWriteTimeUtc.Ticks
-      })
-    return 0
+  while ($parseIndex -lt $data.Length) {
+    $newline = [Array]::IndexOf($data, [byte]10, $parseIndex)
+    if ($newline -lt 0) { break }
+    $lineStartIndex = $parseIndex
+    $lineLength = $newline - $lineStartIndex + 1
+    if ([int64]$lineLength -gt $RolloutWatchMaxLineBytes) {
+      $corruptEpoch = $true
+      $corruptionObserved = $true
+      $stagedType = ''
+      $stagedTurnId = ''
+      $stagedStart = [int64]-1
+      $stagedLength = [int64]0
+      $parseIndex = $newline + 1
+      continue
+    }
+    $contentLength = $lineLength - 1
+    if ($contentLength -gt 0 -and $data[$newline - 1] -eq 13) { $contentLength-- }
+    try {
+      $line = $Utf8StrictNoBom.GetString($data, $lineStartIndex, $contentLength)
+    } catch {
+      $corruptEpoch = $true
+      $corruptionObserved = $true
+      $stagedType = ''
+      $stagedTurnId = ''
+      $stagedStart = [int64]-1
+      $stagedLength = [int64]0
+      $parseIndex = $newline + 1
+      continue
+    }
+    if ($line -match '"(?:task_started|task_complete|turn_aborted)"' -or $line.Contains('\u')) {
+      try {
+        $envelope = ConvertFrom-StrictJsonText -Text $line
+        if ([string](Get-ObjectValue $envelope 'type' '') -ne 'event_msg') {
+          $parseIndex = $newline + 1
+          continue
+        }
+        $payload = Get-ObjectValue $envelope 'payload'
+        $eventType = [string](Get-ObjectValue $payload 'type' '')
+        $turnId = [string](Get-FirstObjectValue $payload @('turn_id', 'turnId'))
+        if ($eventType -eq 'task_started') {
+          # A new turn starts a fresh epoch and invalidates any earlier staged
+          # terminal, including one found in a previous backlog chunk.
+          $corruptEpoch = $false
+          $stagedType = ''
+          $stagedTurnId = ''
+          $stagedStart = [int64]-1
+          $stagedLength = [int64]0
+        } elseif ($eventType -in @('task_complete', 'turn_aborted')) {
+          if ([string]::IsNullOrWhiteSpace($turnId)) { throw 'lifecycle turn identity missing' }
+          if (-not $corruptEpoch) {
+            $stagedType = $eventType
+            $stagedTurnId = $turnId
+            $stagedStart = $chunkStart + $lineStartIndex
+            $stagedLength = [int64]$lineLength
+          }
+        }
+      } catch {
+        $corruptEpoch = $true
+        $corruptionObserved = $true
+        $stagedType = ''
+        $stagedTurnId = ''
+        $stagedStart = [int64]-1
+        $stagedLength = [int64]0
+      }
+    }
+    $parseIndex = $newline + 1
   }
 
-  if ($stateWasMissing) {
-    # Persist the starting cursor before accounting any completion. If queueing
-    # fails, the next scan must retry from here even after the replay window.
-    if (-not (Test-RolloutScanParentAlive)) { return 0 }
-    Write-JsonAtomic -Path $statePath -Value ([ordered]@{
-        schema = 1
-        rollout_path = $File.FullName
-        session_codex_home = $sessionHome
-        session_sqlite_home = $sqliteHome
-        origin = $rootOrigin
-        offset = $offset
-        seen_unix_ms = $NowUnixMs
-      })
+  $newOffset = $chunkStart + $parseIndex
+  if ($parseIndex -lt $data.Length) {
+    $trailingLength = $data.Length - $parseIndex
+    $readReachedSnapshot = $chunkStart + $data.Length -ge $snapshotLength
+    if ([int64]$trailingLength -ge $RolloutWatchMaxLineBytes) {
+      # Do not reread an unterminated oversized record forever. Its epoch is
+      # sticky-corrupt until a later, valid task_started record is observed.
+      $corruptEpoch = $true
+      $corruptionObserved = $true
+      $stagedType = ''
+      $stagedTurnId = ''
+      $stagedStart = [int64]-1
+      $stagedLength = [int64]0
+      $discardMode = 'oversize'
+      $newOffset = $chunkStart + $data.Length
+    } elseif ($readReachedSnapshot) {
+      $incompleteTail = $true
+    }
   }
-  $completeText = $Utf8NoBom.GetString($data, 0, $lastNewline + 1)
-  $newOffset = $offset + $lastNewline + 1
+  if ($newOffset -lt $snapshotLength -and -not $incompleteTail) {
+    $script:RolloutWatchBacklogFiles++
+  }
+  if ($corruptionObserved) { $script:RolloutWatchCorruptFiles++ }
+
+  if ([string]::IsNullOrWhiteSpace($threadId)) {
+    $metadata = Get-RolloutMetadata -Path $File.FullName
+    $threadId = [string](Get-FirstObjectValue $metadata @('id', 'thread_id', 'threadId'))
+  }
+  $cursorState = [ordered]@{
+    schema = 1
+    rollout_path = $File.FullName
+    session_codex_home = $sessionHome
+    session_sqlite_home = $sqliteHome
+    origin = $rootOrigin
+    offset = [int64]$newOffset
+    seen_unix_ms = $NowUnixMs
+    thread_id = $threadId
+    observed_length = [int64]$snapshotLength
+    observed_write_ticks = [int64]$snapshotWriteTicks
+    incomplete_tail = [bool]$incompleteTail
+    discard_mode = $discardMode
+    corrupt_epoch = [bool]$corruptEpoch
+    staged_type = $stagedType
+    staged_turn_id = $stagedTurnId
+    staged_start = [int64]$stagedStart
+    staged_length = [int64]$stagedLength
+  }
+  if (-not (Test-RolloutScanParentAlive)) { return 0 }
+  Write-JsonAtomic -Path $statePath -Value $cursorState
+
+  $postInfo = $null
+  try { $postInfo = Get-Item -LiteralPath $File.FullName -ErrorAction Stop } catch { return 0 }
+  $stableEof = $newOffset -eq $snapshotLength -and
+    -not $incompleteTail -and
+    [string]::IsNullOrWhiteSpace($discardMode) -and
+    [int64]$postInfo.Length -eq $snapshotLength -and
+    [int64]$postInfo.LastWriteTimeUtc.Ticks -eq $snapshotWriteTicks
+  if (-not $stableEof -or $corruptEpoch -or $stagedLength -le 0) { return 0 }
+
+  $stagedEnvelope = Read-RolloutWatchEnvelope -Path $File.FullName -Start $stagedStart -Length $stagedLength
+  $stagedPayload = Get-ObjectValue $stagedEnvelope 'payload'
+  $verifiedType = [string](Get-ObjectValue $stagedPayload 'type' '')
+  $verifiedTurn = [string](Get-FirstObjectValue $stagedPayload @('turn_id', 'turnId'))
+  if ($verifiedType -ne $stagedType -or $verifiedTurn -ne $stagedTurnId) {
+    $cursorState.corrupt_epoch = $true
+    $cursorState.staged_type = ''
+    $cursorState.staged_turn_id = ''
+    $cursorState.staged_start = [int64]-1
+    $cursorState.staged_length = [int64]0
+    Write-JsonAtomic -Path $statePath -Value $cursorState
+    if (-not $corruptionObserved) { $script:RolloutWatchCorruptFiles++ }
+    return 0
+  }
   $metadata = Get-RolloutMetadata -Path $File.FullName
-  $threadId = [string](Get-FirstObjectValue $metadata @('id', 'thread_id', 'threadId'))
-  if ([string]::IsNullOrWhiteSpace($threadId) -and $null -ne $state) {
-    $threadId = [string](Get-ObjectValue $state 'thread_id' '')
+  if ([string]::IsNullOrWhiteSpace($threadId)) {
+    $threadId = [string](Get-FirstObjectValue $metadata @('id', 'thread_id', 'threadId'))
+  }
+  if ([string]::IsNullOrWhiteSpace($threadId)) {
+    Write-RuntimeLog "watcher retained terminal: session identity unavailable path_hash=$($stateId.Substring(0, 12))"
+    return 0
   }
   $cwd = [string](Get-ObjectValue $metadata 'cwd' '')
   $source = Get-ObjectValue $metadata 'source'
   $originator = [string](Get-ObjectValue $metadata 'originator' '')
-  $observed = 0
-  $completionMissingIdentity = $false
-  foreach ($line in @($completeText -split "`n")) {
-    if ($line -notmatch '"(?:task_complete|turn_aborted)"') { continue }
-    $envelope = $null
-    $payload = $null
-    $event = $null
-    try {
-      $envelope = $line.TrimEnd("`r") | ConvertFrom-Json -ErrorAction Stop
-      $payload = Get-ObjectValue $envelope 'payload'
-      $eventType = [string](Get-ObjectValue $payload 'type' '')
-      if ($eventType -notin @('task_complete', 'turn_aborted')) { continue }
-      $turnId = [string](Get-FirstObjectValue $payload @('turn_id', 'turnId'))
-      if ([string]::IsNullOrWhiteSpace($threadId)) {
-        $completionMissingIdentity = $true
-        continue
-      }
-      if ([string]::IsNullOrWhiteSpace($turnId)) { continue }
-      $lastMessage = if ($eventType -eq 'task_complete') {
-        [string](Get-FirstObjectValue $payload @('last_agent_message', 'last-assistant-message', 'last_assistant_message'))
-      } else {
-        ''
-      }
-      $event = [pscustomobject][ordered]@{
-        type = 'agent-turn-complete'
-        'thread-id' = $threadId
-        'turn-id' = $turnId
-        cwd = $cwd
-        'last-assistant-message' = $lastMessage
-        'completion-event-type' = $eventType
-        source = $source
-        transcript_path = $File.FullName
-      }
-    } catch {
-      # Malformed or future-format rollout lines are non-actionable. Durable
-      # queue/receipt operations below intentionally remain outside this catch.
-      continue
-    }
-    if (-not (Test-RolloutScanParentAlive)) { return 0 }
-    $classification = if ($source -is [string] -and -not [string]::IsNullOrWhiteSpace($source)) {
-      if ($source.Trim().Equals('subagent', [StringComparison]::OrdinalIgnoreCase)) { 'subagent' } else { 'root' }
-    } elseif ($null -ne $source -and $source -isnot [string] -and $null -ne (Get-ObjectValue $source 'subagent')) {
-      'subagent'
-    } else {
-      Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $sessionHome
-    }
-    $eventOrigin = if (-not [string]::IsNullOrWhiteSpace($rootOrigin)) {
-      $rootOrigin
-    } elseif (-not [string]::IsNullOrWhiteSpace($originator)) {
-      $originator
-    } else {
-      Get-DefaultOrigin
-    }
-    $record = New-EventRecord -Event $event -EventOrigin $eventOrigin -EventSessionHome $sessionHome -EventSqliteHome $sqliteHome -EventClassification $classification -EventIncludeMessage $Config.includeMessage -CandidateKind 'rollout_watch' -SourceEvent 'rollout-watch'
-    if (-not (Test-RolloutScanParentAlive)) { return 0 }
-    if ($Config.suppressSubagents -and $classification -eq 'subagent') {
-      Move-ToSuppressed -Path (Join-Path $PendingDir ($record.key + '.json')) -Record $record -Reason 'subagent'
-    } else {
-      [void](Add-CandidateEvent -Record $record -Config $Config)
-    }
-    $observed++
+  $lastMessage = if ($verifiedType -eq 'task_complete') {
+    [string](Get-FirstObjectValue $stagedPayload @('last_agent_message', 'last-assistant-message', 'last_assistant_message'))
+  } else { '' }
+  $event = [pscustomobject][ordered]@{
+    type = 'agent-turn-complete'
+    'thread-id' = $threadId
+    'turn-id' = $verifiedTurn
+    cwd = $cwd
+    'last-assistant-message' = $lastMessage
+    'completion-event-type' = $verifiedType
+    source = $source
+    transcript_path = $File.FullName
   }
-  if ($completionMissingIdentity) {
-    Write-RuntimeLog "watcher retained cursor: session identity unavailable path_hash=$($stateId.Substring(0, 12))"
-    return 0
+  $classification = if ($source -is [string] -and -not [string]::IsNullOrWhiteSpace($source)) {
+    if ($source.Trim().Equals('subagent', [StringComparison]::OrdinalIgnoreCase)) { 'subagent' } else { 'root' }
+  } elseif ($null -ne $source -and $source -isnot [string] -and $null -ne (Get-ObjectValue $source 'subagent')) {
+    'subagent'
+  } else {
+    Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $sessionHome -SqliteHome $sqliteHome
   }
-  # This cursor advances only after every actionable line above has a durable
-  # pending/outbox record or suppression receipt. Queue failures propagate.
+  $eventOrigin = if (-not [string]::IsNullOrWhiteSpace($rootOrigin)) {
+    $rootOrigin
+  } elseif (-not [string]::IsNullOrWhiteSpace($originator)) {
+    $originator
+  } else {
+    Get-DefaultOrigin
+  }
+  $record = New-EventRecord -Event $event -EventOrigin $eventOrigin -EventSessionHome $sessionHome -EventSqliteHome $sqliteHome -EventClassification $classification -EventIncludeMessage $Config.includeMessage -CandidateKind 'rollout_watch' -SourceEvent 'rollout-watch'
+  Set-RecordValue -Record $record -Name 'completion_end_offset' -Value ([int64]($stagedStart + $stagedLength))
   if (-not (Test-RolloutScanParentAlive)) { return 0 }
-  Write-JsonAtomic -Path $statePath -Value ([ordered]@{
-      schema = 1
-      rollout_path = $File.FullName
-      session_codex_home = $sessionHome
-      session_sqlite_home = $sqliteHome
-      origin = $rootOrigin
-      offset = $newOffset
-      seen_unix_ms = $NowUnixMs
-      thread_id = $threadId
-      observed_length = [int64]$snapshotLength
-      observed_write_ticks = [int64]$fileInfo.LastWriteTimeUtc.Ticks
-    })
-  return $observed
+  if ($Config.suppressSubagents -and $classification -eq 'subagent') {
+    Move-ToSuppressed -Path (Join-Path $PendingDir ($record.key + '.json')) -Record $record -Reason 'subagent'
+  } else {
+    [void](Add-CandidateEvent -Record $record -Config $Config)
+  }
+  # Queue/suppression is durable before clearing the staged retry marker.
+  $cursorState.thread_id = $threadId
+  $cursorState.staged_type = ''
+  $cursorState.staged_turn_id = ''
+  $cursorState.staged_start = [int64]-1
+  $cursorState.staged_length = [int64]0
+  Write-JsonAtomic -Path $statePath -Value $cursorState
+  return 1
 }
 
 function Invoke-RolloutWatchScan {
@@ -4121,6 +14097,10 @@ function Invoke-RolloutWatchScan {
     [object]$Config,
     [int64]$NowUnixMs
   )
+  $script:RolloutWatchBytesRead = [int64]0
+  $script:RolloutWatchBacklogFiles = 0
+  $script:RolloutWatchTruncatedReplays = 0
+  $script:RolloutWatchCorruptFiles = 0
   $observed = 0
   foreach ($entry in @(Get-RecentRolloutFiles -Config $Config)) {
     $observed += Scan-RolloutFile -Entry $entry -Config $Config -NowUnixMs $NowUnixMs
@@ -4253,7 +14233,7 @@ function Invoke-PendingRecordCommit {
     }
     $writeRecord = if ($canonicalIsStop) { $canonical } else { $incomingRecord }
     if ($canonicalIsStop) {
-      foreach ($name in @('next_attempt_unix_ms', 'gate_reason', 'goal_status', 'completion_event_type', 'active_descendants', 'descendant_unknown_since', 'candidate_rollout_path', 'rollout_sequence', 'claude_goal_state', 'claude_goal_marker')) {
+      foreach ($name in @('next_attempt_unix_ms', 'gate_reason', 'goal_status', 'completion_event_type', 'active_descendants', 'descendant_unknown_since', 'candidate_rollout_path', 'rollout_sequence', 'claude_goal_state', 'claude_goal_marker', 'audncode_idle_fingerprint', 'audncode_idle_fingerprint_stable_at')) {
         $property = $incomingRecord.PSObject.Properties[$name]
         if ($null -ne $property) { Set-RecordValue -Record $writeRecord -Name $name -Value $property.Value }
       }
@@ -4304,6 +14284,251 @@ function Get-ClaudeSessionCommitDisposition {
   return 'current'
 }
 
+function Get-AudnCodeLockedIngressFallbackState {
+  param(
+    [object]$FallbackInfo,
+    [int64]$HostStartedUnixMs
+  )
+
+  # The caller must own FallbackInfo.lock_path. This intentionally mirrors the
+  # public fallback reader without reacquiring the non-reentrant file lock, so
+  # promotion can retain the per-home lock until the pending record is moved.
+  $unknown = [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-unverifiable' }
+  if ($null -eq $FallbackInfo -or [string]::IsNullOrWhiteSpace([string]$FallbackInfo.path) -or
+      [string]::IsNullOrWhiteSpace([string]$FallbackInfo.home) -or $HostStartedUnixMs -le 0) {
+    return $unknown
+  }
+  if (-not (Test-Path -LiteralPath $FallbackInfo.path -PathType Leaf)) {
+    return [pscustomobject]@{ state = 'clear'; reason = 'audncode-ingress-fallback-clear' }
+  }
+  try { $state = Read-JsonFile -Path $FallbackInfo.path } catch { return $unknown }
+  $schemaProperty = $state.PSObject.Properties['schema']
+  $lostProperty = $state.PSObject.Properties['lost_hook_start_ticks']
+  $pendingProperty = $state.PSObject.Properties['pending']
+  if ($null -eq $schemaProperty -or
+      ($schemaProperty.Value -isnot [int] -and $schemaProperty.Value -isnot [long]) -or
+      [int64]$schemaProperty.Value -ne 2 -or
+      [string](Get-ObjectValue $state 'kind' '') -ne 'audncode-ingress-fallback' -or
+      -not [string]::Equals([string](Get-ObjectValue $state 'audncode_home' ''), [string]$FallbackInfo.home, [StringComparison]::OrdinalIgnoreCase) -or
+      $null -eq $lostProperty -or
+      ($lostProperty.Value -isnot [int] -and $lostProperty.Value -isnot [long]) -or
+      [int64]$lostProperty.Value -lt 0 -or
+      $null -eq $pendingProperty -or $pendingProperty.Value -isnot [array]) {
+    return $unknown
+  }
+  try {
+    $hostStartedTicks = [DateTimeOffset]::FromUnixTimeMilliseconds($HostStartedUnixMs).UtcDateTime.Ticks
+  } catch { return $unknown }
+  if ([int64]$lostProperty.Value -ge $hostStartedTicks) {
+    return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-lost' }
+  }
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $pendingCount = 0
+  foreach ($entry in @($pendingProperty.Value)) {
+    $entryToken = [string](Get-ObjectValue $entry 'token' '')
+    $entryTicks = [int64](Get-ObjectValue $entry 'hook_start_ticks' 0)
+    if ($entryToken -notmatch '^[a-f0-9]{32}$' -or $entryTicks -le 0 -or -not $seen.Add($entryToken)) {
+      return $unknown
+    }
+    $pendingCount++
+    if ($entryTicks -ge $hostStartedTicks) {
+      return [pscustomobject]@{ state = 'unknown'; reason = 'audncode-ingress-fallback-pending' }
+    }
+  }
+  if ($pendingCount -gt $AudnCodeLifecycleMaxPendingTokens) { return $unknown }
+  return [pscustomobject]@{ state = 'clear'; reason = 'audncode-ingress-fallback-clear' }
+}
+
+function Wait-AudnCodePromotionFallbackReadTestBarrier {
+  $waitMilliseconds = 0
+  $markerPath = [string]$env:CODEX_NTFY_TEST_AFTER_PROMOTION_FALLBACK_READ_MARKER
+  $releasePath = [string]$env:CODEX_NTFY_TEST_AFTER_PROMOTION_FALLBACK_READ_RELEASE
+  if ([string]::IsNullOrWhiteSpace($markerPath) -or [string]::IsNullOrWhiteSpace($releasePath) -or
+      -not [int]::TryParse([string]$env:CODEX_NTFY_TEST_AFTER_PROMOTION_FALLBACK_READ_MS, [ref]$waitMilliseconds) -or
+      $waitMilliseconds -le 0) { return }
+  $waitMilliseconds = [Math]::Min(10000, $waitMilliseconds)
+  [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($markerPath))) | Out-Null
+  [IO.File]::WriteAllText($markerPath, 'fallback-read', $Utf8NoBom)
+  $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($waitMilliseconds)
+  while (-not (Test-Path -LiteralPath $releasePath -PathType Leaf) -and
+      [DateTimeOffset]::UtcNow -lt $deadline) {
+    Start-Sleep -Milliseconds 25
+  }
+}
+
+function Get-AudnCodePromotionLifecycleGuardSet {
+  param([object]$SessionState)
+
+  if ($null -eq $SessionState) { return $null }
+  $audnCodeHomePath = [string](Get-ObjectValue $SessionState 'audncode_home' '')
+  $sessionId = [string](Get-ObjectValue $SessionState 'session_id' '')
+  $hostPid = [int](Get-ObjectValue $SessionState 'audncode_host_pid' 0)
+  $hostStartedUnixMs = [int64](Get-ObjectValue $SessionState 'audncode_host_started_unix_ms' 0)
+  if ([string]::IsNullOrWhiteSpace($audnCodeHomePath) -or [string]::IsNullOrWhiteSpace($sessionId) -or
+      $hostPid -le 0 -or $hostStartedUnixMs -le 0) { return $null }
+  $ingressFallbackInfo = Get-AudnCodeIngressFallbackInfo -HomePath $audnCodeHomePath
+  if ($null -eq $ingressFallbackInfo) { return $null }
+
+  $hostSession = Get-AudnCodeHostSession `
+    -SessionId $sessionId `
+    -HomePath $audnCodeHomePath `
+    -ExpectedHostPid $hostPid `
+    -ExpectedHostStartedUnixMs $hostStartedUnixMs `
+    -AllowExitedHost
+  if (-not [bool]$hostSession.ok -or [int]$hostSession.pid -ne $hostPid -or
+      [int64]$hostSession.started_unix_ms -ne $hostStartedUnixMs) { return $null }
+  if (-not [bool]$hostSession.live) {
+    return [pscustomobject]@{
+      mode = 'exited'
+      ingress_fallback = $ingressFallbackInfo
+      host_pid = $hostPid
+      host_started_unix_ms = $hostStartedUnixMs
+      finality = Get-AudnCodeExitedHostFinalityState `
+        -SessionState $SessionState `
+        -LockedSessionState $SessionState
+    }
+  }
+
+  # A live host can still mutate its process-bound registries. The session
+  # lock owned by Commit-PendingRecord makes this the final fail-closed check
+  # before the per-home fallback, three host guards, and queue move. Exited
+  # hosts are deliberately handled above by their durable-evidence gate.
+  $promptPrearmProperty = $SessionState.PSObject.Properties['audncode_prompt_prearm_pending']
+  $backgroundRegistryProperty = $SessionState.PSObject.Properties['audncode_background_registry_valid']
+  $backgroundLifecycleProperty = $SessionState.PSObject.Properties['audncode_background_lifecycle_unverifiable']
+  $cronRegistryProperty = $SessionState.PSObject.Properties['audncode_cron_registry_valid']
+  $cronLifecycleProperty = $SessionState.PSObject.Properties['audncode_cron_lifecycle_unverifiable']
+  $backgroundPendingState = Get-AudnCodeSessionLifecyclePendingTokenState `
+    -Record $SessionState `
+    -RegistryKind 'background'
+  $cronPendingState = Get-AudnCodeSessionLifecyclePendingTokenState `
+    -Record $SessionState `
+    -RegistryKind 'cron'
+  if ($null -eq $promptPrearmProperty -or $promptPrearmProperty.Value -isnot [bool] -or
+      [bool]$promptPrearmProperty.Value -or
+      $null -eq $backgroundRegistryProperty -or $backgroundRegistryProperty.Value -isnot [bool] -or
+      -not [bool]$backgroundRegistryProperty.Value -or
+      $null -eq $backgroundLifecycleProperty -or $backgroundLifecycleProperty.Value -isnot [bool] -or
+      [bool]$backgroundLifecycleProperty.Value -or
+      -not [bool](Get-ObjectValue $backgroundPendingState 'valid' $false) -or
+      @((Get-ObjectValue $backgroundPendingState 'tokens' @())).Count -gt 0 -or
+      $null -eq $cronRegistryProperty -or $cronRegistryProperty.Value -isnot [bool] -or
+      -not [bool]$cronRegistryProperty.Value -or
+      $null -eq $cronLifecycleProperty -or $cronLifecycleProperty.Value -isnot [bool] -or
+      [bool]$cronLifecycleProperty.Value -or
+      -not [bool](Get-ObjectValue $cronPendingState 'valid' $false) -or
+      @((Get-ObjectValue $cronPendingState 'tokens' @())).Count -gt 0) {
+    return $null
+  }
+
+  $ingressFallbackState = Get-AudnCodeIngressFallbackState `
+    -HomePath $audnCodeHomePath `
+    -HostStartedUnixMs $hostStartedUnixMs
+  if ([string](Get-ObjectValue $ingressFallbackState 'state' 'unknown') -ne 'clear') {
+    return $null
+  }
+  Wait-AudnCodePromotionFallbackReadTestBarrier
+
+  $backgroundRuntime = Get-AudnCodeRuntimeStateInfo `
+    -HomePath $audnCodeHomePath `
+    -HostPid $hostPid `
+    -HostStartedUnixMs $hostStartedUnixMs
+  if ($null -eq $backgroundRuntime -or
+      [string]$backgroundRuntime.key -ne [string](Get-ObjectValue $SessionState 'audncode_runtime_key' '')) {
+    return $null
+  }
+
+  $cronRuntime = Get-AudnCodeCronRuntimeStateInfo `
+    -HomePath $audnCodeHomePath `
+    -HostPid $hostPid `
+    -HostStartedUnixMs $hostStartedUnixMs `
+    -HookGeneration ([string](Get-ObjectValue $SessionState 'audncode_cron_hook_generation' '')) `
+    -HookInstalledUnixMs ([int64](Get-ObjectValue $SessionState 'audncode_cron_hook_installed_unix_ms' 0)) `
+    -ObservationAllowed $true
+  if ($null -eq $cronRuntime -or
+      [string]$cronRuntime.key -ne [string](Get-ObjectValue $SessionState 'audncode_cron_runtime_key' '')) {
+    return $null
+  }
+
+  $ingressGuard = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $backgroundRuntime -RegistryKind 'ingress'
+  $backgroundGuard = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $backgroundRuntime -RegistryKind 'background'
+  $cronGuard = Get-AudnCodeLifecycleGuardInfo -RuntimeInfo $cronRuntime -RegistryKind 'cron'
+  if ($null -eq $ingressGuard -or $null -eq $backgroundGuard -or $null -eq $cronGuard) { return $null }
+  return [pscustomobject]@{
+    mode = 'live'
+    ingress_fallback = $ingressFallbackInfo
+    host_pid = $hostPid
+    host_started_unix_ms = $hostStartedUnixMs
+    ingress = $ingressGuard
+    background = $backgroundGuard
+    cron = $cronGuard
+  }
+}
+
+function Get-AudnCodeStopFailureGoalCommitGate {
+  param(
+    [object]$Record,
+    [object]$SessionState
+  )
+
+  $retry = [pscustomobject]@{ state = 'retry'; reason = 'claude-goal-state-unverifiable' }
+  $unverifiable = [pscustomobject]@{ state = 'unverifiable'; reason = 'claude-goal-record-oversize' }
+  $cancelled = [pscustomobject]@{ state = 'cancelled'; reason = 'claude-goal-cleared' }
+  $ready = [pscustomobject]@{ state = 'ready'; reason = 'claude-goal-finality-reconfirmed' }
+  $recordState = ([string](Get-ObjectValue $Record 'claude_goal_state' '')).Trim().ToLowerInvariant()
+  $recordMarker = [string](Get-ObjectValue $Record 'claude_goal_marker' '')
+  if ($recordState -notin @('none', 'unknown', 'active', 'achieved', 'failed', 'cleared', 'unverifiable')) {
+    return $retry
+  }
+  if ($recordState -eq 'unverifiable') { return $unverifiable }
+  if ($recordState -eq 'cleared') { return $cancelled }
+
+  $latest = Get-ClaudeGoalTranscriptState `
+    -TranscriptPath ([string](Get-ObjectValue $Record 'candidate_rollout_path' ''))
+  $latestState = ([string](Get-ObjectValue $latest 'state' 'unknown')).Trim().ToLowerInvariant()
+  $latestMarker = [string](Get-ObjectValue $latest 'marker' '')
+  if ($latestState -eq 'unverifiable') { return $unverifiable }
+  if ($latestState -in @('unknown', 'active') -or
+      $latestState -notin @('none', 'achieved', 'failed', 'cleared')) { return $retry }
+
+  if ($recordState -eq 'active') {
+    $terminalTransition = $latestState -in @('achieved', 'failed', 'cleared') -and
+      -not [string]::IsNullOrWhiteSpace($recordMarker) -and
+      -not [string]::IsNullOrWhiteSpace($latestMarker) -and
+      $latestMarker -ne $recordMarker
+    if (-not $terminalTransition) { return $retry }
+    if ($latestState -eq 'cleared') { return $cancelled }
+    Set-RecordValue -Record $Record -Name 'goal_status' -Value $(if ($latestState -eq 'failed') { 'blocked' } else { 'complete' })
+    return $ready
+  }
+
+  if ($latestState -eq 'none') {
+    if ($recordState -in @('none', 'unknown')) { return $ready }
+    # A terminal marker disappearing inside the same prompt is a rewind or an
+    # unstable snapshot, never evidence that finality became weaker but safe.
+    return $retry
+  }
+
+  $isCurrentTerminal = $true
+  if ($recordState -eq 'unknown') {
+    $recordEpoch = [int64](Get-ObjectValue $Record 'claude_session_epoch' 0)
+    $stateEpoch = [int64](Get-ObjectValue $SessionState 'epoch' 0)
+    $baselineCaptured = [bool](Get-ObjectValue $SessionState 'goal_baseline_captured' $false)
+    $baselineMarker = [string](Get-ObjectValue $SessionState 'goal_baseline_marker' '')
+    $isCurrentTerminal = $recordEpoch -gt 0 -and $stateEpoch -eq $recordEpoch -and
+      $baselineCaptured -and -not [string]::IsNullOrWhiteSpace($latestMarker) -and
+      $latestMarker -ne $baselineMarker
+  }
+  if ($latestState -eq 'cleared') {
+    if ($recordState -eq 'unknown' -and -not $isCurrentTerminal) { return $ready }
+    return $cancelled
+  }
+  if ($recordState -ne 'unknown' -or $isCurrentTerminal) {
+    Set-RecordValue -Record $Record -Name 'goal_status' -Value $(if ($latestState -eq 'failed') { 'blocked' } else { 'complete' })
+  }
+  return $ready
+}
+
 function Commit-PendingRecord {
   param(
     [string]$Path,
@@ -4334,6 +14559,167 @@ function Commit-PendingRecord {
         return [pscustomobject]@{ status = 'stale-session' }
       }
       return $discard
+    }
+    $lockedCandidateKind = [string](Get-ObjectValue $lockedRecord 'candidate_kind' '')
+    if ([bool]$shouldPromote -and $lockedCandidateKind -eq 'audncode_stop_failure') {
+      $failureProof = Test-AudnCodeStopFailureRecordProof -Record $lockedRecord -SessionState $sessionState
+      if (-not [bool](Get-ObjectValue $failureProof 'ok' $false)) {
+        if ([string](Get-ObjectValue $failureProof 'reason' '') -eq
+            'audncode-stop-failure-proof-ambiguous') {
+          Set-RecordValue -Record $sessionState -Name 'audncode_stop_failure_ambiguous' -Value $true
+          Write-JsonAtomic -Path $lockedInfo.path -Value $sessionState
+          Set-RecordValue -Record $lockedRecord -Name 'audncode_stop_failure_ambiguous' -Value $true
+        }
+        return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $lockedPath -Record $lockedRecord
+      }
+      $goalCommitGate = Get-AudnCodeStopFailureGoalCommitGate `
+        -Record $lockedRecord `
+        -SessionState $sessionState
+      $goalCommitState = [string](Get-ObjectValue $goalCommitGate 'state' 'retry')
+      if ($goalCommitState -eq 'unverifiable') {
+        return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $lockedPath -Record $lockedRecord
+      }
+      if ($goalCommitState -eq 'cancelled') {
+        $discard = Discard-PendingRecord -Path $lockedPath -Record $lockedRecord
+        if ([string](Get-ObjectValue $discard 'status' '') -in @('discarded', 'missing')) {
+          return [pscustomobject]@{ status = 'audncode-goal-cancelled' }
+        }
+        return $discard
+      }
+      if ($goalCommitState -ne 'ready') {
+        return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+      }
+    }
+    if ([bool]$shouldPromote -and
+        $lockedCandidateKind -in @('audncode_stop', 'audncode_stop_failure')) {
+      $guardSet = Get-AudnCodePromotionLifecycleGuardSet -SessionState $sessionState
+      if ($null -eq $guardSet) {
+        return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+      }
+      if ([string](Get-ObjectValue $guardSet 'mode' '') -eq 'exited') {
+        $exitedFinality = Get-ObjectValue $guardSet 'finality'
+        if ([string](Get-ObjectValue $exitedFinality 'state' 'unknown') -ne 'idle') {
+          return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+        }
+        # Reacquire the per-home fallback after finality read and retain it
+        # through the move. A resumed/new host either left a pending discovery
+        # token or already published a conflicting host marker; both states are
+        # rechecked while its next hook cannot start a new transfer.
+        return Invoke-WithClaudeSessionLock -Info $guardSet.ingress_fallback -Action {
+          param($lockedFallback, $lockedHostPid, $lockedHostStartedUnixMs, $lockedPath, $lockedRecord, $lockedSessionState)
+          $finalFallback = Get-AudnCodeLockedIngressFallbackState `
+            -FallbackInfo $lockedFallback `
+            -HostStartedUnixMs $lockedHostStartedUnixMs
+          if ([string](Get-ObjectValue $finalFallback 'state' 'unknown') -ne 'clear') {
+            return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+          }
+          $finalHost = Get-AudnCodeHostSession `
+            -SessionId ([string](Get-ObjectValue $lockedSessionState 'session_id' '')) `
+            -HomePath ([string]$lockedFallback.home) `
+            -ExpectedHostPid $lockedHostPid `
+            -ExpectedHostStartedUnixMs $lockedHostStartedUnixMs `
+            -AllowExitedHost
+          if (-not [bool](Get-ObjectValue $finalHost 'ok' $false) -or
+              [bool](Get-ObjectValue $finalHost 'live' $true) -or
+              [int](Get-ObjectValue $finalHost 'pid' 0) -ne $lockedHostPid -or
+              [int64](Get-ObjectValue $finalHost 'started_unix_ms' 0) -ne $lockedHostStartedUnixMs) {
+            return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+          }
+          return Invoke-PendingRecordCommit -Path $lockedPath -Record $lockedRecord -Promote
+        } -Arguments @($guardSet.ingress_fallback, [int]$guardSet.host_pid, [int64]$guardSet.host_started_unix_ms, $lockedPath, $lockedRecord, $sessionState)
+      }
+      if ([string](Get-ObjectValue $guardSet 'mode' '') -ne 'live') {
+        return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+      }
+      # Fixed global order: session -> per-home ingress fallback -> ingress
+      # guard -> background guard -> cron guard -> record. Ingress hooks never
+      # retain one lock while acquiring the next: fallback arm, host arm, and
+      # fallback commit are separate critical sections. Holding the fallback
+      # here therefore cannot deadlock them, and makes a new hook linearize
+      # either before this final read or after the pending-record move.
+      return Invoke-WithClaudeSessionLock -Info $guardSet.ingress_fallback -Action {
+        param($lockedFallback, $lockedHostStartedUnixMs, $lockedIngressGuard, $lockedBackgroundGuard, $lockedCronGuard, $lockedPath, $lockedRecord, $lockedSessionState, $lockedSessionInfo)
+        $finalFallback = Get-AudnCodeLockedIngressFallbackState `
+          -FallbackInfo $lockedFallback `
+          -HostStartedUnixMs $lockedHostStartedUnixMs
+        if ([string](Get-ObjectValue $finalFallback 'state' 'unknown') -ne 'clear') {
+          return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+        }
+        $finalHost = Get-AudnCodeHostSession `
+          -SessionId ([string](Get-ObjectValue $lockedSessionState 'session_id' '')) `
+          -HomePath ([string]$lockedFallback.home) `
+          -ExpectedHostPid ([int]$lockedIngressGuard.pid) `
+          -ExpectedHostStartedUnixMs $lockedHostStartedUnixMs `
+          -AllowExitedHost
+        if (-not [bool](Get-ObjectValue $finalHost 'ok' $false) -or
+            -not [bool](Get-ObjectValue $finalHost 'live' $false) -or
+            [int](Get-ObjectValue $finalHost 'pid' 0) -ne [int]$lockedIngressGuard.pid -or
+            [int64](Get-ObjectValue $finalHost 'started_unix_ms' 0) -ne $lockedHostStartedUnixMs) {
+          return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+        }
+        return Invoke-WithClaudeSessionLock -Info $lockedIngressGuard -Action {
+          param($lockedIngressGuardInner, $lockedBackgroundGuard, $lockedCronGuard, $lockedPath, $lockedRecord, $lockedSessionState, $lockedSessionInfo)
+          return Invoke-WithClaudeSessionLock -Info $lockedBackgroundGuard -Action {
+            param($lockedIngressGuardNext, $lockedBackgroundGuardInner, $lockedCronGuardInner, $lockedPathInner, $lockedRecordInner, $lockedSessionStateInner, $lockedSessionInfoInner)
+            return Invoke-WithClaudeSessionLock -Info $lockedCronGuardInner -Action {
+              param($lockedIngressGuardFinal, $lockedBackgroundGuardFinal, $lockedCronGuardFinal, $lockedPathFinal, $lockedRecordFinal, $lockedSessionStateFinal, $lockedSessionInfoFinal)
+              $ingressState = Get-AudnCodeLifecycleGuardState -GuardInfo $lockedIngressGuardFinal
+              $backgroundState = Get-AudnCodeLifecycleGuardState -GuardInfo $lockedBackgroundGuardFinal
+              $cronState = Get-AudnCodeLifecycleGuardState -GuardInfo $lockedCronGuardFinal
+              if ([string](Get-ObjectValue $ingressState 'state' 'unknown') -ne 'clear' -or
+                  [string](Get-ObjectValue $backgroundState 'state' 'unknown') -ne 'clear' -or
+                  [string](Get-ObjectValue $cronState 'state' 'unknown') -ne 'clear') {
+                return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+              }
+              $finalBackground = Get-AudnCodeBackgroundState `
+                -SessionId ([string](Get-ObjectValue $lockedRecordFinal 'thread_id' '')) `
+                -TranscriptPath ([string](Get-ObjectValue $lockedRecordFinal 'candidate_rollout_path' '')) `
+                -HomePath ([string](Get-ObjectValue $lockedSessionStateFinal 'audncode_home' '')) `
+                -LockedSessionState $lockedSessionStateFinal
+              if ([string](Get-ObjectValue $finalBackground 'state' 'unknown') -ne 'idle') {
+                return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+              }
+              if ([string](Get-ObjectValue $lockedRecordFinal 'candidate_kind' '') -eq 'audncode_stop_failure') {
+                $finalProof = Test-AudnCodeStopFailureRecordProof `
+                  -Record $lockedRecordFinal `
+                  -SessionState $lockedSessionStateFinal
+                if (-not [bool](Get-ObjectValue $finalProof 'ok' $false)) {
+                  if ([string](Get-ObjectValue $finalProof 'reason' '') -eq
+                      'audncode-stop-failure-proof-ambiguous') {
+                    Set-RecordValue -Record $lockedSessionStateFinal -Name 'audncode_stop_failure_ambiguous' -Value $true
+                    Write-JsonAtomic -Path $lockedSessionInfoFinal.path -Value $lockedSessionStateFinal
+                    Set-RecordValue -Record $lockedRecordFinal -Name 'audncode_stop_failure_ambiguous' -Value $true
+                    return Suppress-ClaudeSessionUnverifiablePendingRecord `
+                      -Path $lockedPathFinal `
+                      -Record $lockedRecordFinal
+                  }
+                  return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+                }
+                $finalGoalGate = Get-AudnCodeStopFailureGoalCommitGate `
+                  -Record $lockedRecordFinal `
+                  -SessionState $lockedSessionStateFinal
+                $finalGoalState = [string](Get-ObjectValue $finalGoalGate 'state' 'retry')
+                if ($finalGoalState -eq 'unverifiable') {
+                  return Suppress-ClaudeSessionUnverifiablePendingRecord `
+                    -Path $lockedPathFinal `
+                    -Record $lockedRecordFinal
+                }
+                if ($finalGoalState -eq 'cancelled') {
+                  $discard = Discard-PendingRecord -Path $lockedPathFinal -Record $lockedRecordFinal
+                  if ([string](Get-ObjectValue $discard 'status' '') -in @('discarded', 'missing')) {
+                    return [pscustomobject]@{ status = 'audncode-goal-cancelled' }
+                  }
+                  return $discard
+                }
+                if ($finalGoalState -ne 'ready') {
+                  return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
+                }
+              }
+              return Invoke-PendingRecordCommit -Path $lockedPathFinal -Record $lockedRecordFinal -Promote
+            } -Arguments @($lockedIngressGuardNext, $lockedBackgroundGuardInner, $lockedCronGuardInner, $lockedPathInner, $lockedRecordInner, $lockedSessionStateInner, $lockedSessionInfoInner)
+          } -Arguments @($lockedIngressGuardInner, $lockedBackgroundGuard, $lockedCronGuard, $lockedPath, $lockedRecord, $lockedSessionState, $lockedSessionInfo)
+        } -Arguments @($lockedIngressGuard, $lockedBackgroundGuard, $lockedCronGuard, $lockedPath, $lockedRecord, $lockedSessionState, $lockedSessionInfo)
+      } -Arguments @($guardSet.ingress_fallback, [int64]$guardSet.host_started_unix_ms, $guardSet.ingress, $guardSet.background, $guardSet.cron, $lockedPath, $lockedRecord, $sessionState, $lockedInfo)
     }
     return Invoke-PendingRecordCommit -Path $lockedPath -Record $lockedRecord -Promote:$shouldPromote
   } -Arguments @($sessionInfo, $Path, $Record, [bool]$Promote)
@@ -4508,9 +14894,30 @@ function Process-PendingCandidates {
     }
     $promote = $true
     $gate = $null
-    for ($confirmation = 1; $confirmation -le 2; $confirmation++) {
-      # The second pass is the final epoch check. It happens while the record is
-      # still pending, immediately before the durable move into the outbox.
+    for ($confirmation = 1; $confirmation -le 3; $confirmation++) {
+      # Tests can open the same race that real queue/team/task writers do: the
+      # external state changes after two successful reads but before promotion.
+      # Put that window before a third, final filesystem verification.
+      if ($confirmation -eq 3) {
+        $testPromoteDelayMs = 0
+        if ([int]::TryParse([string]$env:CODEX_NTFY_TEST_BEFORE_PROMOTE_MS, [ref]$testPromoteDelayMs) -and $testPromoteDelayMs -gt 0) {
+          $testMarker = [string]$env:CODEX_NTFY_TEST_BEFORE_PROMOTE_MARKER
+          if (-not [string]::IsNullOrWhiteSpace($testMarker)) {
+            [System.IO.File]::WriteAllText($testMarker, [string]$record.candidate_revision, $Utf8NoBom)
+          }
+          $testRelease = [string]$env:CODEX_NTFY_TEST_BEFORE_PROMOTE_RELEASE
+          if (-not [string]::IsNullOrWhiteSpace($testRelease)) {
+            $testDeadline = [DateTimeOffset]::UtcNow.AddMilliseconds([Math]::Min(10000, $testPromoteDelayMs))
+            while (-not (Test-Path -LiteralPath $testRelease) -and [DateTimeOffset]::UtcNow -lt $testDeadline) {
+              Start-Sleep -Milliseconds 25
+            }
+          } else {
+            Start-Sleep -Milliseconds ([Math]::Min(10000, $testPromoteDelayMs))
+          }
+        }
+      }
+      # The third pass is the final epoch and external-state check. It happens
+      # while the record is still pending, immediately before durable promotion.
       $gate = Test-RecordIdleGate -Record $record -Config $Config
       if ($gate.state -eq 'subagent') {
         Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'subagent'
@@ -4564,24 +14971,27 @@ function Process-PendingCandidates {
     }
     if (-not $promote) { continue }
 
-    Set-RecordValue -Record $record -Name 'next_attempt_unix_ms' -Value $now
-    Set-RecordValue -Record $record -Name 'gate_reason' -Value $gate.reason
-    $testPromoteDelayMs = 0
-    if ([int]::TryParse([string]$env:CODEX_NTFY_TEST_BEFORE_PROMOTE_MS, [ref]$testPromoteDelayMs) -and $testPromoteDelayMs -gt 0) {
-      $testMarker = [string]$env:CODEX_NTFY_TEST_BEFORE_PROMOTE_MARKER
-      if (-not [string]::IsNullOrWhiteSpace($testMarker)) {
-        [System.IO.File]::WriteAllText($testMarker, [string]$record.candidate_revision, $Utf8NoBom)
+    $testAfterGateDelayMs = 0
+    if ([int]::TryParse([string]$env:CODEX_NTFY_TEST_AFTER_FINAL_GATE_MS, [ref]$testAfterGateDelayMs) -and
+        $testAfterGateDelayMs -gt 0) {
+      $testAfterGateMarker = [string]$env:CODEX_NTFY_TEST_AFTER_FINAL_GATE_MARKER
+      if (-not [string]::IsNullOrWhiteSpace($testAfterGateMarker)) {
+        [System.IO.File]::WriteAllText($testAfterGateMarker, [string]$record.candidate_revision, $Utf8NoBom)
       }
-      $testRelease = [string]$env:CODEX_NTFY_TEST_BEFORE_PROMOTE_RELEASE
-      if (-not [string]::IsNullOrWhiteSpace($testRelease)) {
-        $testDeadline = [DateTimeOffset]::UtcNow.AddMilliseconds([Math]::Min(10000, $testPromoteDelayMs))
-        while (-not (Test-Path -LiteralPath $testRelease) -and [DateTimeOffset]::UtcNow -lt $testDeadline) {
+      $testAfterGateRelease = [string]$env:CODEX_NTFY_TEST_AFTER_FINAL_GATE_RELEASE
+      if (-not [string]::IsNullOrWhiteSpace($testAfterGateRelease)) {
+        $testAfterGateDeadline = [DateTimeOffset]::UtcNow.AddMilliseconds([Math]::Min(10000, $testAfterGateDelayMs))
+        while (-not (Test-Path -LiteralPath $testAfterGateRelease) -and
+            [DateTimeOffset]::UtcNow -lt $testAfterGateDeadline) {
           Start-Sleep -Milliseconds 25
         }
       } else {
-        Start-Sleep -Milliseconds ([Math]::Min(10000, $testPromoteDelayMs))
+        Start-Sleep -Milliseconds ([Math]::Min(10000, $testAfterGateDelayMs))
       }
     }
+
+    Set-RecordValue -Record $record -Name 'next_attempt_unix_ms' -Value $now
+    Set-RecordValue -Record $record -Name 'gate_reason' -Value $gate.reason
     $commit = Commit-PendingRecord -Path $file.FullName -Record $record -Promote
     if ($commit.status -in @('promoted', 'already-promoted')) {
       Write-RuntimeLog "idle candidate promoted key=$($record.key.Substring(0, 12)) reason=$($gate.reason)"
@@ -4591,6 +15001,10 @@ function Process-PendingCandidates {
       Write-RuntimeLog "suppressed Claude candidate with unverifiable session state key=$($record.key.Substring(0, 12))"
     } elseif ($commit.status -eq 'stale-session') {
       Write-RuntimeLog "discarded stale Claude candidate before promotion key=$($record.key.Substring(0, 12))"
+    } elseif ($commit.status -eq 'audncode-lifecycle-retry') {
+      $lifecycleRetryAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 250
+      if ($null -eq $nextDue -or $lifecycleRetryAt -lt $nextDue) { $nextDue = $lifecycleRetryAt }
+      Write-RuntimeLog "deferred AudnCode candidate because lifecycle changed before promotion key=$($record.key.Substring(0, 12))"
     }
   }
   return [pscustomobject]@{ nextDueUnixMs = $nextDue }
@@ -4630,6 +15044,10 @@ function Write-RolloutScanHealth {
         last_completed_at = $lastCompletedAt
         last_duration_ms = $lastDurationMs
         observed = $Observed
+        bytes_read = [int64]$script:RolloutWatchBytesRead
+        backlog_files = [int]$script:RolloutWatchBacklogFiles
+        truncated_replays = [int]$script:RolloutWatchTruncatedReplays
+        corrupt_files = [int]$script:RolloutWatchCorruptFiles
         error = $ErrorText
       })
   } catch {
@@ -4668,6 +15086,17 @@ function Invoke-RolloutScanWorker {
       if (-not (Test-RolloutScanParentAlive)) {
         return 0
       }
+      if ($ScanScope -eq 'Remote' -and $env:CODEX_NTFY_NO_SPAWN -eq '1') {
+        $testRemoteChildStartupDelayMs = 0
+        if ([int]::TryParse([string]$env:CODEX_NTFY_TEST_REMOTE_CHILD_STARTUP_DELAY_MS, [ref]$testRemoteChildStartupDelayMs) -and
+            $testRemoteChildStartupDelayMs -gt 0) {
+          Start-Sleep -Milliseconds $testRemoteChildStartupDelayMs
+        }
+      }
+      $script:RolloutWatchBytesRead = [int64]0
+      $script:RolloutWatchBacklogFiles = 0
+      $script:RolloutWatchTruncatedReplays = 0
+      $script:RolloutWatchCorruptFiles = 0
       $started = [DateTimeOffset]::Now
       $startedAt = $started.ToString('o')
       Write-RolloutScanHealth -Status 'running' -StartedAt $startedAt
@@ -4689,7 +15118,7 @@ function Invoke-RolloutScanWorker {
         }
         $durationMs = [int64][Math]::Max(0, ($completed - $started).TotalMilliseconds)
         Write-RolloutScanHealth -Status 'completed' -StartedAt $startedAt -CompletedAt $completed.ToString('o') -DurationMs $durationMs -Observed $observed
-        Write-RuntimeLog "rollout scan completed scope=$($ScanScope.ToLowerInvariant()) observed=$observed duration_ms=$durationMs"
+        Write-RuntimeLog "rollout scan completed scope=$($ScanScope.ToLowerInvariant()) observed=$observed duration_ms=$durationMs bytes_read=$($script:RolloutWatchBytesRead) backlog_files=$($script:RolloutWatchBacklogFiles)"
       } catch {
         $completed = [DateTimeOffset]::Now
         $durationMs = [int64][Math]::Max(0, ($completed - $started).TotalMilliseconds)
@@ -4790,7 +15219,10 @@ function Invoke-OutboxWorker {
   $nextRemoteWatchScanMs = [int64]0
   $scanProcess = $null
   $remoteScanProcess = $null
+  # Launch and active-scan budgets are intentionally independent. A cold
+  # powershell/UNC startup must not consume the budget for a healthy scan.
   $remoteScanStartedUnixMs = [int64]0
+  $remoteScanRunningUnixMs = [int64]0
   $deliveryProcess = $null
   $maintenanceProcess = $null
   $maintenanceStarted = $false
@@ -4856,6 +15288,7 @@ function Invoke-OutboxWorker {
         }
         $remoteScanProcess = $null
         $remoteScanStartedUnixMs = [int64]0
+        $remoteScanRunningUnixMs = [int64]0
       }
       if ($null -ne $scanProcess -and $scanProcess.HasExited) {
         if ($scanProcess.ExitCode -ne 0) {
@@ -4866,9 +15299,27 @@ function Invoke-OutboxWorker {
         $nextWatchScanMs = $nowMs + [int64]([Math]::Max(0.1, $config.watchScanSeconds) * 1000)
       }
       if ($null -ne $remoteScanProcess -and -not $remoteScanProcess.HasExited -and
-          $remoteScanStartedUnixMs -gt 0 -and
-          $nowMs -ge $remoteScanStartedUnixMs + [int64]([Math]::Max(5, $config.remoteWatchTimeoutSeconds) * 1000)) {
-        Write-RuntimeLog "remote rollout scan timed out after $([Math]::Round([Math]::Max(5, $config.remoteWatchTimeoutSeconds), 1))s"
+          $remoteScanStartedUnixMs -gt 0 -and $remoteScanRunningUnixMs -le 0) {
+        try {
+          $remoteHealth = Read-JsonFile -Path $RemoteScanHealthPath
+          $healthStartedAt = [DateTimeOffset]::MinValue
+          $healthStartedText = [string](Get-ObjectValue $remoteHealth 'started_at' '')
+          if ([string](Get-ObjectValue $remoteHealth 'status' '') -eq 'running' -and
+              [int](Get-ObjectValue $remoteHealth 'pid' 0) -eq $remoteScanProcess.Id -and
+              [DateTimeOffset]::TryParse($healthStartedText, [ref]$healthStartedAt) -and
+              $healthStartedAt.ToUnixTimeMilliseconds() -ge $remoteScanStartedUnixMs - 1000) {
+            $remoteScanRunningUnixMs = $healthStartedAt.ToUnixTimeMilliseconds()
+          }
+        } catch {
+          # A missing/partial health file means the child is still starting.
+        }
+      }
+      $remoteTimeoutMs = [int64]([Math]::Max(5, $config.remoteWatchTimeoutSeconds) * 1000)
+      $remoteTimeoutPhase = if ($remoteScanRunningUnixMs -gt 0) { 'scan' } else { 'startup' }
+      $remoteTimeoutOriginMs = if ($remoteScanRunningUnixMs -gt 0) { $remoteScanRunningUnixMs } else { $remoteScanStartedUnixMs }
+      if ($null -ne $remoteScanProcess -and -not $remoteScanProcess.HasExited -and
+          $remoteTimeoutOriginMs -gt 0 -and $nowMs -ge $remoteTimeoutOriginMs + $remoteTimeoutMs) {
+        Write-RuntimeLog "remote rollout scan timed out phase=$remoteTimeoutPhase after $([Math]::Round([Math]::Max(5, $config.remoteWatchTimeoutSeconds), 1))s"
         Stop-Process -Id $remoteScanProcess.Id -Force -ErrorAction SilentlyContinue
         try {
           $remoteHealth = if (Test-Path -LiteralPath $RemoteScanHealthPath) { Read-JsonFile -Path $RemoteScanHealthPath } else { [pscustomobject]@{} }
@@ -4879,13 +15330,15 @@ function Invoke-OutboxWorker {
               pid = $remoteScanProcess.Id
               started_at = [string](Get-ObjectValue $remoteHealth 'started_at' '')
               completed_at = [DateTimeOffset]::Now.ToString('o')
-              duration_ms = [int64]([Math]::Max(5, $config.remoteWatchTimeoutSeconds) * 1000)
+              duration_ms = [int64][Math]::Max(0, $nowMs - $remoteTimeoutOriginMs)
               observed = 0
-              error = 'remote scan timeout'
+              timeout_phase = $remoteTimeoutPhase
+              error = if ($remoteTimeoutPhase -eq 'startup') { 'remote scan startup timeout' } else { 'remote scan timeout' }
             })
         } catch {
         }
         $remoteScanStartedUnixMs = [int64]0
+        $remoteScanRunningUnixMs = [int64]0
       }
       if ($null -ne $remoteScanProcess -and $remoteScanProcess.HasExited) {
         if ($remoteScanProcess.ExitCode -ne 0) {
@@ -4894,6 +15347,7 @@ function Invoke-OutboxWorker {
         $remoteScanProcess.Dispose()
         $remoteScanProcess = $null
         $remoteScanStartedUnixMs = [int64]0
+        $remoteScanRunningUnixMs = [int64]0
         $nextRemoteWatchScanMs = $nowMs + [int64]([Math]::Max(5, $config.watchDiscoverySeconds) * 1000)
       }
       if (-not $DeliveryOnly -and $Continuous -and $config.watchRollouts -and $null -eq $scanProcess -and $nowMs -ge $nextWatchScanMs) {
@@ -4908,10 +15362,10 @@ function Invoke-OutboxWorker {
         if ($null -eq $remoteScanProcess) {
           $nextRemoteWatchScanMs = $nowMs + [int64]([Math]::Max(5, $config.watchDiscoverySeconds) * 1000)
         } else {
-          # Process startup can itself be slow under load. Start the timeout
-          # budget only after Start-Process has returned, not from the stale
-          # loop timestamp captured before local work and child creation.
+          # Start the startup budget only after Start-Process returned a child.
+          # Slow process creation must not consume the child's startup window.
           $remoteScanStartedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $remoteScanRunningUnixMs = [int64]0
         }
       }
       if (-not $DeliveryOnly -and $Continuous -and -not $deliveryReadyForMaintenance) {
@@ -5008,7 +15462,9 @@ function Invoke-OutboxWorker {
             if ([string]::IsNullOrWhiteSpace($sessionHome)) {
               $sessionHome = $CodexHome
             }
-            $classification = Get-EventClassification -Event $record.event -ThreadId ([string]$record.thread_id) -SessionHome $sessionHome
+            $sqliteHome = [string](Get-ObjectValue $record 'session_sqlite_home' $sessionHome)
+            if ([string]::IsNullOrWhiteSpace($sqliteHome)) { $sqliteHome = $sessionHome }
+            $classification = Get-EventClassification -Event $record.event -ThreadId ([string]$record.thread_id) -SessionHome $sessionHome -SqliteHome $sqliteHome
           }
           if ($classification -eq 'subagent') {
             Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'subagent'
@@ -5273,6 +15729,7 @@ function Show-Doctor {
   $result | ConvertTo-Json -Depth 5
 }
 
+$audnCodeIngressArm = $null
 try {
   Ensure-RuntimeDirectories
   if ($Doctor) {
@@ -5293,6 +15750,34 @@ try {
     exit (Invoke-OutboxWorker)
   }
 
+  if ($AudnCodeHook) {
+    if ([string]::IsNullOrWhiteSpace($AudnCodeExpectedEvent)) {
+      [void](Set-AudnCodeIngressFallbackLost `
+          -HomePath $AudnCodeHome `
+          -HookStartTicks $HookProcessStartUtcTicks `
+          -Reason 'audncode-hook-missing-trusted-expected-event')
+      Write-RuntimeLog 'ignored AudnCode hook without trusted expected event'
+      Write-Output '{}'
+      exit 0
+    }
+    if ($AudnCodeExpectedEvent -in @('SessionStart', 'UserPromptSubmit', 'PostToolUse', 'SubagentStart')) {
+      # This durable token precedes every stdin read and JSON parse. A killed,
+      # oversized, malformed, or invalidly encoded hook therefore cannot leave
+      # an already-pending completion free to promote.
+      $audnCodeIngressArm = Start-AudnCodeIngressMutation `
+        -ExpectedEvent $AudnCodeExpectedEvent `
+        -HomePath $AudnCodeHome `
+        -HookStartTicks $HookProcessStartUtcTicks
+      if (-not [bool](Get-ObjectValue $audnCodeIngressArm 'armed' $false) -and
+          -not [bool](Get-ObjectValue $audnCodeIngressArm 'fallback_lost' $false)) {
+        [void](Set-AudnCodeIngressFallbackLost `
+            -HomePath $AudnCodeHome `
+            -HookStartTicks $HookProcessStartUtcTicks `
+            -Reason 'audncode-ingress-could-not-arm-before-parse')
+      }
+    }
+  }
+
   $raw = if ($Test) {
     ConvertTo-CompactJson ([ordered]@{
       type = 'agent-turn-complete'
@@ -5306,93 +15791,708 @@ try {
   }
   $event = ConvertTo-NotificationEvent -Raw $raw
   if ($null -eq $event) {
-    if ($HookEvent -or $ClaudeHook) { Write-Output '{}' }
+    if ($null -ne $audnCodeIngressArm) {
+      [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail)
+    }
+    if ($HookEvent -or $ClaudeHook -or $AudnCodeHook) { Write-Output '{}' }
     exit 0
   }
   $candidateKind = 'legacy'
   $provider = 'codex'
   $sourceEvent = 'agent-turn-complete'
-  if ($ClaudeHook) {
+  if ($ClaudeHook -or $AudnCodeHook) {
+    $isAudnCode = [bool]$AudnCodeHook
+    $hostLabel = if ($isAudnCode) { 'AudnCode' } else { 'Claude' }
     $hookInput = $event
     $hookName = [string](Get-FirstObjectValue $hookInput @('hook_event_name', 'hook-event-name', 'hookEventName', 'event_name', 'eventName', 'type'))
     $sessionId = [string](Get-FirstObjectValue $hookInput @('session_id', 'session-id', 'sessionId'))
     $promptId = [string](Get-FirstObjectValue $hookInput @('prompt_id', 'prompt-id', 'promptId'))
     $agentId = [string](Get-FirstObjectValue $hookInput @('agent_id', 'agent-id', 'agentId'))
     $transcriptPath = [string](Get-FirstObjectValue $hookInput @('transcript_path', 'transcript-path', 'transcriptPath'))
-    if ($hookName -eq 'UserPromptSubmit') {
-      if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
-        [void](Set-ClaudeSessionBusy -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath)
+    if ($isAudnCode -and
+        -not [string]::Equals($hookName, $AudnCodeExpectedEvent, [StringComparison]::Ordinal)) {
+      if ($null -ne $audnCodeIngressArm) {
+        [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail)
       } else {
-        Write-RuntimeLog 'ignored Claude UserPromptSubmit without session_id'
+        [void](Set-AudnCodeIngressFallbackLost `
+            -HomePath $AudnCodeHome `
+            -HookStartTicks $HookProcessStartUtcTicks `
+            -Reason 'audncode-hook-event-did-not-match-trusted-installer-event')
+      }
+      Write-RuntimeLog 'ignored AudnCode hook whose payload event mismatched its trusted installer event'
+      Write-Output '{}'
+      exit 0
+    }
+    if ($isAudnCode -and $hookName -eq 'SessionStart') {
+      $sourceProperty = $hookInput.PSObject.Properties['source']
+      $sessionStartSource = if ($null -ne $sourceProperty -and $sourceProperty.Value -is [string]) {
+        [string]$sourceProperty.Value
+      } else { '' }
+      $validSessionStart = @('startup', 'resume', 'clear') -ccontains $sessionStartSource -and
+        [string]::IsNullOrWhiteSpace($agentId) -and
+        -not [string]::IsNullOrWhiteSpace($sessionId) -and
+        (Test-AudnCodeTranscriptPath `
+          -SessionId $sessionId `
+          -TranscriptPath $transcriptPath `
+          -AllowMissing)
+      $busyEpoch = [int64]0
+      if ($validSessionStart) {
+        # AudnCode bypasses UserPromptSubmit for some direct initial plan and
+        # complex-content queries. This placeholder has no candidate of its
+        # own; it only establishes the exact host-bound busy epoch and stable
+        # transcript cursor that the later Stop/StopFailure must prove.
+        $busyEpoch = Set-ClaudeSessionBusy `
+          -SessionId $sessionId `
+          -PromptId ([Guid]::NewGuid().ToString()) `
+          -TranscriptPath $transcriptPath `
+          -HookStartTicks $HookProcessStartUtcTicks `
+          -AudnCodeTerminalClaims @() `
+          -AudnCodeHomePath $AudnCodeHome `
+          -AudnCodeIngressHostPid ([int](Get-ObjectValue $audnCodeIngressArm 'host_pid' 0)) `
+          -AudnCodeIngressHostStartedUnixMs ([int64](Get-ObjectValue $audnCodeIngressArm 'host_started_unix_ms' 0)) `
+          -AudnCodeTaskListId ([string]$env:CLAUDE_CODE_TASK_LIST_ID) `
+          -AudnCodeTeamName ([string]$env:CLAUDE_CODE_TEAM_NAME) `
+          -AudnCodeBusyEventRank $AudnCodeSessionStartBusyEventRank
+      }
+      if ($validSessionStart -and $null -ne $audnCodeIngressArm) {
+        [void](Complete-AudnCodeBusyIngressHandoff `
+            -SessionId $sessionId `
+            -TranscriptPath $transcriptPath `
+            -BusyEpoch $busyEpoch `
+            -IngressArm $audnCodeIngressArm `
+            -HomePath $AudnCodeHome `
+            -HookStartTicks $HookProcessStartUtcTicks `
+            -BusyEventRank $AudnCodeSessionStartBusyEventRank `
+            -TaskListId ([string]$env:CLAUDE_CODE_TASK_LIST_ID) `
+            -TeamName ([string]$env:CLAUDE_CODE_TEAM_NAME))
+      } elseif ($null -ne $audnCodeIngressArm) {
+        [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail)
+      }
+      if (-not $validSessionStart -or $busyEpoch -le 0) {
+        Write-RuntimeLog 'ignored AudnCode SessionStart without one trusted startup, resume, or clear root lifecycle'
+      }
+      Write-Output '{}'
+      exit 0
+    }
+    if ($hookName -eq 'UserPromptSubmit') {
+      if ($isAudnCode -and [string]::IsNullOrWhiteSpace($promptId)) {
+        # AudnCode/OpenClaude 0.9.x does not expose prompt_id. Establish a
+        # private epoch identity while this ordered synchronous hook still
+        # belongs unambiguously to the submitted root prompt.
+        $promptId = [Guid]::NewGuid().ToString()
+      }
+      if (-not [string]::IsNullOrWhiteSpace($sessionId) -and
+          -not [string]::IsNullOrWhiteSpace($promptId) -and
+          (-not $isAudnCode -or (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath -AllowMissing))) {
+        $terminalClaims = if ($isAudnCode) {
+          @(Get-AudnCodeTerminalClaimsFromPrompt -Prompt ([string](Get-ObjectValue $hookInput 'prompt' '')))
+        } else { @() }
+        $remoteLaunchClaim = $false
+        if ($isAudnCode) {
+          $rawPrompt = [string](Get-ObjectValue $hookInput 'prompt' '')
+          $remoteLaunchClaim = $rawPrompt.Trim() -cmatch '^/ultrareview(?:\s|$)'
+        }
+        $busyEpoch = Set-ClaudeSessionBusy `
+          -SessionId $sessionId `
+          -PromptId $promptId `
+          -TranscriptPath $transcriptPath `
+          -HookStartTicks $(if ($isAudnCode) { $HookProcessStartUtcTicks } else { 0 }) `
+          -AudnCodeTerminalClaims $terminalClaims `
+          -AudnCodeHomePath $(if ($isAudnCode) { $AudnCodeHome } else { '' }) `
+          -AudnCodeIngressHostPid $(if ($isAudnCode) { [int](Get-ObjectValue $audnCodeIngressArm 'host_pid' 0) } else { 0 }) `
+          -AudnCodeIngressHostStartedUnixMs $(if ($isAudnCode) { [int64](Get-ObjectValue $audnCodeIngressArm 'host_started_unix_ms' 0) } else { [int64]0 }) `
+          -AudnCodeTaskListId $(if ($isAudnCode) { [string]$env:CLAUDE_CODE_TASK_LIST_ID } else { '' }) `
+          -AudnCodeTeamName $(if ($isAudnCode) { [string]$env:CLAUDE_CODE_TEAM_NAME } else { '' }) `
+          -AudnCodeRemoteLaunchClaim ([bool]$remoteLaunchClaim) `
+          -AudnCodeBusyEventRank $(if ($isAudnCode) { $AudnCodeUserPromptBusyEventRank } else { 0 })
+        if ($isAudnCode -and $null -ne $audnCodeIngressArm) {
+          [void](Complete-AudnCodeBusyIngressHandoff `
+              -SessionId $sessionId `
+              -TranscriptPath $transcriptPath `
+              -BusyEpoch $busyEpoch `
+              -IngressArm $audnCodeIngressArm `
+              -HomePath $AudnCodeHome `
+              -HookStartTicks $HookProcessStartUtcTicks `
+              -BusyEventRank $AudnCodeUserPromptBusyEventRank `
+              -TaskListId ([string]$env:CLAUDE_CODE_TASK_LIST_ID) `
+              -TeamName ([string]$env:CLAUDE_CODE_TEAM_NAME) `
+              -RemoteLaunchClaim ([bool]$remoteLaunchClaim))
+        }
+      } else {
+        if ($isAudnCode -and $null -ne $audnCodeIngressArm) {
+          [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail)
+        }
+        Write-RuntimeLog "ignored $hostLabel UserPromptSubmit without correlatable session data"
+      }
+      Write-Output '{}'
+      exit 0
+    }
+    if ($isAudnCode -and $hookName -eq 'SubagentStart') {
+      $hostLifetimeRegistered = Register-AudnCodeObservedHostLifetime `
+        -SessionId $sessionId `
+        -TranscriptPath $transcriptPath `
+        -HomePath $AudnCodeHome `
+        -HostPid ([int](Get-ObjectValue $audnCodeIngressArm 'host_pid' 0)) `
+        -HostStartedUnixMs ([int64](Get-ObjectValue $audnCodeIngressArm 'host_started_unix_ms' 0))
+      if (-not $hostLifetimeRegistered) {
+        # A resumed agent can start from a logically retired host whose exact
+        # lifetime cannot be re-registered. Continue through the background
+        # lifecycle-loss path: the old ingress guard alone is no longer in the
+        # current lifetime envelope, while the fallback below resolves the
+        # current session runtime even when its owner is already idle or lives
+        # under another AudnCode home. Runtime commits remain gated on this
+        # exact lifetime registration.
+        Write-RuntimeLog 'AudnCode SubagentStart exact host lifetime could not be registered; preserving lifecycle loss'
+      }
+      $agentTypeProperty = $hookInput.PSObject.Properties['agent_type']
+      $agentType = if ($null -ne $agentTypeProperty -and $agentTypeProperty.Value -is [string]) {
+        [string]$agentTypeProperty.Value
+      } else { '' }
+      $resumeProof = Get-AudnCodeSubagentStartResumeProof `
+        -SessionId $sessionId `
+        -TranscriptPath $transcriptPath `
+        -AgentId $agentId `
+        -AgentType $agentType `
+        -HomePath $AudnCodeHome
+      $updated = $false
+      $backgroundLifecycleArm = $null
+      if ([bool](Get-ObjectValue $resumeProof 'ok' $false) -and
+          -not [bool](Get-ObjectValue $resumeProof 'resume' $false)) {
+        $updated = [bool]$hostLifetimeRegistered
+      } elseif ([bool](Get-ObjectValue $resumeProof 'ok' $false)) {
+        $backgroundLifecycleArm = Start-AudnCodeBackgroundLifecycleMutation `
+          -SessionId $sessionId `
+          -TranscriptPath $transcriptPath `
+          -HookStartTicks $HookProcessStartUtcTicks
+        if ([bool]$hostLifetimeRegistered -and
+            [bool](Get-ObjectValue $backgroundLifecycleArm 'armed' $false)) {
+          $updated = Add-AudnCodeBackgroundIds `
+            -SessionId $sessionId `
+            -BackgroundIds @() `
+            -StartIncarnations @([pscustomobject]@{
+                id = [string](Get-ObjectValue $resumeProof 'agent_id' '')
+                receipt = [string](Get-ObjectValue $resumeProof 'receipt' '')
+              }) `
+            -TranscriptPath $transcriptPath `
+            -HookStartTicks $HookProcessStartUtcTicks `
+            -LifecycleArm $backgroundLifecycleArm
+        }
+      }
+      if (-not [bool]$updated -and
+          ($null -ne $backgroundLifecycleArm -or -not [bool]$hostLifetimeRegistered)) {
+        [void](Set-AudnCodeBackgroundLifecycleUnverifiable `
+          -SessionId $sessionId `
+          -HookStartTicks $HookProcessStartUtcTicks `
+          -LifecycleArm $backgroundLifecycleArm `
+          -Reason 'audncode-subagent-start-could-not-be-correlated-or-committed')
+      }
+      if ($null -ne $audnCodeIngressArm) {
+        [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail:(-not [bool]$updated))
+      }
+      if (-not [bool]$updated) {
+        Write-RuntimeLog 'ignored unverifiable AudnCode SubagentStart lifecycle event'
+      }
+      Write-Output '{}'
+      exit 0
+    }
+    if ($isAudnCode -and $hookName -eq 'PostToolUse') {
+      $toolName = [string](Get-ObjectValue $hookInput 'tool_name' '')
+      $hostLifetimeRegistered = Register-AudnCodeObservedHostLifetime `
+        -SessionId $sessionId `
+        -TranscriptPath $transcriptPath `
+        -HomePath $AudnCodeHome `
+        -HostPid ([int](Get-ObjectValue $audnCodeIngressArm 'host_pid' 0)) `
+        -HostStartedUnixMs ([int64](Get-ObjectValue $audnCodeIngressArm 'host_started_unix_ms' 0))
+      if (-not $hostLifetimeRegistered) {
+        # Continue through the lifecycle-loss paths below. Returning here would
+        # discard the only durable evidence that this uncorrelated launch or
+        # cron mutation may still be active, and a concurrent valid hook could
+        # then make the session appear idle. Runtime commits remain gated on
+        # this exact lifetime registration.
+        Write-RuntimeLog 'AudnCode PostToolUse exact host lifetime could not be registered; preserving lifecycle loss'
+      }
+      $cronUpdated = $true
+      $cronLifecycleArm = $null
+      if ($toolName -in @('CronCreate', 'CronDelete')) {
+        $cronLifecycleArm = Start-AudnCodeCronLifecycleMutation `
+          -SessionId $sessionId `
+          -TranscriptPath $transcriptPath `
+          -HookStartTicks $HookProcessStartUtcTicks
+        $cronUpdated = [bool]$hostLifetimeRegistered -and
+          [bool](Get-ObjectValue $cronLifecycleArm 'armed' $false) -and
+          (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath) -and
+          (Update-AudnCodeCronFromToolEvent `
+            -SessionId $sessionId `
+            -TranscriptPath $transcriptPath `
+            -HookStartTicks $HookProcessStartUtcTicks `
+            -HookInput $hookInput `
+            -LifecycleArm $cronLifecycleArm)
+      }
+      $backgroundIds = @(Get-AudnCodeBackgroundIdsFromToolEvent -HookInput $hookInput)
+      $backgroundIdsForAdd = New-Object 'System.Collections.Generic.List[string]'
+      $backgroundStartIncarnations = New-Object 'System.Collections.Generic.List[object]'
+      $backgroundLaunchIdentityValid = $true
+      $toolUseIdProperty = $hookInput.PSObject.Properties['tool_use_id']
+      $toolUseId = if ($null -ne $toolUseIdProperty -and $toolUseIdProperty.Value -is [string]) {
+        [string]$toolUseIdProperty.Value
+      } else { '' }
+      foreach ($backgroundId in $backgroundIds) {
+        if ($toolName -eq 'Agent' -and $backgroundId -match '^a[a-z0-9]{8}$') {
+          if ([string]::IsNullOrWhiteSpace($toolUseId) -or $toolUseId.Length -gt 512) {
+            $backgroundLaunchIdentityValid = $false
+            continue
+          }
+          $backgroundStartIncarnations.Add([pscustomobject]@{
+              id = $backgroundId
+              receipt = Get-Sha256Hex (
+                'audncode-agent-start/v1|' + $sessionId + '|' + $toolUseId + '|' + $backgroundId
+              )
+            })
+        } else {
+          $backgroundIdsForAdd.Add($backgroundId)
+        }
+      }
+      $completedToolIds = @(Get-AudnCodeCompletedBackgroundIdsFromToolEvent -HookInput $hookInput)
+      $toolResponse = Get-ObjectValue $hookInput 'tool_response'
+      $responseData = Get-ObjectValue $toolResponse 'data'
+      if ($null -eq $responseData) { $responseData = $toolResponse }
+      $responseStatus = ([string](Get-ObjectValue $responseData 'status' '')).Trim().ToLowerInvariant()
+      $sendMessageNeedsStickyGuard = $false
+      if ($toolName -eq 'SendMessage') {
+        $successProperty = if ($null -ne $responseData) { $responseData.PSObject.Properties['success'] } else { $null }
+        $messageProperty = if ($null -ne $responseData) { $responseData.PSObject.Properties['message'] } else { $null }
+        $sendMessageResponseValid = $null -ne $successProperty -and $successProperty.Value -is [bool] -and
+          $null -ne $messageProperty -and $messageProperty.Value -is [string] -and
+          ([string]$messageProperty.Value).Length -le 1048576
+        # A successful SendMessage can either resume a local agent or append a
+        # message to its RAM-only pendingMessages queue. Neither the resolved
+        # a-ID nor a durable consumed acknowledgement is returned. Even a later
+        # task terminal can precede consumption, so successful or malformed
+        # outcomes are intentionally sticky for this host lifetime. An exact
+        # success=false is the only authoritative no-launch/no-queue outcome.
+        if (-not $sendMessageResponseValid) {
+          $sendMessageNeedsStickyGuard = $true
+        } else {
+          $sendMessageNeedsStickyGuard = [bool]$successProperty.Value
+        }
+      }
+      $toolInput = Get-ObjectValue $hookInput 'tool_input'
+      $runInBackground = [bool](Get-ObjectValue $toolInput 'run_in_background' $false)
+      $responseIsAsync = $toolName -eq 'Agent' -and
+        (Get-ObjectValue $responseData 'isAsync' $false) -eq $true
+      $responseWasBackgrounded = $toolName -in @('Bash', 'PowerShell') -and (
+        (Get-ObjectValue $responseData 'backgroundedByUser' $false) -eq $true -or
+        (Get-ObjectValue $responseData 'assistantAutoBackgrounded' $false) -eq $true
+      )
+      $isTeammateSpawn = [string](Get-ObjectValue $hookInput 'tool_name' '') -eq 'Agent' -and
+        $responseStatus -eq 'teammate_spawned'
+      # teammate_spawned identifies an Agent Teams member, not a TaskManager
+      # LocalAgent/RemoteAgent ID. Its lifecycle is authoritative in teams/*;
+      # treating it as a malformed background launch poisons the runtime
+      # registry permanently and suppresses every later completion.
+      $claimsBackground = -not $isTeammateSpawn -and (
+        $toolName -eq 'Monitor' -or
+        $runInBackground -or
+        $responseIsAsync -or
+        $responseWasBackgrounded -or
+        $responseStatus -in @('async_launched', 'remote_launched') -or
+        -not [string]::IsNullOrWhiteSpace([string](Get-ObjectValue $responseData 'backgroundTaskId' ''))
+      )
+      $claimsBackgroundLaunch = $claimsBackground -or $sendMessageNeedsStickyGuard -or
+        -not $backgroundLaunchIdentityValid -or $backgroundIds.Count -gt 0
+      $backgroundLifecycleArm = $null
+      if ($claimsBackgroundLaunch) {
+        $backgroundLifecycleArm = Start-AudnCodeBackgroundLifecycleMutation `
+          -SessionId $sessionId `
+          -TranscriptPath $transcriptPath `
+          -HookStartTicks $HookProcessStartUtcTicks
+      }
+      $updated = $false
+      if ($claimsBackgroundLaunch -and
+          -not [bool](Get-ObjectValue $backgroundLifecycleArm 'armed' $false)) {
+        $updated = $false
+      } elseif ([bool]$hostLifetimeRegistered -and $backgroundLaunchIdentityValid -and
+          (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath) -and
+          ($backgroundIdsForAdd.Count -gt 0 -or $backgroundStartIncarnations.Count -gt 0 -or
+           $completedToolIds.Count -gt 0)) {
+        $updated = Add-AudnCodeBackgroundIds `
+          -SessionId $sessionId `
+          -BackgroundIds @($backgroundIdsForAdd.ToArray()) `
+          -StartIncarnations @($backgroundStartIncarnations.ToArray()) `
+          -CompletedIds $completedToolIds `
+          -TranscriptPath $transcriptPath `
+          -HookStartTicks $HookProcessStartUtcTicks `
+          -LifecycleArm $backgroundLifecycleArm
+      } elseif ([bool]$hostLifetimeRegistered -and $sendMessageNeedsStickyGuard -and
+          (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath)) {
+        $updated = Add-AudnCodeBackgroundIds `
+          -SessionId $sessionId `
+          -BackgroundIds @() `
+          -TranscriptPath $transcriptPath `
+          -HookStartTicks $HookProcessStartUtcTicks `
+          -LifecycleArm $backgroundLifecycleArm `
+          -MarkLocalAgentUiUncertain
+      } elseif ([bool]$hostLifetimeRegistered -and -not $backgroundLaunchIdentityValid -and
+          (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath)) {
+        $updated = Add-AudnCodeBackgroundIds `
+          -SessionId $sessionId `
+          -BackgroundIds @() `
+          -TranscriptPath $transcriptPath `
+          -HookStartTicks $HookProcessStartUtcTicks `
+          -LifecycleArm $backgroundLifecycleArm `
+          -Invalidate
+      } elseif ([bool]$hostLifetimeRegistered -and $claimsBackground -and
+          (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath)) {
+        $updated = Add-AudnCodeBackgroundIds `
+          -SessionId $sessionId `
+          -BackgroundIds @() `
+          -TranscriptPath $transcriptPath `
+          -HookStartTicks $HookProcessStartUtcTicks `
+          -LifecycleArm $backgroundLifecycleArm `
+          -Invalidate
+      } else {
+        $updated = [bool]$hostLifetimeRegistered
+      }
+      if (-not [bool]$updated) {
+        if ($claimsBackgroundLaunch) {
+          [void](Set-AudnCodeBackgroundLifecycleUnverifiable `
+            -SessionId $sessionId `
+            -HookStartTicks $HookProcessStartUtcTicks `
+            -LifecycleArm $backgroundLifecycleArm `
+            -Reason 'audncode-background-hook-could-not-be-correlated-or-committed')
+        }
+        Write-RuntimeLog 'ignored uncorrelated AudnCode background-tool lifecycle event'
+      }
+      if (-not [bool]$cronUpdated) {
+        [void](Set-AudnCodeCronLifecycleUnverifiable `
+          -SessionId $sessionId `
+          -HookStartTicks $HookProcessStartUtcTicks `
+          -LifecycleArm $cronLifecycleArm `
+          -Reason 'audncode-cron-hook-could-not-be-correlated-or-committed')
+        Write-RuntimeLog 'ignored uncorrelated AudnCode cron lifecycle event'
+      }
+      if ($null -ne $audnCodeIngressArm) {
+        if ([bool]$updated -and [bool]$cronUpdated) {
+          [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm)
+        } else {
+          [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail)
+        }
       }
       Write-Output '{}'
       exit 0
     }
     if ($hookName -eq 'Notification') {
       $notificationType = [string](Get-FirstObjectValue $hookInput @('notification_type', 'notification-type', 'notificationType'))
-      if ($notificationType -in @('idle_prompt', 'agent_completed') -and
+      $idleUpdated = $false
+      $supersededHostRetired = $false
+      if ($isAudnCode) {
+        # idle_prompt is emitted only after the complete query loop returns.
+        # Task/agent completion notifications are deliberately ignored because
+        # they can be intermediate. Require the still-pending Stop candidate so
+        # a late async idle notification cannot mark a newer prompt idle.
+        $sessionState = Read-ClaudeSessionState -SessionId $sessionId
+        $promptId = [string](Get-ObjectValue $sessionState 'prompt_id' '')
+        $sessionEpoch = [int64](Get-ObjectValue $sessionState 'epoch' 0)
+        $hostPid = [int](Get-ObjectValue $sessionState 'audncode_host_pid' 0)
+        $hostStarted = [int64](Get-ObjectValue $sessionState 'audncode_host_started_unix_ms' 0)
+        $actualHost = Get-AudnCodeHostSession -SessionId $sessionId -HomePath $AudnCodeHome
+        $actualHostPid = [int](Get-ObjectValue $actualHost 'pid' 0)
+        $actualHostStarted = [int64](Get-ObjectValue $actualHost 'started_unix_ms' 0)
+        $isCurrentHost = [bool](Get-ObjectValue $actualHost 'ok' $false) -and
+          $actualHostPid -eq $hostPid -and $actualHostStarted -eq $hostStarted
+        $hasOrderedTranscript = $notificationType -eq 'idle_prompt' -and
+          (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath) -and
+          (Test-AudnCodeTranscriptCorrelation -SessionState $sessionState -TranscriptPath $transcriptPath)
+        if ($hasOrderedTranscript -and $isCurrentHost -and
+            (Test-AudnCodePendingCandidate -SessionId $sessionId -PromptId $promptId -SessionEpoch $sessionEpoch -TranscriptPath $transcriptPath -SessionState $sessionState -IdleHookStartTicks $HookProcessStartUtcTicks)) {
+          $idleUpdated = Set-ClaudeSessionIdle -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath -NotificationType $notificationType -HookStartTicks $HookProcessStartUtcTicks
+        } elseif ($hasOrderedTranscript -and [bool](Get-ObjectValue $actualHost 'ok' $false) -and -not $isCurrentHost) {
+          # A previous live owner remains a hard gate until that exact
+          # home/PID/start lifetime supplies Stop followed by idle_prompt.
+          # Retiring it never marks the current prompt idle or creates a
+          # candidate; it only releases that one superseded lifetime.
+          $retirement = Complete-AudnCodeSupersededHostIdleProof `
+            -SessionId $sessionId `
+            -TranscriptPath $transcriptPath `
+            -HomePath $AudnCodeHome `
+            -HostPid $actualHostPid `
+            -HostStartedUnixMs $actualHostStarted `
+            -HookStartTicks $HookProcessStartUtcTicks
+          $supersededHostRetired = [bool](Get-ObjectValue $retirement 'retired' $false)
+          if (-not $supersededHostRetired) {
+            Write-RuntimeLog "kept superseded AudnCode host lifetime reason=$(Sanitize-NotificationText -Text ([string](Get-ObjectValue $retirement 'reason' 'unverifiable-terminal-pair')) -MaxLength 80)"
+          }
+        }
+      } elseif ($notificationType -in @('idle_prompt', 'agent_completed') -and
           -not [string]::IsNullOrWhiteSpace($sessionId) -and
           -not [string]::IsNullOrWhiteSpace($promptId)) {
-        [void](Set-ClaudeSessionIdle -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath -NotificationType $notificationType)
+        $idleUpdated = Set-ClaudeSessionIdle -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath -NotificationType $notificationType
+      }
+      if ([bool]$idleUpdated -or [bool]$supersededHostRetired) {
+        if ([bool]$supersededHostRetired) {
+          Write-RuntimeLog 'retired one superseded AudnCode host after trusted Stop and idle_prompt'
+        }
         Start-DetachedWorker
       } else {
-        Write-RuntimeLog "ignored unsupported or uncorrelated Claude notification type=$(Sanitize-NotificationText -Text $notificationType -MaxLength 80)"
+        Write-RuntimeLog "ignored unsupported or uncorrelated $hostLabel notification type=$(Sanitize-NotificationText -Text $notificationType -MaxLength 80)"
       }
       Write-Output '{}'
       exit 0
     }
     if ($hookName -eq 'SubagentStop' -or -not [string]::IsNullOrWhiteSpace($agentId)) {
-      Write-RuntimeLog 'ignored Claude subagent completion'
+      Write-RuntimeLog "ignored $hostLabel subagent completion"
       Write-Output '{}'
       exit 0
     }
     if ($hookName -notin @('Stop', 'StopFailure')) {
-      Write-RuntimeLog "ignored unsupported Claude hook event type=$(Sanitize-NotificationText -Text $hookName -MaxLength 80)"
+      Write-RuntimeLog "ignored unsupported $hostLabel hook event type=$(Sanitize-NotificationText -Text $hookName -MaxLength 80)"
       Write-Output '{}'
       exit 0
     }
     if ([string]::IsNullOrWhiteSpace($sessionId)) {
-      Write-RuntimeLog 'ignored unverifiable Claude completion without session_id'
+      Write-RuntimeLog "ignored unverifiable $hostLabel completion without session_id"
       Write-Output '{}'
       exit 0
     }
     $sessionState = Read-ClaudeSessionState -SessionId $sessionId
+    if ($isAudnCode -and [bool](Get-ObjectValue $sessionState 'audncode_prompt_prearm_pending' $false)) {
+      Write-RuntimeLog 'ignored AudnCode completion while prompt pre-arm is incomplete'
+      Write-Output '{}'
+      exit 0
+    }
+    if ($isAudnCode -and [string]::IsNullOrWhiteSpace($promptId)) {
+      $promptId = [string](Get-ObjectValue $sessionState 'prompt_id' '')
+    }
     if ([string]::IsNullOrWhiteSpace($promptId)) {
       # Async hooks without prompt identity cannot be correlated safely after a
       # follow-up prompt. Fail closed instead of manufacturing a weak key.
-      Write-RuntimeLog 'ignored unverifiable Claude completion without prompt_id'
+      Write-RuntimeLog "ignored unverifiable $hostLabel completion without prompt identity"
       Write-Output '{}'
       exit 0
     }
     $activePromptId = [string](Get-ObjectValue $sessionState 'prompt_id' '')
     if (-not [string]::IsNullOrWhiteSpace($activePromptId) -and $activePromptId -ne $promptId) {
-      Write-RuntimeLog 'ignored stale Claude completion for a superseded prompt'
+      Write-RuntimeLog "ignored stale $hostLabel completion for a superseded prompt"
       Write-Output '{}'
       exit 0
     }
-    if ($hookName -eq 'Stop') {
-      $backgroundProperty = $hookInput.PSObject.Properties['background_tasks']
-      $cronsProperty = $hookInput.PSObject.Properties['session_crons']
-      if ($null -eq $backgroundProperty -or $null -eq $cronsProperty -or
-          $null -eq $backgroundProperty.Value -or $null -eq $cronsProperty.Value -or
-          $backgroundProperty.Value -isnot [System.Array] -or
-          $cronsProperty.Value -isnot [System.Array]) {
-        Write-RuntimeLog 'ignored unverifiable Claude Stop without work registries'
+    if ($isAudnCode -and
+        (-not (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath) -or
+         [int64](Get-ObjectValue $sessionState 'epoch' 0) -le 0 -or
+         -not (Test-AudnCodeTranscriptCorrelation -SessionState $sessionState -TranscriptPath $transcriptPath))) {
+      Write-RuntimeLog 'ignored unverifiable AudnCode completion without ordered prompt correlation'
+      Write-Output '{}'
+      exit 0
+    }
+    if ($isAudnCode) {
+      $hostPid = [int](Get-ObjectValue $sessionState 'audncode_host_pid' 0)
+      $hostStarted = [int64](Get-ObjectValue $sessionState 'audncode_host_started_unix_ms' 0)
+      $actualHost = Get-AudnCodeHostSession -SessionId $sessionId -HomePath $AudnCodeHome
+      $actualHostPid = [int](Get-ObjectValue $actualHost 'pid' 0)
+      $actualHostStarted = [int64](Get-ObjectValue $actualHost 'started_unix_ms' 0)
+      $isCurrentHost = [bool](Get-ObjectValue $actualHost 'ok' $false) -and
+        $actualHostPid -eq $hostPid -and $actualHostStarted -eq $hostStarted
+      $busyHookStartTicks = [int64](Get-ObjectValue $sessionState 'busy_hook_start_ticks' 0)
+      try { $canonicalAudnCodeHome = [IO.Path]::GetFullPath($AudnCodeHome) } catch { $canonicalAudnCodeHome = '' }
+      $completionIsOrdered = $HookProcessStartUtcTicks -gt 0 -and
+        $busyHookStartTicks -gt 0 -and $HookProcessStartUtcTicks -gt $busyHookStartTicks
+      if ([bool](Get-ObjectValue $actualHost 'ok' $false) -and -not $isCurrentHost) {
+        $stopHookProperty = $hookInput.PSObject.Properties['stop_hook_active']
+        $trustedStopShape = $hookName -eq 'Stop' -and
+          $null -ne $stopHookProperty -and $stopHookProperty.Value -is [bool] -and
+          -not [bool]$stopHookProperty.Value
+        $registeredSupersededStop = $trustedStopShape -and $completionIsOrdered -and
+          (Register-AudnCodeSupersededHostStopProof `
+            -SessionId $sessionId `
+            -TranscriptPath $transcriptPath `
+            -HomePath $AudnCodeHome `
+            -HostPid $actualHostPid `
+            -HostStartedUnixMs $actualHostStarted `
+            -HookStartTicks $HookProcessStartUtcTicks)
+        if ($registeredSupersededStop) {
+          Write-RuntimeLog 'recorded trusted Stop for one superseded AudnCode host lifetime'
+        } else {
+          Write-RuntimeLog 'ignored delayed AudnCode completion from a superseded prompt'
+        }
         Write-Output '{}'
         exit 0
       }
-      if (@($backgroundProperty.Value).Count -gt 0 -or @($cronsProperty.Value).Count -gt 0) {
-        Remove-ClaudePendingCandidate -SessionId $sessionId -PromptId $promptId
-        Write-RuntimeLog 'ignored Claude Stop while background work remains active'
+      if (-not $isCurrentHost -or
+          [string]::IsNullOrWhiteSpace($canonicalAudnCodeHome) -or
+          -not [string]::Equals(
+            [string](Get-ObjectValue $sessionState 'audncode_home' ''),
+            $canonicalAudnCodeHome,
+            [StringComparison]::OrdinalIgnoreCase
+          ) -or
+          -not $completionIsOrdered) {
+        Write-RuntimeLog 'ignored delayed AudnCode completion from a superseded prompt'
+        Write-Output '{}'
+        exit 0
+      }
+      $hostLifetimeRefresh = Refresh-AudnCodeSessionHostLifetimes `
+        -SessionId $sessionId `
+        -HomePath $canonicalAudnCodeHome `
+        -HostPid $hostPid `
+        -HostStartedUnixMs $hostStarted
+      if (-not [bool](Get-ObjectValue $hostLifetimeRefresh 'ok' $false)) {
+        Write-RuntimeLog 'ignored AudnCode completion with unverifiable session host lifetimes'
+        Write-Output '{}'
+        exit 0
+      }
+      $sessionState = Read-ClaudeSessionState -SessionId $sessionId
+    }
+    $audnStopFailureProof = $null
+    if ($isAudnCode -and $hookName -eq 'StopFailure') {
+      $hookMarker = Get-AudnCodeCronObservationMarker `
+        -HomePath $AudnCodeHome `
+        -HostStartedUnixMs $hostStarted `
+        -HostProcessStartedUnixMs ([int64](Get-ObjectValue $sessionState 'audncode_host_process_started_unix_ms' 0))
+      if (-not [bool](Get-ObjectValue $hookMarker 'ok' $false) -or
+          -not [bool](Get-ObjectValue $hookMarker 'host_observable' $false) -or
+          [string](Get-ObjectValue $hookMarker 'generation' '') -ne
+            [string](Get-ObjectValue $sessionState 'audncode_cron_hook_generation' '') -or
+          [int64](Get-ObjectValue $hookMarker 'installed_unix_ms' 0) -ne
+            [int64](Get-ObjectValue $sessionState 'audncode_cron_hook_installed_unix_ms' 0)) {
+        Write-RuntimeLog 'ignored AudnCode StopFailure without the trusted installed hook shape'
+        Write-Output '{}'
+        exit 0
+      }
+      $payloadBinding = Get-AudnCodeStopFailureHookPayloadBinding -HookInput $hookInput
+      if (-not [bool](Get-ObjectValue $payloadBinding 'ok' $false)) {
+        Write-RuntimeLog 'ignored AudnCode StopFailure with an unverifiable payload'
+        Write-Output '{}'
+        exit 0
+      }
+      $proofEpoch = [int64](Get-ObjectValue $sessionState 'epoch' 0)
+      $proofPrompt = [string](Get-ObjectValue $sessionState 'prompt_id' '')
+      $proofBusyUnixMs = [int64](Get-ObjectValue $sessionState 'busy_unix_ms' 0)
+      $audnStopFailureProof = [pscustomobject]@{ ok = $false }
+      # AudnCode batches transcript persistence on a 100 ms timer and launches
+      # StopFailure without awaiting it. Give that exact epoch a short bounded
+      # window to become durable, but abandon the proof immediately if any
+      # prompt/host/home/transcript binding changes while waiting.
+      for ($proofAttempt = 0; $proofAttempt -lt 12; $proofAttempt++) {
+        $proofState = if ($proofAttempt -eq 0) {
+          $sessionState
+        } else {
+          Read-ClaudeSessionState -SessionId $sessionId
+        }
+        $sameProofEpoch = $null -ne $proofState -and
+          [string](Get-ObjectValue $proofState 'session_id' '') -eq $sessionId -and
+          [int64](Get-ObjectValue $proofState 'epoch' 0) -eq $proofEpoch -and
+          [string](Get-ObjectValue $proofState 'prompt_id' '') -eq $proofPrompt -and
+          [int64](Get-ObjectValue $proofState 'busy_unix_ms' 0) -eq $proofBusyUnixMs -and
+          [int](Get-ObjectValue $proofState 'audncode_host_pid' 0) -eq $hostPid -and
+          [int64](Get-ObjectValue $proofState 'audncode_host_started_unix_ms' 0) -eq $hostStarted -and
+          [string]::Equals(
+            [string](Get-ObjectValue $proofState 'audncode_home' ''),
+            $canonicalAudnCodeHome,
+            [StringComparison]::OrdinalIgnoreCase
+          ) -and
+          [string]::Equals(
+            [string](Get-ObjectValue $proofState 'transcript_path' ''),
+            $transcriptPath,
+            [StringComparison]::OrdinalIgnoreCase
+          )
+        if (-not $sameProofEpoch) { break }
+        $audnStopFailureProof = Get-AudnCodeStopFailureTranscriptProof `
+          -SessionState $proofState `
+          -SessionId $sessionId `
+          -SessionEpoch $proofEpoch `
+          -TranscriptPath $transcriptPath `
+          -ExpectedPayloadHash ([string]$payloadBinding.payload_hash)
+        if ([bool](Get-ObjectValue $audnStopFailureProof 'ok' $false)) {
+          $sessionState = $proofState
+          break
+        }
+        if ([string](Get-ObjectValue $audnStopFailureProof 'reason' '') -eq
+            'audncode-stop-failure-proof-ambiguous') { break }
+        if ($proofAttempt -eq 0) {
+          Write-RuntimeLog 'waiting briefly for durable AudnCode StopFailure transcript evidence'
+        }
+        if ($proofAttempt -lt 11) { Start-Sleep -Milliseconds 75 }
+      }
+      if (-not [bool](Get-ObjectValue $audnStopFailureProof 'ok' $false)) {
+        if ([string](Get-ObjectValue $audnStopFailureProof 'reason' '') -eq
+            'audncode-stop-failure-proof-ambiguous') {
+          if (Set-AudnCodeStopFailureEpochAmbiguous `
+              -SessionId $sessionId `
+              -SessionEpoch $proofEpoch `
+              -PromptId $proofPrompt) {
+            Set-AudnCodePendingStopFailureAmbiguous `
+              -SessionId $sessionId `
+              -PromptId $proofPrompt `
+              -SessionEpoch $proofEpoch
+          }
+          Write-RuntimeLog 'ignored ambiguous AudnCode StopFailure transcript proof for the same prompt epoch'
+        } else {
+          Write-RuntimeLog 'ignored AudnCode StopFailure without one stable correlated transcript error'
+        }
+        Write-Output '{}'
+        exit 0
+      }
+      $identityRegistration = Register-AudnCodeStopFailureIdentity `
+        -SessionId $sessionId `
+        -SessionEpoch $proofEpoch `
+        -PromptId $proofPrompt `
+        -CandidateIdentity ([string]$audnStopFailureProof.candidate_identity)
+      if (-not [bool](Get-ObjectValue $identityRegistration 'ok' $false)) {
+        if ([bool](Get-ObjectValue $identityRegistration 'ambiguous' $false)) {
+          Set-AudnCodePendingStopFailureAmbiguous `
+            -SessionId $sessionId `
+            -PromptId $proofPrompt `
+            -SessionEpoch $proofEpoch
+          Write-RuntimeLog 'ignored conflicting AudnCode StopFailure proof for the same prompt epoch'
+        } else {
+          Write-RuntimeLog 'ignored AudnCode StopFailure whose prompt epoch changed before proof commit'
+        }
+        Write-Output '{}'
+        exit 0
+      }
+      $sessionState = Read-ClaudeSessionState -SessionId $sessionId
+      if ($null -eq $sessionState -or
+          [int64](Get-ObjectValue $sessionState 'epoch' 0) -ne $proofEpoch -or
+          [string](Get-ObjectValue $sessionState 'prompt_id' '') -ne $proofPrompt -or
+          [bool](Get-ObjectValue $sessionState 'audncode_stop_failure_ambiguous' $true) -or
+          [string](Get-ObjectValue $sessionState 'audncode_stop_failure_identity' '') -ne
+            [string]$audnStopFailureProof.candidate_identity) {
+        Write-RuntimeLog 'ignored AudnCode StopFailure whose prompt epoch changed after proof commit'
         Write-Output '{}'
         exit 0
       }
     }
+    if ($hookName -eq 'Stop') {
+      if ($isAudnCode) {
+        $stopHookProperty = $hookInput.PSObject.Properties['stop_hook_active']
+        if ($null -eq $stopHookProperty -or $stopHookProperty.Value -isnot [bool] -or [bool]$stopHookProperty.Value) {
+          Write-RuntimeLog 'ignored unverifiable or recursive AudnCode Stop'
+          Write-Output '{}'
+          exit 0
+        }
+      } else {
+        $backgroundProperty = $hookInput.PSObject.Properties['background_tasks']
+        $cronsProperty = $hookInput.PSObject.Properties['session_crons']
+        if ($null -eq $backgroundProperty -or $null -eq $cronsProperty -or
+            $null -eq $backgroundProperty.Value -or $null -eq $cronsProperty.Value -or
+            $backgroundProperty.Value -isnot [System.Array] -or
+            $cronsProperty.Value -isnot [System.Array]) {
+          Write-RuntimeLog 'ignored unverifiable Claude Stop without work registries'
+          Write-Output '{}'
+          exit 0
+        }
+        if (@($backgroundProperty.Value).Count -gt 0 -or @($cronsProperty.Value).Count -gt 0) {
+          Remove-ClaudePendingCandidate -SessionId $sessionId -PromptId $promptId
+          Write-RuntimeLog 'ignored Claude Stop while background work remains active'
+          Write-Output '{}'
+          exit 0
+        }
+      }
+    }
     $sessionEpoch = [int64](Get-ObjectValue $sessionState 'epoch' 0)
-    $goalInfo = if ($hookName -eq 'Stop') {
-      # Stop is synchronous so repeated lifecycle events retain host ordering.
-      # Keep that ordered path bounded; the detached worker performs the full
-      # reverse scan whenever this limited read returns unknown.
+    $goalInfo = if ($hookName -in @('Stop', 'StopFailure')) {
+      # Keep hook ingestion bounded; the detached worker performs the full
+      # reverse scan whenever this limited read returns unknown. StopFailure's
+      # transcript proof binds this scan to the same prompt epoch.
       Get-ClaudeGoalTranscriptState -TranscriptPath $transcriptPath -MaxBytes $ClaudePromptBaselineMaxBytes
     } else {
       [pscustomobject]@{ state = 'none'; marker = ''; marker_unix_ms = [int64]0 }
@@ -5420,7 +16520,7 @@ try {
     $lastMessage = [string](Get-FirstObjectValue $hookInput @('last_assistant_message', 'last-assistant-message', 'lastAgentMessage', 'last_agent_message', 'message'))
     if ($hookName -eq 'StopFailure' -and [string]::IsNullOrWhiteSpace($lastMessage)) {
       $errorName = Sanitize-NotificationText -Text ([string](Get-ObjectValue $hookInput 'error' 'unknown')) -MaxLength 80
-      $lastMessage = "Claude API error: $errorName"
+      $lastMessage = "$hostLabel API error: $errorName"
     }
     $event = [pscustomobject][ordered]@{
       type = 'agent-turn-complete'
@@ -5432,11 +16532,21 @@ try {
       'claude-session-epoch' = $sessionEpoch
       'claude-goal-state' = $goalState
       'claude-goal-marker' = $goalMarker
+      'audncode-hook-start-ticks' = if ($isAudnCode) { $HookProcessStartUtcTicks } else { 0 }
+      'candidate-identity' = if ($null -ne $audnStopFailureProof) { [string]$audnStopFailureProof.candidate_identity } else { '' }
+      'audncode-stop-failure-uuid' = if ($null -ne $audnStopFailureProof) { [string]$audnStopFailureProof.uuid } else { '' }
+      'audncode-stop-failure-payload-hash' = if ($null -ne $audnStopFailureProof) { [string]$audnStopFailureProof.payload_hash } else { '' }
+      'audncode-stop-failure-line-hash' = if ($null -ne $audnStopFailureProof) { [string]$audnStopFailureProof.line_hash } else { '' }
+      'audncode-stop-failure-proof-hash' = if ($null -ne $audnStopFailureProof) { [string]$audnStopFailureProof.proof_hash } else { '' }
       'goal-status' = if ($goalState -eq 'failed') { 'blocked' } elseif ($goalState -eq 'achieved') { 'complete' } else { '' }
       'completion-event-type' = if ($hookName -eq 'StopFailure') { 'turn_aborted' } else { 'task_complete' }
     }
     $provider = 'claude'
-    $candidateKind = if ($hookName -eq 'StopFailure') { 'claude_stop_failure' } else { 'claude_stop' }
+    $candidateKind = if ($isAudnCode) {
+      if ($hookName -eq 'StopFailure') { 'audncode_stop_failure' } else { 'audncode_stop' }
+    } else {
+      if ($hookName -eq 'StopFailure') { 'claude_stop_failure' } else { 'claude_stop' }
+    }
     $sourceEvent = $hookName
   } elseif ($HookEvent) {
     $hookName = [string](Get-FirstObjectValue $event @('hook_event_name', 'hook-event-name', 'hookEventName', 'event_name', 'eventName', 'type'))
@@ -5469,7 +16579,7 @@ try {
   }
   $eventType = [string](Get-ObjectValue $event 'type' 'agent-turn-complete')
   if ($eventType -ne 'agent-turn-complete') {
-    if ($HookEvent -or $ClaudeHook) { Write-Output '{}' }
+    if ($HookEvent -or $ClaudeHook -or $AudnCodeHook) { Write-Output '{}' }
     exit 0
   }
 
@@ -5496,7 +16606,7 @@ try {
   $detectedClassification = if ($Test -or $provider -eq 'claude') {
     'root'
   } else {
-    Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $eventSessionHome
+    Get-EventClassification -Event $event -ThreadId $threadId -SessionHome $eventSessionHome -SqliteHome $eventSqliteHome
   }
   $eventClassification = if ($detectedClassification -eq 'subagent') {
     'subagent'
@@ -5509,14 +16619,14 @@ try {
   if ($config.suppressSubagents -and $eventClassification -eq 'subagent') {
     Move-ToSuppressed -Path (Join-Path $OutboxDir ($record.key + '.json')) -Record $record
     Write-RuntimeLog "suppressed subagent completion thread=$($threadId.Substring(0, [Math]::Min(8, $threadId.Length)))"
-    if ($HookEvent -or $ClaudeHook) { Write-Output '{}' }
+    if ($HookEvent -or $ClaudeHook -or $AudnCodeHook) { Write-Output '{}' }
     exit 0
   }
 
   $queued = if ($Test) { Add-OutboxEvent -Record $record } else { Add-CandidateEvent -Record $record -Config $config }
   Start-DetachedWorker
 
-  if ($HookEvent -or $ClaudeHook) {
+  if ($HookEvent -or $ClaudeHook -or $AudnCodeHook) {
     Write-Output '{}'
     exit 0
   }
@@ -5536,8 +16646,11 @@ try {
   }
   exit 0
 } catch {
+  if ($null -ne $audnCodeIngressArm) {
+    [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail)
+  }
   Write-RuntimeLog "hook error: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 500)"
-  if ($HookEvent -or $ClaudeHook) {
+  if ($HookEvent -or $ClaudeHook -or $AudnCodeHook) {
     if ($BridgeFallback) { exit 1 }
     Write-Output '{}'
     exit 0

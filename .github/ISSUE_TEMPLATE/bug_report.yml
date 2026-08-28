@@ -9,14 +9,25 @@ body:
       value: |
         Thanks for helping improve the notifier.
 
-        **Privacy warning:** do not attach unredacted configuration files, logs, Codex sessions, outbox/dead-letter records, or state files. Remove topic names, tokens, hostnames, usernames, project paths, prompts, and assistant messages first.
+        **Privacy warning:** do not attach raw configuration, provider transcript/session data, queue/team/task/scheduler files, logs, outbox/dead-letter records, or notifier state. Describe only the minimum relevant structure and redact topic names, tokens, hostnames, usernames, project paths, IDs, prompts, and assistant content.
 
   - type: input
     id: version
     attributes:
       label: Version
       description: Run the notifier with `--doctor` or `-Doctor`, or provide the release tag.
-      placeholder: 2.4.2
+      placeholder: 2.6.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: integration
+    attributes:
+      label: Integration
+      options:
+        - Codex
+        - Claude Code
+        - AudnCode
     validations:
       required: true
 

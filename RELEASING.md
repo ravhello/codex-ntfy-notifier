@@ -17,6 +17,7 @@ Create a release branch from current `main`. Update:
 - `VERSION`;
 - `$ScriptVersion` in `src/notify-ntfy.ps1`;
 - `VERSION` in `src/notify-ntfy.py`;
+- `$NotifierVersion` in `install.ps1`;
 - the `[Unreleased]` section and dated version section in `CHANGELOG.md`;
 - README support/version text and examples when behavior changed;
 - `README.it.md` for user-visible setup, privacy, or diagnostic changes;
@@ -30,6 +31,7 @@ Verify version parity:
 version=$(tr -d '\r\n' < VERSION)
 grep -F "VERSION = \"$version\"" src/notify-ntfy.py
 grep -F "\$ScriptVersion = '$version'" src/notify-ntfy.ps1
+grep -F "\$NotifierVersion = '$version'" install.ps1
 ```
 
 ## 2. Review public safety

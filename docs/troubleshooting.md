@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Start in the environment where Codex actually runs. The Codex app on Windows, a local VS Code window, a WSL window, and a Remote SSH window can use different `CODEX_HOME` values, hook files, rollout histories, databases, and notifier state.
+Start in the environment where the coding agent actually runs. The Codex app on Windows, a local VS Code window, a WSL window, a Remote SSH window, Claude Code, and AudnCode can use different homes, hook files, lifecycle histories, and notifier state.
 
 Do not post private config, pending/outbox records, rollout files, Codex databases, dead letters, backups, or raw logs. See [Security and privacy](security-and-privacy.md).
 
@@ -24,7 +24,7 @@ tail -n 40 "$HOME/.codex/ntfy-state/notify.log"
 
 The doctor output does not print the topic or credentials. Check:
 
-- `version` is `2.5.2` or a newer compatible release;
+- `version` is `2.6.0` or a newer compatible release;
 - `topic_configured` is `true`;
 - `idle_detection_mode` is `strict` when intermediate notifications must never be sent;
 - `goal_aware` and `watch_rollouts` are `true`;
@@ -93,6 +93,146 @@ For a `Stop`, both `background_tasks` and `session_crons` must be present and em
 
 Reload app/CLI processes and VS Code windows that were already running during installation. If `Stop` remains untrusted, the legacy notification and rollout watcher can still detect completions, but the modern candidate is absent.
 
+### AudnCode on Windows
+
+AudnCode support is a separate opt-in. Install it alone or alongside Claude Code:
+
+```powershell
+.\install.ps1 -NoWsl -EnableAudnCode
+# or
+.\install.ps1 -NoWsl -EnableClaudeCode -EnableAudnCode
+```
+
+The installer follows a nonblank `CLAUDE_CONFIG_DIR`; otherwise it uses `~/.openclaude`. An explicit `-AudnCodeHome` overrides both. Install once per distinct configuration home when multiple AudnCode profiles or launchers are in use, and close only the AudnCode processes attached to the home being changed. The same Codex home and worker can serve all of them because runtime state remains keyed by AudnCode home and host identity.
+
+Inspect the selected home's handler shape and active idle threshold without printing hook commands:
+
+```powershell
+$CodexHome = [IO.Path]::GetFullPath((Join-Path $HOME '.codex')) # replace when customized
+$ManagedScript = [IO.Path]::GetFullPath((Join-Path $CodexHome 'notify-ntfy.ps1'))
+$AudnHome = if ([string]::IsNullOrWhiteSpace($env:CLAUDE_CONFIG_DIR)) {
+  [IO.Path]::GetFullPath((Join-Path $HOME '.openclaude'))
+} else {
+  [IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR)
+}
+$Utf8Strict = New-Object Text.UTF8Encoding($false, $true)
+$SettingsPath = Join-Path $AudnHome 'settings.json'
+$Settings = $Utf8Strict.GetString([IO.File]::ReadAllBytes($SettingsPath)) | ConvertFrom-Json
+$ExpectedMatchers = [ordered]@{
+  SessionStart = '^(startup|resume|clear)$'
+  UserPromptSubmit = $null
+  Stop = $null
+  StopFailure = $null
+  Notification = 'idle_prompt'
+  PostToolUse = 'Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage'
+  SubagentStart = $null
+}
+$ManagedQuotedScript = "'" + $ManagedScript.Replace("'", "''") + "'"
+$ManagedQuotedHome = "'" + $AudnHome.Replace("'", "''") + "'"
+$ManagedCommandPrefix = "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & " +
+  $ManagedQuotedScript + " -AudnCodeHook -ReadStdin -Origin 'AudnCode' -AudnCodeHome " + $ManagedQuotedHome
+$ManagedEventPattern = '(?i)^' + [regex]::Escape($ManagedCommandPrefix) +
+  '\s+-AudnCodeExpectedEvent\s+''(?:SessionStart|UserPromptSubmit|Stop|StopFailure|Notification|PostToolUse|SubagentStart)''$'
+foreach ($EventName in @($ExpectedMatchers.Keys)) {
+  $EventProperty = $Settings.hooks.PSObject.Properties[$EventName]
+  if ($null -eq $EventProperty -or $EventProperty.Value -isnot [array]) {
+    [pscustomobject]@{
+      Event = $EventName; Present = $false; Matcher = '<missing>'; MatcherMatches = $false
+      Async = $null; Timeout = $null; ManagedHandler = $false; TrustedExpectedEvent = $false
+    }
+    continue
+  }
+  foreach ($Group in @($EventProperty.Value)) {
+    $MatcherProperty = if ($null -ne $Group) { $Group.PSObject.Properties['matcher'] } else { $null }
+    $Matcher = if ($null -eq $MatcherProperty) { '<none>' } else { [string]$MatcherProperty.Value }
+    $ExpectedMatcher = $ExpectedMatchers[$EventName]
+    $MatcherMatches = if ($null -eq $ExpectedMatcher) {
+      $null -eq $MatcherProperty
+    } else {
+      [string]::Equals($Matcher, [string]$ExpectedMatcher, [StringComparison]::Ordinal)
+    }
+    $HooksProperty = if ($null -ne $Group) { $Group.PSObject.Properties['hooks'] } else { $null }
+    $Handlers = if ($null -ne $HooksProperty -and $HooksProperty.Value -is [array]) {
+      @($HooksProperty.Value)
+    } else { @() }
+    if ($Handlers.Count -eq 0) {
+      [pscustomobject]@{
+        Event = $EventName; Present = $true; Matcher = $Matcher; MatcherMatches = $MatcherMatches
+        Async = $null; Timeout = $null; ManagedHandler = $false; TrustedExpectedEvent = $false
+      }
+      continue
+    }
+    foreach ($Handler in $Handlers) {
+      $Command = if ($null -ne $Handler) { [string]$Handler.command } else { '' }
+      $ManagedHandler = $null -ne $Handler -and [string]$Handler.type -eq 'command' -and
+        $Command -match $ManagedEventPattern
+      $ExpectedCommand = $ManagedCommandPrefix + " -AudnCodeExpectedEvent '" + $EventName + "'"
+      $AsyncProperty = if ($null -ne $Handler) { $Handler.PSObject.Properties['async'] } else { $null }
+      $TimeoutProperty = if ($null -ne $Handler) { $Handler.PSObject.Properties['timeout'] } else { $null }
+      [pscustomobject]@{
+        Event = $EventName
+        Present = $true
+        Matcher = $Matcher
+        MatcherMatches = $MatcherMatches
+        Async = if ($null -eq $AsyncProperty) { $null } else { [bool]$AsyncProperty.Value }
+        Timeout = if ($null -eq $TimeoutProperty) { $null } else { [int]$TimeoutProperty.Value }
+        ManagedHandler = [bool]$ManagedHandler
+        TrustedExpectedEvent = [bool]($ManagedHandler -and
+          [string]::Equals($Command, $ExpectedCommand, [StringComparison]::OrdinalIgnoreCase))
+      }
+    }
+  }
+}
+
+$IsTruthy = { param($Value) -not [string]::IsNullOrWhiteSpace($Value) -and $Value.Trim().ToLowerInvariant() -in @('1','true','yes','on') }
+$OAuthSuffix = if (-not [string]::IsNullOrEmpty($env:CLAUDE_CODE_CUSTOM_OAUTH_URL)) {
+  '-custom-oauth'
+} elseif ($env:USER_TYPE -ceq 'ant' -and (& $IsTruthy $env:USE_LOCAL_OAUTH)) {
+  '-local-oauth'
+} elseif ($env:USER_TYPE -ceq 'ant' -and (& $IsTruthy $env:USE_STAGING_OAUTH)) {
+  '-staging-oauth'
+} else { '' }
+$ConfigJson = Join-Path $AudnHome '.config.json'
+$OpenClaudeJson = Join-Path $AudnHome ".openclaude${OAuthSuffix}.json"
+$LegacyJson = Join-Path $AudnHome ".claude${OAuthSuffix}.json"
+$GlobalPath = if (Test-Path -LiteralPath $ConfigJson -PathType Leaf) {
+  $ConfigJson
+} elseif ((Test-Path -LiteralPath $OpenClaudeJson -PathType Leaf) -or
+          -not (Test-Path -LiteralPath $LegacyJson -PathType Leaf)) {
+  $OpenClaudeJson
+} else {
+  $LegacyJson
+}
+if (-not (Test-Path -LiteralPath $GlobalPath -PathType Leaf)) { throw "AudnCode global config not found: $GlobalPath" }
+($Utf8Strict.GetString([IO.File]::ReadAllBytes($GlobalPath)) | ConvertFrom-Json).messageIdleNotifThresholdMs
+```
+
+Expect hook shape 8 with one project-managed group for each of these seven synchronous events:
+
+- `SessionStart` with only `^(startup|resume|clear)$`;
+- `UserPromptSubmit` with no matcher;
+- `Stop` with no matcher;
+- `StopFailure` with no matcher;
+- `Notification` with only `idle_prompt`;
+- `PostToolUse` with exactly `Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage`;
+- `SubagentStart` with no matcher.
+
+For the single project-managed row under each event, expect `Present`, `MatcherMatches`, `ManagedHandler`, and `TrustedExpectedEvent` to be `true`, `Async` to be `false`, and `Timeout` to be `60`. The diagnostic reports booleans instead of printing the private command path. The default threshold is `1000` ms; a deliberate value from 1,000 through 60,000 can be installed with `-AudnCodeIdleThresholdMs`. If `disableAllHooks` is `true`, AudnCode will not execute the handlers.
+
+AudnCode `Stop` is not a final signal. It creates or refreshes a candidate, which remains pending until a later matching `idle_prompt` proves that the foreground query loop returned. `StopFailure` is accepted only when one current-prompt assistant error record after the saved transcript cursor matches the hook error evidence. That proven failure bypasses only `idle_prompt`: settle time, ingress/lifecycle guards, runtime identity, command queue, background IDs, team/task state, sidechains, cron evidence, repeated snapshots, and the locked promotion boundary still apply. Do not add `agent_completed`; it is not used as AudnCode finality. A late idle or error from an older prompt fails closed through transcript cursor, prompt epoch, timestamp, and hook-process ordering.
+
+Managed hook stdin is strict UTF-8 and capped at 8 MiB. `SessionStart`, `UserPromptSubmit`, `PostToolUse`, and `SubagentStart` arm durable ingress before slower correlation as applicable, then transfer it to the exact host-runtime guard. Reaching the 60-second hook timeout, malformed/oversized input, an event mismatch, or an interrupted transfer can intentionally leave the host fail closed. This cannot protect an event for which AudnCode never launched the hook process.
+
+Host exit is not a universal release. It can close only evidence proven to be process-bound to the exact PID/`startedAt`; sticky `SendMessage`, overlapping same-ID resumes, lost lifecycle history, detached work, retained team state, or ambiguous scheduler ownership remains fail closed. Durable cron reconciliation also requires causally ordered stable file snapshots and the exact native `scheduled_tasks.lock` owner/lifetime. Do not move a retained candidate into `outbox/` manually.
+
+Foreground idle is still not whole-runtime idle. The gate binds the logical session to AudnCode's live PID and `startedAt`, preserving state across `/clear` and `/resume`. It waits at least 1.25 seconds after `idle_prompt` or proven `StopFailure`, then checks queue lineage, counted background incarnations, `SendMessage` uncertainty, session/team/custom tasks, retained team directories, CCR claims, cron lease/file evidence, and Ctrl+B sidechains. A non-lead team remains busy until `TeamDelete` removes its directory; `isActive: false` or membership removal is insufficient. The complete check runs three times before the locked outbox commit.
+
+Evidence limits are fail-closed, not truncation-as-idle. Version 2.6.0 permits at most 512 MiB of queue transcripts across the runtime lineage, 4,096 relevant queue records, 1,048,576 characters per line, 65,536 characters per queue content field, 1 MiB per team/task JSON file, and 1,024 team members. If a valid workload exceeds one of these bounds, preserve the files and report a sanitized reproduction; do not move the candidate manually.
+
+AudnCode hot-reloads ordinary settings but has no shared lock for `settings.json`. Close it before a first install or shape change, then verify shape 8 and reopen after `.codex-ntfy-hooks.json` is created or rotated. An identical reinstall preserves the generation. During upgrade the installer stops only verified orphan notifier hook processes from obsolete shapes; it does not terminate current-shape or still-parented processes. Do not copy the marker between homes. Hooks still require AudnCode workspace trust.
+
+Known public-build limits can explain a permanently retained candidate. Successful/malformed `SendMessage` has no resolved recipient or durable consumption acknowledgement; overlapping resumed local agents can reuse one ID; `clearCommandQueue`, kill-all, and some Ctrl+B paths can omit the removed ID. `/ultrareview` requires the exact CCR/remote task identity and terminal record. Session-only cron firing omits its ID; only a later exact same-runtime `CronDelete` closes that incarnation. For durable cron work, a delete response or empty `scheduled_tasks.json` does not prove completion: causal stable file snapshots plus the exact scheduler lease owner/lifetime are required. These gaps can suppress a true final alert, but cannot produce an intermediate one.
+
 ## Legacy notification does not run
 
 Confirm the relevant `config.toml` has one root-level `notify` entry:
@@ -128,6 +268,8 @@ On Windows, an exceptionally large legacy payload can fail before the notifier p
 
 Version 2.4.3 keeps the persistent Windows local scanner off the historical recursive path: it follows active and recently resumed rollout paths from Codex's read-only SQLite index and checks hot current-day files. This removes the repeated full-tree walk that reached 23 GB in the installation where the regression was found. UNC/WSL recovery runs in a different timeout-bounded process, and large local rollout lifecycle checks use a native streaming summary instead of line-by-line PowerShell JSON replay. A full recursive archive walk occurs only when an operator explicitly runs the manual all-scope scanner. Remote SSH installs have their own host-local worker and queue, so they cannot block the local Windows delivery path.
 
+For AudnCode, normal latency includes its configured 1,000 ms idle notification threshold, the notifier's fixed minimum 1.25-second settle, up to three local evidence passes, and worker scheduling. A hook's `timeout: 60` is an upstream safety ceiling, not a normal delay target. Missing or ambiguous evidence has no timed fail-open, so a permanently pending AudnCode candidate is a diagnostic condition rather than a reason to lower the idle threshold.
+
 Check the scheduled task action and scanner health without printing private state:
 
 ```powershell
@@ -149,6 +291,17 @@ Inspect the sanitized log first. Common idle reasons are:
 | `goal-active` | The root goal is still `active`. | Let the goal reach a non-running status. |
 | `claude-goal-active` | Claude `/goal` still has a newest active/not-met marker. | Let the same goal reach achieved/failed, or clear it intentionally. |
 | `claude-goal-awaiting-finality` | Claude goal evidence is missing/malformed and no matching prompt idle fallback has arrived. | Verify the transcript path, Claude version, and managed prompt/Notification hooks. |
+| `audncode-awaiting-idle` | AudnCode produced a normal `Stop`, but no later matching `idle_prompt` has passed session/epoch/process-order checks. | Let the query loop return; verify synchronous managed hooks, trusted expected-event arguments, workspace trust, transcript path, and the 1,000 ms threshold. A valid `StopFailure` follows the separate transcript-error proof path. |
+| `audncode-background-settling` | The fixed 1.25-second post-idle window has not elapsed. | Wait; this floor applies even when general idle grace is zero. |
+| `audncode-background-tools-active` | At least one runtime-scoped Agent/Bash/PowerShell/Monitor or Ctrl+B sidechain ID lacks terminal proof. | Let it finish, or use a single-ID TaskStop/KillShell path that emits a correlatable ID. |
+| `audncode-command-queue-active` | Persisted `queue-operation` records still have outstanding work across the current runtime's session lineage. | Let queued commands dequeue/remove/pop; `popAll` is recognized even from a later `/clear`/`/resume` lineage session when it is logged. |
+| `audncode-teammates-active` | A matching non-lead team directory still exists. | Let AudnCode complete `TeamDelete`. Editing `isActive`, removing members, or emptying the list is not terminal proof. |
+| `audncode-goal-tasks-active` | A session, team, or valid custom task list still contains `pending`/`in_progress`. | Complete the explicit task records. |
+| `audncode-awaiting-terminal-proof` | A background/sidechain ID has a terminal claim but no correlated native external main-session `<task-notification>` after the saved cursor. | Let AudnCode persist either accepted `user`-origin or `queued_command` attachment form; pasted or sidechain-local content is not proof. |
+| `audncode-local-agent-ui-queue-unverifiable` | A successful/malformed `SendMessage` left RAM-only delivery or recipient identity unprovable. | Do not forge a terminal record. Resolve the upstream work, then start a fresh host/session; preserve sanitized evidence for a bug report. |
+| `audncode-remote-*` | A `/ultrareview` CCR claim lacks its exact identity sidecar or matching remote terminal proof. | Let the same remote task finish; deletion, another prompt, or another task's terminal does not release it. |
+| `audncode-cron-*` | Scheduler file/lease history is live, non-causal, reused, missing, malformed, or unstable. | A same-runtime `CronDelete` can close only its exact session-only incarnation. For durable work, let the exact native owner exit and its stable file/lock transition settle; a delete response or empty task file alone is insufficient. |
+| `audncode-*-unverifiable` | Host marker, runtime registry, queue, team/task, transcript, or terminal evidence is malformed, unstable, or ambiguous. | Preserve the files, confirm the current PID/session and v2.6.0 hooks, then inspect sanitized logs. The gate intentionally fails closed. |
 | `subagents-active` | At least one descendant rollout still looks active. | Let the descendant finish; check stale-child policy if it crashed. |
 | `probe-incomplete` | Matching local rollout evidence is missing or unreadable. | Verify the real Codex/session paths and upstream state format. |
 
@@ -184,10 +337,11 @@ Lowering that timeout can notify while a genuinely long-running child is still a
 
 Confirm all of the following:
 
-- doctor reports version 2.5.2+ and `idle_detection_mode: "strict"`;
+- doctor reports version 2.6.0+ and `idle_detection_mode: "strict"`;
 - the alert comes from this installation/topic rather than an older custom hook or another notifier;
 - no duplicate/legacy managed notifier handlers remain under `UserPromptExpansion`, `SubagentStop`, or unexpected hook groups; the single managed `UserPromptSubmit` is intentional;
 - only one intended `notify-ntfy` `Stop` group exists per environment;
+- AudnCode has exactly the seven shape-8 synchronous event groups, 60-second timeouts, and matchers listed above, with no old direct-publish or `agent_completed` handler, and every command has the correct trusted expected event;
 - every worker was restarted after upgrade;
 - `suppress_subagents` and `suppress_technical_turns` are `true`;
 - Windows, WSL, and SSH environments are not publishing to the same topic through separate old installations.
@@ -325,13 +479,14 @@ Without a persistent service, hook-driven on-demand delivery still works, but au
 
 ## Notification content looks wrong
 
-- Since 2.4.2, the JSON title is only `<conversation-or-project>`. With the default single `white_check_mark` tag, the complete visible title is one status emoji plus that title. `Codex`, `done`, model names, lifecycle text, and duplicate emoji are intentionally absent.
+- Since 2.4.2, the JSON title is only `<conversation-or-project>`. With the default single `white_check_mark` tag, the complete visible title is one status emoji plus that title. Provider names, `done`, model names, lifecycle text, and duplicate emoji are intentionally absent.
 - The default body is one plain-text line, `<origin> · #<thread8>`, without `Project:`, `Source:`, or `Thread:` labels. A project is prepended only when a distinct task title occupies the title, or a sanitized path is added when full-path output is enabled.
 - Keep `include_message: false` unless the final assistant response should be captured and sent. With it enabled, the excerpt is prepended to the context and `max_message_chars` defaults to 180.
 - Keep `include_full_path: false` to avoid sending the sanitized working-directory path.
 - Keep `include_thread_title: false` unless a prompt-derived local task title is acceptable.
-- Fresh installs use `tags: ["white_check_mark"]`, `markdown: false`, and `priority: 3`. At priority 3 the outgoing JSON intentionally has no `priority` member. The templates do not duplicate the tag with an emoji in title or body.
+- Every outgoing payload has one tag: `warning` for any terminal non-success, otherwise the first valid configured member or `white_check_mark`. Legacy multi-tag strings/arrays normalize to the first valid member. The templates do not duplicate its emoji in title or body.
 - The full ntfy `message` is always at most 3,500 UTF-8 bytes. `max_message_chars` controls the optional excerpt, not that final byte ceiling.
+- Version 2.6.0 decodes hook/config/state/title data as strict UTF-8/Unicode, normalizes display text to NFC, removes unsafe control/bidi formatting, and truncates only between complete display clusters. Titles are at most 60 clusters and 240 UTF-8 bytes; bodies are at most 3,500 bytes. Mojibake or U+FFFD indicates stale/invalid input or an older duplicate handler; remove the stale registration rather than adding substitutions.
 
 Redaction is best-effort. If sensitive data was published, rotate credentials/topic access and follow the ntfy server/client deletion procedure; configuration changes cannot recall it.
 

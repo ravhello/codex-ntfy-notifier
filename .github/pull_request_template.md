@@ -7,7 +7,7 @@ Describe the user-visible change and the environments it affects.
 - [ ] Python unit tests pass.
 - [ ] Relevant PowerShell or POSIX shell syntax checks pass.
 - [ ] I tested the affected installation or delivery path, or explained why I could not.
-- [ ] `VERSION`, `src/notify-ntfy.py`, and `src/notify-ntfy.ps1` remain in sync if this is a release change.
+- [ ] `VERSION`, `src/notify-ntfy.py`, `src/notify-ntfy.ps1`, and `install.ps1` version constants remain in sync if this is a release change.
 
 ## Privacy and security
 

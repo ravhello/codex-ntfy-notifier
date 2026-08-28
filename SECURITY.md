@@ -2,14 +2,14 @@
 
 Durable Codex ntfy notifier processes private local metadata and may hold reusable ntfy credentials. Please report vulnerabilities privately and avoid exposing affected users while a fix is prepared.
 
-This is an unofficial community project. Security problems in OpenAI Codex, Anthropic Claude Code, ntfy, Python, PowerShell, Windows, systemd, OpenSSH, VS Code, or an operating system should normally be reported to the relevant upstream project.
+This is an unofficial community project. Security problems in OpenAI Codex, Anthropic Claude Code, AudnCode, ntfy, Python, PowerShell, Windows, systemd, OpenSSH, VS Code, or an operating system should normally be reported to the relevant upstream project.
 
 ## Supported versions
 
 | Version | Security fixes |
 | --- | --- |
-| 2.5.x | Supported |
-| 2.4.x and earlier | Not supported; upgrade to the latest release |
+| 2.6.x | Supported |
+| 2.5.x and earlier | Not supported; upgrade to the latest release |
 | Earlier private/pre-public builds | Not supported; upgrade and rotate any embedded credentials |
 
 Only the latest patch release receives security updates. A report may lead to a new patch release rather than a backport.
@@ -27,7 +27,7 @@ Include, after sanitizing all secrets and personal data:
 - affected version, commit, platform, and deployment topology;
 - impact and realistic attack prerequisites;
 - reproduction steps or a minimal proof of concept using fake credentials and a local test server;
-- whether the issue affects PowerShell, Python, WSL, remote installation, or more than one path;
+- whether the issue affects Codex, Claude Code, AudnCode, PowerShell, Python, WSL, remote installation, or more than one path;
 - suggested remediation, if known;
 - whether the issue or exploit is already public.
 
@@ -42,10 +42,10 @@ Examples in scope include:
 - installer quoting, staging, rollback, ACL, or file-mode behavior exposing credentials;
 - secret values appearing in logs, doctor output, exceptions, tests, or repository artifacts;
 - queue tampering bypassing validation in a way that crosses a security boundary;
-- idle-gate, goal-state, descendant, or rollout-watcher behavior that sends a root completion despite verified active work;
+- an idle gate that sends despite verified active work, including Codex goal/descendant state, Claude goal/work registries, or AudnCode queue, team/task, background, `SendMessage`, CCR, cron-lease, and sidechain evidence;
 - hook registration or upgrade behavior that silently grants trust, replaces unrelated handlers, or executes before user review;
 - unsafe remote-host validation that copies credentials to an unintended target;
-- default behavior sending materially more Codex content than documented;
+- default behavior sending materially more Codex, Claude Code, or AudnCode content than documented;
 - a service/task configuration that grants unintended privilege.
 
 Usually out of scope:
@@ -56,7 +56,7 @@ Usually out of scope:
 - notification content visible because a client is configured to display it on a lock screen;
 - denial of service that requires the attacker already to have arbitrary write access to the user's private state directory;
 - unsupported/private builds that differ from the published source;
-- upstream Codex events that launch neither a local hook nor a locally persisted lifecycle record;
+- upstream provider events that launch neither a managed local hook nor supported locally persisted lifecycle evidence;
 - pure cloud tasks that expose no lifecycle state to the installed local environment.
 
 The boundary is not absolute. If uncertain and the impact could expose credentials, content, or code execution, report privately.
@@ -90,4 +90,4 @@ Rewriting Git history does not invalidate a credential already copied by someone
 
 ## Hardening guidance
 
-Deployment and privacy guidance is maintained in [docs/security-and-privacy.md](docs/security-and-privacy.md). In particular, keep `include_message: false`, retain the default `idle_detection_mode: "strict"`, review the managed `Stop` hook through `/hooks`, use HTTPS, refuse redirects, scope a publish-only token per host, and protect Codex/notifier state and backups with host-native permissions.
+Deployment and privacy guidance is maintained in [docs/security-and-privacy.md](docs/security-and-privacy.md). In particular, keep `include_message: false`, retain `idle_detection_mode: "strict"`, review Codex's managed `Stop` hook through `/hooks`, inspect any opt-in Claude Code/AudnCode handlers before enabling them, use HTTPS, refuse redirects, scope a publish-only token per host, and protect provider/notifier state and backups with host-native permissions.

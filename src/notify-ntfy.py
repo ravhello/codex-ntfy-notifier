@@ -23,6 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -33,10 +34,35 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.5.2"
+VERSION = "2.6.0"
 MAX_NTFY_MESSAGE_BYTES = 3500
+MAX_NTFY_TITLE_BYTES = 240
+SESSION_INDEX_TAIL_BYTES = 4 * 1024 * 1024
+TITLE_JSONL_LINE_BYTES = 256 * 1024
+FIRST_METADATA_LINE_BYTES = 1024 * 1024
+MAX_FALLBACK_ROLLOUT_LINE_BYTES = 8 * 1024 * 1024
 SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
+
+BIDI_CONTROL_CODEPOINTS = {
+    0x061C,
+    0x200E,
+    0x200F,
+    *range(0x202A, 0x202F),
+    *range(0x2066, 0x206A),
+}
+ROLLOUT_WATCH_MAX_READ_BYTES = 8 * 1024 * 1024
+SESSION_INDEX_MAX_BYTES = 4 * 1024 * 1024
+
+
+def rollout_watch_max_read_bytes() -> int:
+    """Return the production ceiling, allowing tests to shrink it only."""
+    if os.environ.get("CODEX_NTFY_NO_SPAWN") == "1":
+        with contextlib.suppress(ValueError):
+            value = int(os.environ.get("CODEX_NTFY_TEST_WATCH_MAX_BYTES", "0"))
+            if 256 <= value < ROLLOUT_WATCH_MAX_READ_BYTES:
+                return value
+    return ROLLOUT_WATCH_MAX_READ_BYTES
 
 
 def utc_now() -> dt.datetime:
@@ -47,13 +73,55 @@ def unix_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+def safe_unicode_scalar_text(value: str) -> bool:
+    return "\ufffd" not in value and not any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+
+
+def validate_json_strings(value: Any, depth: int = 0) -> None:
+    if depth > 64:
+        raise ValueError("JSON nesting exceeds the validation limit")
+    if isinstance(value, str):
+        if not safe_unicode_scalar_text(value):
+            raise ValueError("JSON contains an invalid Unicode scalar or replacement character")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and not safe_unicode_scalar_text(key):
+                raise ValueError("JSON contains an invalid Unicode object key")
+            validate_json_strings(item, depth + 1)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            validate_json_strings(item, depth + 1)
+
+
+def strict_json_loads(value: str) -> Any:
+    try:
+        if not safe_unicode_scalar_text(value):
+            raise ValueError("JSON text contains an invalid Unicode scalar or replacement character")
+        parsed = json.loads(value)
+        validate_json_strings(parsed)
+        return parsed
+    except (ValueError, RecursionError) as error:
+        if isinstance(error, json.JSONDecodeError):
+            raise
+        raise json.JSONDecodeError(str(error), value, 0) from error
+
+
 def compact_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    validate_json_strings(value)
+    rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if not safe_unicode_scalar_text(rendered):
+        raise ValueError("serialized JSON contains an invalid Unicode scalar")
+    return rendered
 
 
 def read_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8-sig") as handle:
-        return json.load(handle)
+    try:
+        text = path.read_bytes().decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError as error:
+        raise json.JSONDecodeError("file is not strict UTF-8", "", 0) from error
+    return strict_json_loads(text)
 
 
 def atomic_write_json(path: Path, value: Any, *, no_overwrite: bool = False) -> None:
@@ -85,32 +153,128 @@ def obj_value(value: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+def _is_grapheme_extension(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        unicodedata.category(character) in ("Mn", "Mc", "Me")
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or 0xE0100 <= codepoint <= 0xE01EF
+        or 0x1F3FB <= codepoint <= 0x1F3FF
+        or 0xE0020 <= codepoint <= 0xE007F
+    )
+
+
+def notification_clusters(value: str) -> list[str]:
+    """Approximate extended grapheme clusters consistently with PowerShell 5.1."""
+    if not safe_unicode_scalar_text(value):
+        return []
+    clusters: list[str] = []
+    current = ""
+    pending_join = False
+    regional_count = 0
+
+    def flush() -> None:
+        nonlocal current, pending_join, regional_count
+        current = current.rstrip("\u200c\u200d")
+        if current:
+            clusters.append(current)
+        current = ""
+        pending_join = False
+        regional_count = 0
+
+    for character in value:
+        codepoint = ord(character)
+        if _is_grapheme_extension(character):
+            if current:
+                current += character
+            continue
+        if codepoint in (0x200C, 0x200D):
+            if current:
+                current += character
+                pending_join = True
+            continue
+        regional = 0x1F1E6 <= codepoint <= 0x1F1FF
+        if not current:
+            current = character
+            regional_count = 1 if regional else 0
+        elif pending_join:
+            current += character
+            pending_join = False
+            regional_count = 0
+        elif regional and regional_count == 1:
+            current += character
+            regional_count = 2
+        else:
+            flush()
+            current = character
+            regional_count = 1 if regional else 0
+    flush()
+    return clusters
+
+
 def truncate_text(value: str, max_length: int) -> str:
     """Truncate at a readable Unicode boundary without splitting a word when possible."""
-    if len(value) <= max_length:
+    if not safe_unicode_scalar_text(value):
+        return ""
+    clusters = notification_clusters(value)
+    if len(clusters) <= max_length:
         return value
     if max_length <= 1:
         return "…"[:max_length]
-    prefix = value[: max_length - 1].rstrip()
-    boundary = max(prefix.rfind(" "), prefix.rfind("\n"))
-    if boundary >= int((max_length - 1) * 0.7):
-        prefix = prefix[:boundary].rstrip()
-    return prefix + "…"
+    keep = max_length - 1
+    boundary = -1
+    for index in range(keep - 1, -1, -1):
+        if clusters[index].isspace():
+            boundary = index
+            break
+    if boundary >= int(keep * 0.7):
+        keep = boundary
+    return "".join(clusters[:keep]).rstrip() + "…"
 
 
 def truncate_utf8(value: str, max_bytes: int) -> str:
     """Fit text into a byte budget while keeping valid UTF-8."""
+    if not safe_unicode_scalar_text(value):
+        return ""
     encoded = value.encode("utf-8")
     if len(encoded) <= max_bytes:
         return value
     suffix = "…"
     budget = max(0, max_bytes - len(suffix.encode("utf-8")))
-    prefix = encoded[:budget].decode("utf-8", errors="ignore").rstrip()
+    prefix_parts: list[str] = []
+    used = 0
+    for cluster in notification_clusters(value):
+        cluster_bytes = len(cluster.encode("utf-8"))
+        if used + cluster_bytes > budget:
+            break
+        prefix_parts.append(cluster)
+        used += cluster_bytes
+    prefix = "".join(prefix_parts).rstrip()
     return prefix + suffix if max_bytes >= len(suffix.encode("utf-8")) else ""
 
 
+def normalize_display_text(text: Any) -> str:
+    value = str(text or "")
+    if not safe_unicode_scalar_text(value):
+        return ""
+    value = value.replace("\r\n", "\n").replace("\r", "\n").replace("\u2028", "\n").replace("\u2029", "\n")
+    cleaned = "".join(
+        character
+        for character in value
+        if not (
+            (ord(character) < 0x20 and character not in ("\t", "\n"))
+            or 0x7F <= ord(character) <= 0x9F
+            or ord(character) in BIDI_CONTROL_CODEPOINTS
+            or ord(character) == 0xFEFF
+        )
+    )
+    return unicodedata.normalize("NFC", cleaned)
+
+
 def sanitize(text: Any, max_length: int = 900, *, preserve_lines: bool = False) -> str:
-    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = normalize_display_text(text)
+    if not value:
+        return ""
     if preserve_lines:
         value = re.sub(r"[\t\f\v ]+", " ", value)
         value = re.sub(r" *\n *", "\n", value)
@@ -134,11 +298,29 @@ def sanitize(text: Any, max_length: int = 900, *, preserve_lines: bool = False) 
 
 def markdown_to_plain_text(text: Any) -> str:
     """Render the small Markdown subset used in completion summaries as compact text."""
-    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = normalize_display_text(text)
+    if not value:
+        return ""
     literals: list[str] = []
 
+    namespace = ""
+    for nonce in range(32):
+        digest = hashlib.sha256(
+            f"codex-ntfy-markdown-literal/v1|{nonce}|{value}".encode("utf-8")
+        ).hexdigest()
+        left = chr(0xE000 + int(digest[:4], 16) % 6400)
+        right = chr(0xE000 + int(digest[4:8], 16) % 6400)
+        if right == left:
+            right = chr(0xE000 + ((ord(right) - 0xE000 + 1) % 6400))
+        candidate = left + digest[8:24] + right
+        if candidate not in value:
+            namespace = candidate
+            break
+    if not namespace:
+        return value
+
     def protect(literal: str) -> str:
-        token = f"\ue000{len(literals)}\ue001"
+        token = f"{namespace}{len(literals)}{namespace}"
         literals.append(literal)
         return token
 
@@ -187,7 +369,7 @@ def markdown_to_plain_text(text: Any) -> str:
         value = re.sub(r"(?<![\w*])\*([^*\r\n]+)\*(?![\w*])", r"\1", value)
         value = re.sub(r"(?<![\w_])_([^_\r\n]+)_(?![\w_])", r"\1", value)
     for index, literal in enumerate(literals):
-        value = value.replace(f"\ue000{index}\ue001", literal)
+        value = value.replace(f"{namespace}{index}{namespace}", literal)
     return value.strip()
 
 
@@ -217,6 +399,10 @@ class Runtime:
         self.last_watch_cursor_refresh_ms = 0
         self.watch_cursor_cache: dict[str, Path] = {}
         self.cold_discovery_ran_this_scan = False
+        self.watch_bytes_read = 0
+        self.watch_backlog_files = 0
+        self.watch_truncated_replays = 0
+        self.watch_corrupt_files = 0
 
     def ensure(self) -> None:
         for path in (
@@ -289,18 +475,42 @@ def load_config(runtime: Runtime) -> dict[str, Any]:
     def setting(env_name: str, key: str, default: Any = "") -> Any:
         return os.environ.get(env_name) or file_config.get(key, default)
 
-    tags = file_config.get("tags", ["white_check_mark"])
-    if tags is None:
-        tags = ["white_check_mark"]
-    if isinstance(tags, str):
-        tags = [part.strip() for part in tags.split(",") if part.strip()]
-    elif isinstance(tags, list):
-        tags = [str(part).strip() if isinstance(part, str) else "" for part in tags]
+    raw_tags = file_config.get("tags", ["white_check_mark"])
+    if raw_tags is None:
+        raw_tags = []
+    if isinstance(raw_tags, str):
+        tag_items: list[Any] = raw_tags.split(",")
+    elif isinstance(raw_tags, list):
+        tag_items = list(raw_tags)
     else:
         raise ValueError("tags must be an array of strings or a comma-separated string")
-    if any(not tag or len(tag) > 32 or any(character.isspace() for character in tag) for tag in tags):
-        raise ValueError("tags must contain non-empty strings of at most 32 characters without whitespace")
-    tags = list(dict.fromkeys(tags))
+    valid_tags: list[str] = []
+    invalid_tag = False
+    for item in tag_items:
+        if not isinstance(item, str) or not safe_unicode_scalar_text(item):
+            invalid_tag = True
+            continue
+        tag = unicodedata.normalize("NFC", item.strip())
+        clusters = notification_clusters(tag)
+        if (
+            not tag
+            or len(clusters) > 32
+            or "".join(clusters) != tag
+            or any(character.isspace() for character in tag)
+            or any(
+                ord(character) < 0x20
+                or 0x7F <= ord(character) <= 0x9F
+                or ord(character) in BIDI_CONTROL_CODEPOINTS
+                or ord(character) == 0xFEFF
+                for character in tag
+            )
+        ):
+            invalid_tag = True
+            continue
+        valid_tags.append(tag)
+    if len(tag_items) > 1 or invalid_tag:
+        runtime.log("normalized ntfy tags to one valid status tag")
+    tags = [valid_tags[0] if valid_tags else "white_check_mark"]
     priority = int(file_config.get("priority", 3))
     if not 1 <= priority <= 5:
         raise ValueError("priority must be between 1 and 5")
@@ -368,6 +578,28 @@ def safe_server_display(value: str) -> str:
         return "invalid"
 
 
+def _decode_jsonl_line(
+    raw: bytes, *, allow_bom: bool = False, max_bytes: int = TITLE_JSONL_LINE_BYTES
+) -> Any:
+    if len(raw) > max_bytes:
+        raise json.JSONDecodeError("JSONL line exceeds the title metadata limit", "", 0)
+    try:
+        text = raw.decode("utf-8-sig" if allow_bom else "utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise json.JSONDecodeError("JSONL line is not strict UTF-8", "", 0) from error
+    return strict_json_loads(text.rstrip("\r"))
+
+
+def read_first_json_line(path: Path, max_bytes: int = FIRST_METADATA_LINE_BYTES) -> Any:
+    with path.open("rb") as handle:
+        raw = handle.readline(max_bytes + 2)
+    terminated = raw.endswith(b"\n")
+    content = raw[:-1] if terminated else raw
+    if len(content) > max_bytes or (len(raw) == max_bytes + 2 and not terminated):
+        raise json.JSONDecodeError("first JSONL line exceeds the metadata limit", "", 0)
+    return _decode_jsonl_line(content, allow_bom=True, max_bytes=max_bytes)
+
+
 def thread_title(runtime: Runtime, thread_id: str, session_home: str = "", sqlite_home: str = "") -> str:
     if not thread_id:
         return ""
@@ -383,17 +615,40 @@ def thread_title(runtime: Runtime, thread_id: str, session_home: str = "", sqlit
         return ""
     title = ""
     try:
-        with index.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                if thread_id not in line:
-                    continue
-                with contextlib.suppress(json.JSONDecodeError):
-                    item = json.loads(line)
-                    if item.get("id") == thread_id and item.get("thread_name"):
-                        title = str(item["thread_name"])
+        with index.open("rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            start = max(0, size - SESSION_INDEX_TAIL_BYTES)
+            handle.seek(start)
+            data = handle.read(SESSION_INDEX_TAIL_BYTES)
+        if start > 0:
+            boundary = data.find(b"\n")
+            data = data[boundary + 1 :] if boundary >= 0 else b""
+        for index_number, raw_line in enumerate(data.splitlines()):
+            if thread_id.encode("ascii", errors="ignore") not in raw_line:
+                continue
+            try:
+                item = _decode_jsonl_line(raw_line, allow_bom=start == 0 and index_number == 0)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict) and item.get("id") == thread_id and item.get("thread_name"):
+                candidate = item["thread_name"]
+                if isinstance(candidate, str) and safe_unicode_scalar_text(candidate):
+                    title = candidate
     except OSError:
         pass
     return title
+
+
+def sqlite_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        text = bytes(value).decode("utf-8", errors="strict")
+    else:
+        text = str(value)
+    if not safe_unicode_scalar_text(text):
+        raise ValueError("SQLite text contains an invalid Unicode scalar or replacement character")
+    return text
 
 
 def sqlite_scalar(database: Path, sql: str, parameter: str) -> tuple[bool, str]:
@@ -406,8 +661,8 @@ def sqlite_scalar(database: Path, sql: str, parameter: str) -> tuple[bool, str]:
         connection = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True, timeout=0.5)
         connection.execute("PRAGMA query_only = ON")
         row = connection.execute(sql, (parameter,)).fetchone()
-        return True, "" if row is None or row[0] is None else str(row[0])
-    except (OSError, sqlite3.Error):
+        return True, "" if row is None else sqlite_text(row[0])
+    except (OSError, sqlite3.Error, UnicodeError, ValueError):
         return False, ""
     finally:
         if connection is not None:
@@ -425,8 +680,8 @@ def sqlite_rows(database: Path, sql: str, parameter: str) -> tuple[bool, list[tu
         connection = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True, timeout=0.5)
         connection.execute("PRAGMA query_only = ON")
         rows = connection.execute(sql, (parameter,)).fetchall()
-        return True, [tuple("" if value is None else str(value) for value in row) for row in rows]
-    except (OSError, sqlite3.Error):
+        return True, [tuple(sqlite_text(value) for value in row) for row in rows]
+    except (OSError, sqlite3.Error, UnicodeError, ValueError):
         return False, []
     finally:
         if connection is not None:
@@ -447,30 +702,114 @@ def state_database_path(sqlite_home: Path) -> Path:
     return preferred
 
 
-def state_database_classification(codex_home: Path, thread_id: str) -> str:
+def state_database_thread_info(codex_home: Path, thread_id: str) -> tuple[str, str]:
+    """Return exact-PK classification and rollout path without filesystem walks."""
     database = state_database_path(codex_home)
-    available, value = sqlite_scalar(
+    available, rows = sqlite_rows(
         database,
-        "SELECT COALESCE(thread_source, '') FROM threads WHERE id = ? LIMIT 1",
+        "SELECT rollout_path, COALESCE(thread_source, ''), COALESCE(source, '') "
+        "FROM threads WHERE id = ? LIMIT 1",
         thread_id,
     )
-    if available and value.lower() == "subagent":
-        return "subagent"
+    if not available:
+        available, rows = sqlite_rows(
+            database,
+            "SELECT rollout_path, '', COALESCE(source, '') FROM threads WHERE id = ? LIMIT 1",
+            thread_id,
+        )
+    if not available or not rows:
+        return "unknown", ""
+    rollout_path, thread_source, source = rows[0]
+    if thread_source.lower() == "subagent" or '"subagent"' in source.lower():
+        return "subagent", rollout_path
     edge_available, edge = sqlite_scalar(
         database,
         "SELECT child_thread_id FROM thread_spawn_edges WHERE child_thread_id = ? LIMIT 1",
         thread_id,
     )
     if edge_available and edge:
-        return "subagent"
-    if available and value != "":
-        return "root"
-    # Older rows can have an empty thread_source. Their source still carries the
-    # structured subagent marker, while ordinary local clients use a short string.
-    source_available, source = sqlite_scalar(database, "SELECT source FROM threads WHERE id = ? LIMIT 1", thread_id)
-    if source_available and source:
-        return "subagent" if '"subagent"' in source else "root"
-    return "unknown"
+        return "subagent", rollout_path
+    if thread_source or (source and edge_available):
+        return "root", rollout_path
+    return "unknown", rollout_path
+
+
+def state_database_classification(codex_home: Path, thread_id: str) -> str:
+    return state_database_thread_info(codex_home, thread_id)[0]
+
+
+def trusted_rollout_candidate(candidate: Path, session_home: Path, thread_id: str) -> Path | None:
+    """Accept only an identity-matching rollout inside this Codex home."""
+    if not thread_id:
+        return None
+    try:
+        resolved_candidate = candidate.resolve(strict=True)
+        if not resolved_candidate.is_file():
+            return None
+        resolved_home = session_home.resolve(strict=True)
+        allowed_roots = [
+            root.resolve(strict=True)
+            for root in (resolved_home / "sessions", resolved_home / "archived_sessions")
+            if root.is_dir()
+        ]
+        if not any(resolved_candidate.is_relative_to(root) for root in allowed_roots):
+            return None
+        metadata = read_first_json_line(resolved_candidate)
+        payload = metadata.get("payload") if isinstance(metadata, dict) else None
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("type") != "session_meta"
+            or not isinstance(payload, dict)
+            or payload.get("id") != thread_id
+        ):
+            return None
+        return resolved_candidate
+    except (OSError, json.JSONDecodeError, RuntimeError):
+        return None
+
+
+def exact_rollout_path(stored_path: str, session_home: Path, thread_id: str) -> Path | None:
+    if not stored_path:
+        return None
+    candidate = Path(stored_path)
+    trusted = trusted_rollout_candidate(candidate, session_home, thread_id)
+    if trusted is not None:
+        return trusted
+    normalized = stored_path.replace("\\", "/")
+    marker = normalized.lower().find("/.codex/")
+    if marker < 0:
+        return None
+    relative_text = normalized[marker + len("/.codex/") :]
+    relative = Path(relative_text)
+    if relative.is_absolute() or not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        return None
+    translated = session_home.joinpath(*relative.parts)
+    return trusted_rollout_candidate(translated, session_home, thread_id)
+
+
+def bounded_session_index_contains(session_home: Path, thread_id: str) -> bool:
+    index = session_home / "session_index.jsonl"
+    try:
+        with index.open("rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            start = max(0, size - SESSION_INDEX_MAX_BYTES)
+            handle.seek(start)
+            data = handle.read(SESSION_INDEX_MAX_BYTES)
+        if start > 0:
+            boundary = data.find(b"\n")
+            data = data[boundary + 1 :] if boundary >= 0 else b""
+        for index_number, raw_line in enumerate(data.splitlines()):
+            if thread_id.encode("ascii", errors="ignore") not in raw_line:
+                continue
+            try:
+                item = _decode_jsonl_line(raw_line, allow_bom=start == 0 and index_number == 0)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict) and item.get("id") == thread_id:
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def goal_status(codex_home: Path, thread_id: str) -> tuple[bool, str]:
@@ -545,27 +884,31 @@ def last_rollout_lifecycle(path: Path) -> tuple[str, str, int, bool, bool]:
         latest_turn_id = ""
         lines = raw_tail.splitlines()
         for line in reversed(lines):
+            if len(line) > MAX_FALLBACK_ROLLOUT_LINE_BYTES:
+                invalid_lifecycle = True
+                continue
             try:
                 decoded = line.decode("utf-8", errors="strict")
             except UnicodeDecodeError:
                 invalid_lifecycle = True
                 continue
-            if not any(marker in decoded for marker in ("task_started", "task_complete", "turn_aborted")):
-                continue
+            has_literal_lifecycle = any(
+                marker in decoded for marker in ("task_started", "task_complete", "turn_aborted")
+            )
             try:
-                envelope = json.loads(decoded)
+                envelope = strict_json_loads(decoded)
             except json.JSONDecodeError:
-                invalid_lifecycle = True
+                invalid_lifecycle = invalid_lifecycle or has_literal_lifecycle
                 continue
             if not isinstance(envelope, dict) or envelope.get("type") != "event_msg":
                 continue
             payload = envelope.get("payload")
             if not isinstance(payload, dict):
-                invalid_lifecycle = True
+                invalid_lifecycle = invalid_lifecycle or has_literal_lifecycle
                 continue
             event_type_value = payload.get("type")
             if not isinstance(event_type_value, str) or not event_type_value.strip():
-                invalid_lifecycle = True
+                invalid_lifecycle = invalid_lifecycle or has_literal_lifecycle
                 continue
             event_type = event_type_value.strip()
             if event_type not in ("task_started", "task_complete", "turn_aborted"):
@@ -697,26 +1040,51 @@ def event_classification(
     if not thread_id:
         return "unknown"
     codex_home = Path(session_home or runtime.codex_home)
-    database_classification = state_database_classification(Path(session_sqlite_home or codex_home), thread_id)
+    database_classification, stored_rollout = state_database_thread_info(
+        Path(session_sqlite_home or codex_home), thread_id
+    )
     if database_classification != "unknown":
         return database_classification
-    for root_name in ("sessions", "archived_sessions"):
-        root = codex_home / root_name
-        if not root.exists():
-            continue
+    session = exact_rollout_path(stored_rollout, codex_home, thread_id)
+    if session is not None:
         try:
-            matches = root.rglob(f"*{thread_id}*.jsonl")
-            session = next(matches, None)
-            if session is None:
-                continue
-            with session.open("r", encoding="utf-8", errors="replace") as handle:
-                metadata = json.loads(handle.readline())
+            metadata = read_first_json_line(session)
             session_source = obj_value(obj_value(metadata, "payload", default={}), "source", default={})
             if isinstance(session_source, dict) and session_source.get("subagent") is not None:
                 return "subagent"
             return "root"
         except (OSError, json.JSONDecodeError):
+            pass
+    if bounded_session_index_contains(codex_home, thread_id):
+        return "root"
+    # A brand-new active session can precede both SQLite and session_index.jsonl.
+    # Probe only the current/previous date buckets (plus the flat archive root),
+    # cap candidates, and verify the embedded identity before trusting metadata.
+    dates = (dt.datetime.now().date(), dt.datetime.now().date() - dt.timedelta(days=1))
+    buckets = [codex_home / "sessions" / day.strftime("%Y/%m/%d") for day in dates]
+    buckets.append(codex_home / "archived_sessions")
+    for bucket in buckets:
+        if not bucket.is_dir():
             continue
+        try:
+            candidates = list(candidate for _, candidate in zip(range(8), bucket.glob(f"*{thread_id}*.jsonl")))
+        except OSError:
+            continue
+        for candidate in candidates:
+            trusted = trusted_rollout_candidate(candidate, codex_home, thread_id)
+            if trusted is None:
+                continue
+            try:
+                metadata = read_first_json_line(trusted)
+                payload = obj_value(metadata, "payload", default={})
+                if not isinstance(payload, dict) or payload.get("id") != thread_id:
+                    continue
+                session_source = obj_value(payload, "source", default={})
+                if isinstance(session_source, dict) and session_source.get("subagent") is not None:
+                    return "subagent"
+                return "root"
+            except (OSError, json.JSONDecodeError):
+                continue
     return "unknown"
 
 
@@ -724,7 +1092,7 @@ def parse_event(raw: str) -> dict[str, Any] | None:
     if not raw.strip():
         return None
     try:
-        value = json.loads(raw)
+        value = strict_json_loads(raw)
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
@@ -745,17 +1113,18 @@ def find_rollout(
         thread_id,
     )
     if available and stored_path:
-        candidate = Path(stored_path)
-        if candidate.is_file():
+        candidate = exact_rollout_path(stored_path, codex_home, thread_id)
+        if candidate is not None:
             return candidate
     for root_name in ("sessions", "archived_sessions"):
         root = codex_home / root_name
         if not root.exists():
             continue
         with contextlib.suppress(OSError):
-            candidate = next(root.rglob(f"*{thread_id}*.jsonl"), None)
-            if candidate is not None:
-                return candidate
+            for _, candidate in zip(range(64), root.rglob(f"*{thread_id}*.jsonl")):
+                trusted = trusted_rollout_candidate(candidate, codex_home, thread_id)
+                if trusted is not None:
+                    return trusted
     return None
 
 
@@ -903,30 +1272,32 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
     line_offset = previous_offset
     for raw_line in complete_bytes.splitlines(keepends=True):
         line_offset += len(raw_line)
+        if len(raw_line) > MAX_FALLBACK_ROLLOUT_LINE_BYTES:
+            invalid_lifecycle = True
+            continue
         try:
             line = raw_line.rstrip(b"\r\n").decode("utf-8", errors="strict")
         except UnicodeDecodeError:
             invalid_lifecycle = True
             continue
-        if not any(
+        has_literal_relevant_event = any(
             marker in line
             for marker in ("task_started", "task_complete", "turn_aborted", "thread_goal_updated", "user_message")
-        ):
-            continue
+        )
         try:
-            envelope = json.loads(line)
+            envelope = strict_json_loads(line)
         except json.JSONDecodeError:
-            invalid_lifecycle = True
+            invalid_lifecycle = invalid_lifecycle or has_literal_relevant_event
             continue
         if not isinstance(envelope, dict) or envelope.get("type") != "event_msg":
             continue
         payload = envelope.get("payload")
         if not isinstance(payload, dict):
-            invalid_lifecycle = True
+            invalid_lifecycle = invalid_lifecycle or has_literal_relevant_event
             continue
         event_type_value = payload.get("type")
         if not isinstance(event_type_value, str) or not event_type_value.strip():
-            invalid_lifecycle = True
+            invalid_lifecycle = invalid_lifecycle or has_literal_relevant_event
             continue
         event_type = event_type_value.strip()
         if event_type not in ("task_started", "task_complete", "turn_aborted", "thread_goal_updated", "user_message"):
@@ -1163,6 +1534,7 @@ def new_record(
         "schema": 1,
         "key": key,
         "sequence_id": f"codex-{key[:32]}",
+        "provider": "codex",
         "weak_identity": weak,
         "thread_id": thread_id,
         "turn_id": turn_id,
@@ -1175,6 +1547,7 @@ def new_record(
         "completion_event_type": str(
             obj_value(event, "completion-event-type", "completion_event_type", default="")
         ),
+        "goal_status": str(obj_value(event, "goal-status", "goal_status", default="")),
         "created_at": now.isoformat(),
         "created_unix_ms": now_ms,
         "next_probe_unix_ms": now_ms,
@@ -1688,12 +2061,32 @@ def recent_rollouts(runtime: Runtime, config: dict[str, Any], now_ms: int) -> li
 
 def rollout_metadata(path: Path) -> dict[str, Any]:
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            first = json.loads(handle.readline())
+        first = read_first_json_line(path)
         payload = first.get("payload") if isinstance(first, dict) else None
         return payload if isinstance(payload, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def read_rollout_watch_envelope(
+    runtime: Runtime, path: Path, start: int, length: int, limit: int
+) -> dict[str, Any] | None:
+    if start < 0 or length <= 0 or length > limit:
+        return None
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            if start + length > handle.tell():
+                return None
+            handle.seek(start)
+            raw = handle.read(length)
+        runtime.watch_bytes_read += len(raw)
+        if len(raw) != length or not raw.endswith(b"\n"):
+            return None
+        value = strict_json_loads(raw.rstrip(b"\r\n").decode("utf-8", errors="strict"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
 
 
 def scan_rollout_file(
@@ -1708,6 +2101,16 @@ def scan_rollout_file(
 ) -> int:
     if not scan_parent_is_alive(runtime, parent_pid, parent_token):
         return 0
+    try:
+        metadata = read_first_json_line(path)
+        payload = metadata.get("payload") if isinstance(metadata, dict) else None
+        thread_id_from_metadata = str(payload.get("id", "")) if isinstance(payload, dict) else ""
+    except (OSError, json.JSONDecodeError):
+        return 0
+    trusted_path = trusted_rollout_candidate(path, runtime.codex_home, thread_id_from_metadata)
+    if trusted_path is None:
+        return 0
+    path = trusted_path
     state_id = hashlib.sha256(str(path).encode("utf-8")).hexdigest()
     state_path = runtime.watch / f"{state_id}.json"
     state: dict[str, Any] = {}
@@ -1720,142 +2123,304 @@ def scan_rollout_file(
         stat = path.stat()
     except OSError:
         return 0
-    if not state:
+    state_was_missing = not state
+    limit = rollout_watch_max_read_bytes()
+    discard_mode = ""
+    corrupt_epoch = False
+    incomplete_tail = False
+    staged_type = ""
+    staged_turn_id = ""
+    staged_start = -1
+    staged_length = 0
+    thread_id = ""
+    if state_was_missing:
         replay_ms = int(max(0, float(config["watch_initial_replay_seconds"])) * 1000)
-        offset = 0 if force_replay or now_ms - stat.st_mtime_ns // 1_000_000 <= replay_ms else stat.st_size
+        should_replay = force_replay or now_ms - stat.st_mtime_ns // 1_000_000 <= replay_ms
+        # Reserve one byte for the record-boundary probe so total reads remain
+        # within the configured cap while the retained tail still reaches EOF.
+        offset = max(0, stat.st_size - max(1, limit - 1)) if should_replay else stat.st_size
+        if should_replay and offset > 0:
+            discard_mode = "initial"
+            runtime.watch_truncated_replays += 1
     else:
         offset = int(state.get("offset", 0) or 0)
+        discard_mode = str(state.get("discard_mode", ""))
+        corrupt_epoch = bool(state.get("corrupt_epoch", False))
+        incomplete_tail = bool(state.get("incomplete_tail", False))
+        staged_type = str(state.get("staged_type", ""))
+        staged_turn_id = str(state.get("staged_turn_id", ""))
+        staged_start = int(state.get("staged_start", -1) or -1)
+        staged_length = int(state.get("staged_length", 0) or 0)
+        thread_id = str(state.get("thread_id", ""))
         if offset < 0 or offset > stat.st_size:
             offset = stat.st_size
+            discard_mode = ""
+            corrupt_epoch = True
+            incomplete_tail = False
+            staged_type = ""
+            staged_turn_id = ""
+            staged_start = -1
+            staged_length = 0
         has_snapshot = "observed_size" in state and "observed_mtime_ns" in state
         snapshot_unchanged = (
             has_snapshot
             and int(state.get("observed_size", -1)) == stat.st_size
             and int(state.get("observed_mtime_ns", -1)) == stat.st_mtime_ns
         )
-        # Rollouts are append-only. offset==size is also a safe no-op for
-        # legacy cursors that predate snapshot metadata.
-        if snapshot_unchanged or (not has_snapshot and offset == stat.st_size):
+        # Retry staged EOF terminals, but never reread an unchanged partial
+        # tail. Backlog offsets intentionally continue even with a same stat.
+        if (
+            snapshot_unchanged
+            and staged_length <= 0
+            and (offset == stat.st_size or incomplete_tail)
+        ) or (not has_snapshot and offset == stat.st_size and staged_length <= 0):
             return 0
     try:
         with path.open("rb") as handle:
+            snapshot = os.fstat(handle.fileno())
+            snapshot_size = snapshot.st_size
+            snapshot_mtime_ns = snapshot.st_mtime_ns
+            offset = min(offset, snapshot_size)
+            read_budget = limit
+            boundary_bytes = 0
+            if state_was_missing and discard_mode == "initial" and offset > 0:
+                handle.seek(offset - 1)
+                previous = handle.read(1)
+                if previous:
+                    boundary_bytes = 1
+                    read_budget -= 1
+                    if previous == b"\n":
+                        discard_mode = ""
             handle.seek(offset)
-            data = handle.read()
+            data = handle.read(min(max(0, snapshot_size - offset), read_budget))
+        runtime.watch_bytes_read += boundary_bytes + len(data)
     except OSError:
         return 0
-    newline = data.rfind(b"\n")
-    if newline < 0:
-        if not scan_parent_is_alive(runtime, parent_pid, parent_token):
-            return 0
-        atomic_write_json(
-            state_path,
-            {
-                "schema": 1,
-                "rollout_path": str(path),
-                "offset": offset,
-                "seen_unix_ms": now_ms,
-                "observed_size": stat.st_size,
-                "observed_mtime_ns": stat.st_mtime_ns,
-            },
+
+    parse_index = 0
+    corruption_observed = False
+    incomplete_tail = False
+    if discard_mode and data:
+        discard_newline = data.find(b"\n")
+        if discard_newline < 0:
+            parse_index = len(data)
+        else:
+            parse_index = discard_newline + 1
+            discard_mode = ""
+    while parse_index < len(data):
+        newline = data.find(b"\n", parse_index)
+        if newline < 0:
+            break
+        line_start_index = parse_index
+        line_length = newline - line_start_index + 1
+        if line_length > limit:
+            corrupt_epoch = True
+            corruption_observed = True
+            staged_type = staged_turn_id = ""
+            staged_start, staged_length = -1, 0
+            parse_index = newline + 1
+            continue
+        raw_line = data[line_start_index:newline].rstrip(b"\r")
+        try:
+            line = raw_line.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            corrupt_epoch = True
+            corruption_observed = True
+            staged_type = staged_turn_id = ""
+            staged_start, staged_length = -1, 0
+            parse_index = newline + 1
+            continue
+        has_literal_lifecycle = any(
+            marker in line for marker in ("task_started", "task_complete", "turn_aborted")
         )
+        try:
+            envelope = strict_json_loads(line)
+        except json.JSONDecodeError:
+            if has_literal_lifecycle:
+                corrupt_epoch = True
+                corruption_observed = True
+                staged_type = staged_turn_id = ""
+                staged_start, staged_length = -1, 0
+            parse_index = newline + 1
+            continue
+        payload = (
+            envelope.get("payload")
+            if isinstance(envelope, dict) and envelope.get("type") == "event_msg"
+            else None
+        )
+        if not isinstance(payload, dict):
+            if has_literal_lifecycle:
+                corrupt_epoch = True
+                corruption_observed = True
+                staged_type = staged_turn_id = ""
+                staged_start, staged_length = -1, 0
+            parse_index = newline + 1
+            continue
+        event_type_value = payload.get("type")
+        event_type = event_type_value.strip() if isinstance(event_type_value, str) else ""
+        if event_type == "task_started":
+            corrupt_epoch = False
+            staged_type = staged_turn_id = ""
+            staged_start, staged_length = -1, 0
+        elif event_type in ("task_complete", "turn_aborted"):
+            turn_id = str(obj_value(payload, "turn_id", "turnId", default=""))
+            if not turn_id:
+                corrupt_epoch = True
+                corruption_observed = True
+                staged_type = staged_turn_id = ""
+                staged_start, staged_length = -1, 0
+            elif not corrupt_epoch:
+                staged_type = event_type
+                staged_turn_id = turn_id
+                staged_start = offset + line_start_index
+                staged_length = line_length
+        parse_index = newline + 1
+
+    new_offset = offset + parse_index
+    if parse_index < len(data):
+        trailing_length = len(data) - parse_index
+        read_reached_snapshot = offset + len(data) >= snapshot_size
+        if trailing_length >= limit:
+            # Advance monotonically through an oversized unterminated record;
+            # fail closed for this epoch until a later task_started record.
+            corrupt_epoch = True
+            corruption_observed = True
+            staged_type = staged_turn_id = ""
+            staged_start, staged_length = -1, 0
+            discard_mode = "oversize"
+            new_offset = offset + len(data)
+        elif read_reached_snapshot:
+            incomplete_tail = True
+    if new_offset < snapshot_size and not incomplete_tail:
+        runtime.watch_backlog_files += 1
+    if corruption_observed:
+        runtime.watch_corrupt_files += 1
+
+    if not thread_id:
+        metadata = rollout_metadata(path)
+        thread_id = str(obj_value(metadata, "id", "thread_id", "threadId", default=""))
+    cursor_state: dict[str, Any] = {
+        "schema": 1,
+        "rollout_path": str(path),
+        "offset": new_offset,
+        "seen_unix_ms": now_ms,
+        "thread_id": thread_id,
+        "observed_size": snapshot_size,
+        "observed_mtime_ns": snapshot_mtime_ns,
+        "incomplete_tail": incomplete_tail,
+        "discard_mode": discard_mode,
+        "corrupt_epoch": corrupt_epoch,
+        "staged_type": staged_type,
+        "staged_turn_id": staged_turn_id,
+        "staged_start": staged_start,
+        "staged_length": staged_length,
+    }
+    if not scan_parent_is_alive(runtime, parent_pid, parent_token):
         return 0
-    complete = data[: newline + 1]
-    new_offset = offset + newline + 1
-    metadata = rollout_metadata(path)
-    thread_id = str(
-        obj_value(metadata, "id", "thread_id", "threadId", default="")
-        or obj_value(state, "thread_id", default="")
+    atomic_write_json(state_path, cursor_state)
+
+    try:
+        post = path.stat()
+    except OSError:
+        return 0
+    stable_eof = (
+        new_offset == snapshot_size
+        and not incomplete_tail
+        and not discard_mode
+        and post.st_size == snapshot_size
+        and post.st_mtime_ns == snapshot_mtime_ns
     )
+    if not stable_eof or corrupt_epoch or staged_length <= 0:
+        return 0
+    staged_envelope = read_rollout_watch_envelope(
+        runtime, path, staged_start, staged_length, limit
+    )
+    staged_payload = staged_envelope.get("payload") if isinstance(staged_envelope, dict) else None
+    verified_type = str(staged_payload.get("type", "")) if isinstance(staged_payload, dict) else ""
+    verified_turn = (
+        str(obj_value(staged_payload, "turn_id", "turnId", default=""))
+        if isinstance(staged_payload, dict)
+        else ""
+    )
+    if verified_type != staged_type or verified_turn != staged_turn_id:
+        cursor_state.update(
+            {
+                "corrupt_epoch": True,
+                "staged_type": "",
+                "staged_turn_id": "",
+                "staged_start": -1,
+                "staged_length": 0,
+            }
+        )
+        atomic_write_json(state_path, cursor_state)
+        if not corruption_observed:
+            runtime.watch_corrupt_files += 1
+        return 0
+
+    metadata = rollout_metadata(path)
+    if not thread_id:
+        thread_id = str(obj_value(metadata, "id", "thread_id", "threadId", default=""))
+    if not thread_id:
+        runtime.log(f"watcher retained terminal: session identity unavailable path_hash={state_id[:12]}")
+        return 0
     cwd = str(obj_value(metadata, "cwd", default=""))
     source = metadata.get("source")
     originator = str(obj_value(metadata, "originator", default=""))
-    queued = 0
-    completion_missing_identity = False
-    line_end_offset = offset
-    for raw_line in complete.splitlines(keepends=True):
-        line_end_offset += len(raw_line)
-        line = raw_line.rstrip(b"\r\n").decode("utf-8", errors="replace")
-        if "task_complete" not in line and "turn_aborted" not in line:
-            continue
-        with contextlib.suppress(json.JSONDecodeError):
-            envelope = json.loads(line)
-            payload = envelope.get("payload") if isinstance(envelope, dict) else None
-            if not isinstance(payload, dict):
-                continue
-            event_type = str(payload.get("type", ""))
-            if event_type not in ("task_complete", "turn_aborted"):
-                continue
-            turn_id = str(obj_value(payload, "turn_id", "turnId", default=""))
-            if not thread_id:
-                completion_missing_identity = True
-                continue
-            if not turn_id:
-                continue
-            event = {
-                "type": "agent-turn-complete",
-                "thread-id": thread_id,
-                "turn-id": turn_id,
-                "cwd": cwd,
-                "last-assistant-message": str(payload.get("last_agent_message", ""))
-                if event_type == "task_complete"
-                else "",
-                "hook-event-name": "rollout-watch",
-                "completion-event-type": event_type,
-                "source": source,
-            }
-            if isinstance(source, str) and source.strip():
-                classification = "subagent" if source.strip().lower() == "subagent" else "root"
-            elif isinstance(source, dict) and source.get("subagent") is not None:
-                classification = "subagent"
-            else:
-                classification = event_classification(
-                    runtime,
-                    event,
-                    thread_id,
-                    str(runtime.codex_home),
-                    str(runtime.sqlite_home),
-                )
-            origin = originator or platform.node() or "Codex"
-            record = new_record(
-                event,
-                origin,
-                str(runtime.codex_home),
-                str(runtime.sqlite_home),
-                classification,
-                config["include_message"],
-            )
-            record["rollout_identity"] = str(path)
-            record["completion_end_offset"] = line_end_offset
-            record["completion_timestamp"] = str(envelope.get("timestamp", ""))
-            if not scan_parent_is_alive(runtime, parent_pid, parent_token):
-                return 0
-            if config["suppress_subagents"] and classification == "subagent":
-                write_suppressed_receipt(runtime, record, "subagent")
-            elif config["idle_detection_mode"] == "off":
-                enqueue(runtime, record)
-            else:
-                enqueue_pending(runtime, record)
-            queued += 1
-    if completion_missing_identity:
-        # A transient failure while reading session_meta must not turn a
-        # persisted completion into a permanently skipped cursor range.
-        runtime.log(f"watcher retained cursor: session identity unavailable path_hash={state_id[:12]}")
-        return 0
+    event = {
+        "type": "agent-turn-complete",
+        "thread-id": thread_id,
+        "turn-id": verified_turn,
+        "cwd": cwd,
+        "last-assistant-message": str(staged_payload.get("last_agent_message", ""))
+        if verified_type == "task_complete"
+        else "",
+        "hook-event-name": "rollout-watch",
+        "completion-event-type": verified_type,
+        "source": source,
+    }
+    if isinstance(source, str) and source.strip():
+        classification = "subagent" if source.strip().lower() == "subagent" else "root"
+    elif isinstance(source, dict) and source.get("subagent") is not None:
+        classification = "subagent"
+    else:
+        classification = event_classification(
+            runtime,
+            event,
+            thread_id,
+            str(runtime.codex_home),
+            str(runtime.sqlite_home),
+        )
+    origin = originator or platform.node() or "Codex"
+    record = new_record(
+        event,
+        origin,
+        str(runtime.codex_home),
+        str(runtime.sqlite_home),
+        classification,
+        config["include_message"],
+    )
+    record["rollout_identity"] = str(path)
+    record["completion_end_offset"] = staged_start + staged_length
+    record["completion_timestamp"] = str(staged_envelope.get("timestamp", ""))
     if not scan_parent_is_alive(runtime, parent_pid, parent_token):
         return 0
-    atomic_write_json(
-        state_path,
+    if config["suppress_subagents"] and classification == "subagent":
+        write_suppressed_receipt(runtime, record, "subagent")
+    elif config["idle_detection_mode"] == "off":
+        enqueue(runtime, record)
+    else:
+        enqueue_pending(runtime, record)
+    cursor_state.update(
         {
-            "schema": 1,
-            "rollout_path": str(path),
-            "offset": new_offset,
-            "seen_unix_ms": now_ms,
             "thread_id": thread_id,
-            "observed_size": stat.st_size,
-            "observed_mtime_ns": stat.st_mtime_ns,
-        },
+            "staged_type": "",
+            "staged_turn_id": "",
+            "staged_start": -1,
+            "staged_length": 0,
+        }
     )
-    return queued
+    atomic_write_json(state_path, cursor_state)
+    return 1
 
 
 def scan_rollouts(
@@ -1866,6 +2431,10 @@ def scan_rollouts(
     parent_pid: int = 0,
     parent_token: str = "",
 ) -> int:
+    runtime.watch_bytes_read = 0
+    runtime.watch_backlog_files = 0
+    runtime.watch_truncated_replays = 0
+    runtime.watch_corrupt_files = 0
     queued = 0
     for path in recent_rollouts(runtime, config, now_ms):
         if not scan_parent_is_alive(runtime, parent_pid, parent_token):
@@ -1913,14 +2482,35 @@ def codex_task_url(thread_id: Any) -> str:
     return CHATGPT_TASK_URL_PREFIX + canonical
 
 
+def notification_title(value: Any, fallback: str = "workspace") -> str:
+    candidate = sanitize(value, 60)
+    if not candidate:
+        candidate = sanitize(fallback, 60) or "workspace"
+    oversized = len(candidate.encode("utf-8")) > MAX_NTFY_TITLE_BYTES
+    fitted = truncate_utf8(candidate, MAX_NTFY_TITLE_BYTES)
+    if oversized and fitted == "…":
+        safe_fallback = sanitize(fallback, 60)
+        if safe_fallback and safe_fallback != candidate:
+            return notification_title(safe_fallback, "workspace")
+        return "workspace"
+    return fitted or "workspace"
+
+
+def terminal_failure(record: dict[str, Any]) -> bool:
+    if str(record.get("completion_event_type", "")).strip().lower() == "turn_aborted":
+        return True
+    goal = str(record.get("goal_status", "")).strip().lower()
+    return bool(goal) and goal not in ("complete", "achieved")
+
+
 def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     event = record["event"]
     cwd = str(obj_value(event, "cwd", "working-directory", "working_directory", default=""))
-    project = sanitize(project_name(cwd), 60)
+    project = notification_title(project_name(cwd), "workspace")
     display_name = project
     has_distinct_thread_title = False
     if config["include_thread_title"]:
-        local_title = sanitize(
+        raw_local_title = sanitize(
             thread_title(
                 runtime,
                 record.get("thread_id", ""),
@@ -1929,6 +2519,7 @@ def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any
             ),
             60,
         )
+        local_title = notification_title(raw_local_title, project) if raw_local_title else ""
         if local_title:
             display_name = local_title
             has_distinct_thread_title = local_title.casefold() != project.casefold()
@@ -1972,7 +2563,8 @@ def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any
         "message": body,
         "sequence_id": record["sequence_id"],
     }
-    if config["include_task_link"]:
+    provider = record.get("provider", "codex") if "provider" in record else "codex"
+    if config["include_task_link"] and provider == "codex":
         task_url = codex_task_url(record.get("thread_id", ""))
         if task_url:
             payload["click"] = task_url
@@ -1985,8 +2577,8 @@ def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any
                         "clear": True,
                     }
                 ]
-    if config["tags"]:
-        payload["tags"] = config["tags"]
+    success_tag = config["tags"][0] if config.get("tags") else "white_check_mark"
+    payload["tags"] = ["warning" if terminal_failure(record) else success_tag]
     if config["priority"] != 3:
         payload["priority"] = config["priority"]
     if config["markdown"] and bool(summary):
@@ -2026,6 +2618,11 @@ def publish(runtime: Runtime, record: dict[str, Any], config: dict[str, Any]) ->
     elif config["username"] and config["password"]:
         encoded = base64.b64encode(f"{config['username']}:{config['password']}".encode()).decode()
         headers["Authorization"] = f"Basic {encoded}"
+    if any(
+        not safe_unicode_scalar_text(str(value)) or "\r" in str(value) or "\n" in str(value)
+        for value in headers.values()
+    ):
+        raise RuntimeError("refusing unsafe HTTP header content")
     request = urllib.request.Request(
         config["server"],
         data=compact_json(ntfy_payload(runtime, record, config)).encode("utf-8"),
@@ -2038,7 +2635,7 @@ def publish(runtime: Runtime, record: dict[str, Any], config: dict[str, Any]) ->
         if not 200 <= response.status < 300:
             raise RuntimeError(f"HTTP {response.status}")
     with contextlib.suppress(json.JSONDecodeError):
-        decoded = json.loads(body)
+        decoded = strict_json_loads(body)
         if isinstance(decoded, dict):
             return decoded
     return {}
@@ -2181,6 +2778,10 @@ def write_scan_health(
                 "completed_at": completed_at,
                 "duration_ms": duration_ms,
                 "observed": observed,
+                "bytes_read": runtime.watch_bytes_read,
+                "backlog_files": runtime.watch_backlog_files,
+                "truncated_replays": runtime.watch_truncated_replays,
+                "corrupt_files": runtime.watch_corrupt_files,
                 "error": error,
             },
         )
@@ -2200,6 +2801,10 @@ def scan_worker(runtime: Runtime, *, continuous: bool, parent_pid: int, parent_t
                 return 0
             started = utc_now()
             started_at = started.isoformat()
+            runtime.watch_bytes_read = 0
+            runtime.watch_backlog_files = 0
+            runtime.watch_truncated_replays = 0
+            runtime.watch_corrupt_files = 0
             write_scan_health(runtime, status="running", started_at=started_at)
             runtime.log(f"rollout scan started pid={os.getpid()}")
             try:
@@ -2231,7 +2836,10 @@ def scan_worker(runtime: Runtime, *, continuous: bool, parent_pid: int, parent_t
                     duration_ms=duration_ms,
                     observed=observed,
                 )
-                runtime.log(f"rollout scan completed observed={observed} duration_ms={duration_ms}")
+                runtime.log(
+                    f"rollout scan completed observed={observed} duration_ms={duration_ms} "
+                    f"bytes_read={runtime.watch_bytes_read} backlog_files={runtime.watch_backlog_files}"
+                )
             except Exception as exc:
                 completed = utc_now()
                 duration_ms = max(0, int((completed - started).total_seconds() * 1000))

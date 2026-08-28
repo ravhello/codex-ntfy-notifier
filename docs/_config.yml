@@ -1,5 +1,5 @@
 title: Codex ntfy Notifier
-description: Idle-only, durable ntfy notifications for local OpenAI Codex tasks and opt-in Claude Code on Windows.
+description: Idle-only, durable ntfy notifications for local Codex tasks and opt-in Claude Code or AudnCode on Windows.
 theme: jekyll-theme-cayman
 show_downloads: false
 url: https://ravhello.github.io

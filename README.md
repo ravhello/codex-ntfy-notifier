@@ -6,20 +6,20 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![Windows PowerShell 5.1](https://img.shields.io/badge/Windows%20PowerShell-5.1-5391FE.svg)](https://learn.microsoft.com/powershell/)
 
-One compact ntfy push when a local OpenAI Codex root task is verifiably idle—not for intermediate turns. It also supports Claude Code on Windows, including the Code tab in Claude Desktop, through opt-in native lifecycle hooks.
+Final-only ntfy notifications for supported local coding chats, with durable host-local delivery across Windows, WSL, Linux, and Remote SSH installs. WSL normally bridges into the Windows queue and keeps separate native fallback state. OpenAI Codex works in the Codex app, VS Code, and CLI with optional ChatGPT task navigation; opt-in Windows adapters add Claude Code (including Claude Desktop's Code tab) and AudnCode. Ordinary ChatGPT chats without local Codex lifecycle state remain outside the observation boundary.
 
 ![Codex ntfy Notifier waits for locally verifiable idle before sending one compact completion notification](docs/assets/hero.svg)
 
 [Italiano](README.it.md) · [Architecture](docs/architecture.md) · [Privacy and security](docs/security-and-privacy.md) · [Support](SUPPORT.md) · [Alternatives](docs/alternatives.md)
 
 > [!IMPORTANT]
-> This is an unofficial community project. It is not affiliated with or endorsed by OpenAI, Anthropic, or ntfy.
+> This is an unofficial community project. It is not affiliated with or endorsed by OpenAI, Anthropic, AudnCode, or ntfy.
 
 ## What makes it different
 
 - **Idle-aware:** the root task must be locally verifiable as idle; intermediate turns, active goals, and running subagents keep the notification pending.
 - **Durable delivery:** an atomic outbox, stable deduplication, and retry with backoff provide at-least-once delivery after idle confirmation.
-- **Multi-environment:** Codex app, VS Code, CLI, Windows, WSL, native Linux, host-local Remote SSH installs, and opt-in Claude Code on Windows share one durable delivery engine.
+- **Multi-environment:** Codex app, VS Code, CLI, Windows, WSL, native Linux, host-local Remote SSH installs, and opt-in Claude Code or AudnCode on Windows use the same durable delivery design while retaining per-host and per-session isolation.
 - **Fast isolated recovery:** on Windows, the persistent local scanner follows recent Codex SQLite entries instead of repeatedly walking the full session archive, while UNC/WSL recovery runs separately and cannot block local delivery. Remote SSH installs keep their worker and queue on the remote host.
 - **Privacy by default:** prompts and final messages are excluded; task titles, message excerpts, and full paths each require an explicit opt-in.
 
@@ -49,6 +49,22 @@ To also connect Claude Code on Windows (Claude Desktop Code tab, CLI, and VS Cod
 
 The installer atomically merges ordered synchronous main-agent `Stop`/`StopFailure` and `UserPromptSubmit`, plus optional asynchronous `Notification` accelerators (`idle_prompt` and `agent_completed`), into `~/.claude/settings.json`. It preserves unrelated Claude hooks and backs the original file up with the Codex installation snapshot. Claude Code 2.1.198 or newer is required for the complete managed lifecycle set. The installer checks the newest executable found for each detected surface separately—`PATH`, Claude Desktop, VS Code, VS Code Insiders, and Cursor—and stops if any detected surface is older than that minimum.
 
+To connect AudnCode on Windows, use its separate opt-in:
+
+```powershell
+.\install.ps1 -WslDistro Ubuntu -EnableAudnCode
+```
+
+Both adapters can be enabled in one installation:
+
+```powershell
+.\install.ps1 -WslDistro Ubuntu -EnableClaudeCode -EnableAudnCode
+```
+
+When `CLAUDE_CONFIG_DIR` is nonblank, the AudnCode installer follows that directory by default; an explicit `-AudnCodeHome` always wins. If separate AudnCode profiles or launchers use different configuration homes, run the installer once for each home with its matching environment or explicit path. They can share the same `-CodexHome` and durable worker while keeping hooks, markers, sessions, and runtime correlation isolated per AudnCode home.
+
+The AudnCode installer reads `<AudnCodeHome>/settings.json` (normally `~/.openclaude/settings.json`), preserves unrelated entries, and commits an atomic replacement with hook shape 8: seven synchronous events—`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification`, `PostToolUse`, and `SubagentStart`. `SessionStart` matches only `^(startup|resume|clear)$`, `Notification` only `idle_prompt`, and `PostToolUse` exactly `Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage`; every handler has a 60-second hook timeout. Each managed command carries its installer-controlled expected event, which must match the untrusted payload event exactly. Busy/lifecycle ingress is armed before standard input is read; redirected input is strict UTF-8 and capped at 8 MiB. Oversized, malformed, mismatched, timed-out, or interrupted ingress fails closed instead of releasing pending work. AudnCode does not expose a shared lock for this settings file, so close running AudnCode processes before a first install or a hook-shape upgrade. The installer backs up the original files, sets `messageIdleNotifThresholdMs` to 1,000 ms, writes `<AudnCodeHome>/.codex-ntfy-hooks.json`, and removes only verified orphaned notifier hook processes from older shapes. Reopen AudnCode when the marker is created or rotated; an identical reinstall preserves its generation. Hooks run only in workspaces AudnCode already trusts.
+
 ### 1b. Install on native Linux
 
 ```sh
@@ -65,6 +81,8 @@ unset CODEX_NTFY_TOPIC
 In every installed Codex environment, run `/hooks`, inspect the managed `Stop` command, and approve it. The installer never modifies the Codex trust store.
 
 For Claude Code, `/hooks` is a read-only configuration browser: verify four managed event types and five handlers (`Notification` has separate `idle_prompt` and `agent_completed` handlers). Claude normally reloads `settings.json` automatically.
+
+For AudnCode, verify all seven events listed above in its hook view or the selected `<AudnCodeHome>/settings.json`. Every managed handler is synchronous with `timeout: 60`; confirm the exact `SessionStart`, `Notification`, and `PostToolUse` matchers and the trusted expected-event argument. Also confirm that the workspace is trusted. Hot reload applies unchanged-shape updates, but a created or rotated observation marker requires the one-time restart printed by the installer.
 
 ### 3. Run the doctor
 
@@ -100,7 +118,7 @@ python3 ~/.codex/notify-ntfy.py --test
 
 Codex may emit several turn-completion signals while one task is still progressing: an automatic continuation can start immediately, a goal can remain active, or a delegated subagent can still be working. Publishing every signal produces noisy “finished” notifications that are not actually final.
 
-Version 2.4 introduced the logical **idle epoch** retained by 2.5:
+Version 2.4 introduced the logical **idle epoch** retained by 2.5 and 2.6:
 
 - the modern Codex `Stop` hook contributes a candidate; it never publishes directly;
 - the legacy `agent-turn-complete` notification remains a compatibility signal;
@@ -113,6 +131,16 @@ Version 2.4 introduced the logical **idle epoch** retained by 2.5:
 - `strict` mode never fails open: unknown or unavailable evidence is retried during `idle_probe_grace_seconds`, then an unverifiable candidate is suppressed locally instead of becoming a false “done” alert.
 
 Version 2.5 adds a provider-specific Claude path on Windows. Claude `Stop` is accepted only for the main agent when both authoritative work registries are present and empty; `session_id + prompt_id` provides stable deduplication, and `StopFailure` covers turns ended by an API error. `Stop`, `StopFailure`, and `UserPromptSubmit` are ordered synchronously so repeated same-prompt goal stops cannot finish out of order; their initial reverse scan is capped at 1 MiB and any full reconciliation runs in the worker. `UserPromptSubmit` snapshots the previous session-level goal marker and cancels stale candidates before a new prompt can finish. The gate then mirrors Claude's own resume rule from the newest local `attachment.goal_status`: active/not-met markers hold the candidate, a newer achieved/failed marker releases it, and a newer manual-clear sentinel discards it without a notification. `idle_prompt`/`agent_completed` with the same non-empty `prompt_id` are optional asynchronous fallbacks, never required for correctness, so delayed or uncorrelated VS Code idle events cannot release the wrong candidate. The notification body still uses Claude's supplied final message.
+
+Version 2.6 adds a separate AudnCode path on Windows. A normal `Stop` is only a candidate and needs a matching later `Notification: idle_prompt`; `StopFailure` is terminal only after one matching current-prompt transcript error is proven. That proof bypasses only `idle_prompt`: every other gate remains mandatory. `UserPromptSubmit` pre-arms ordinary prompts, while `SessionStart` supplies the guarded root epoch for direct initial-plan and complex-content paths that AudnCode 0.9.x can start without `UserPromptSubmit`. `SubagentStart` distinguishes a fresh synchronous child from a resumed local-agent incarnation. Process-start ordering prevents delayed events from an older prompt from releasing newer work, and `agent_completed` is never accepted as finality.
+
+AudnCode finality is bound to the live host runtime by AudnCode home, PID, and `startedAt`, so `/clear` and `/resume` cannot erase outstanding work. If two live windows expose the same session UUID, output from the old process is never attributed to the new owner: that exact old lifetime remains a hard gate until its ordered `Stop` then `idle_prompt` **and** its host-specific background, cron, and lifecycle guards are all proven clear; only then is that lifetime retired. Parent-process exit alone does not prune a superseded lifetime: detached background work and every host-specific guard are revalidated before removal. The synchronous `PostToolUse` hook records background launches and exact terminal evidence; `Monitor` is always a launch. A successful or malformed `SendMessage` is conservatively sticky because the public build exposes neither the resolved recipient ID nor durable proof that its RAM-only queue was consumed; only an authoritative `success: false` proves no work was queued. Resumed same-ID local agents are counted as separate incarnations, so one delayed terminal cannot close a newer overlap. The gate also requires an empty persisted command queue, completed task lists, no unresolved Ctrl+B sidechain, and no retained non-lead team directory: `isActive: false` or removing a member is not terminal proof; only AudnCode's `TeamDelete` removal releases that team. After at least 1.25 seconds of settling, the entire gate is evaluated three times before the locked outbox commit.
+
+Evidence reads are bounded as an operational safety limit. In 2.6.0, AudnCode queue reconciliation accepts at most 512 MiB across the runtime lineage, 4,096 relevant records, 1,048,576-character lines, and 65,536-character queue content fields; team/task JSON is capped at 1 MiB per file, and team membership at 1,024 entries. Exceeding a limit is unknown evidence and fails closed—it is not interpreted as idle.
+
+Background and cron lifecycle events are durably pre-armed before slower correlation. Overlapping hooks receive independent bounded guard tokens, so one successful mutation cannot clear another in flight. If a synchronous hook is killed, reaches its 60-second timeout, or cannot commit its exact mutation, a later terminal-looking event cannot erase the lost-history uncertainty. Live or candidate-owned runtime/guard files are protected from ordinary age cleanup; the installer separately terminates only command-line-verified orphan hook processes left by obsolete shapes.
+
+Cron finality uses a separate host registry plus AudnCode's native scheduler lease. `CronCreate` records the observed incarnation. A trusted `CronDelete` closes only the exact session-only incarnation created by the same runtime and host; an uncorrelated delete remains fail closed. For durable work, `CronDelete` is diagnostic because it does not prove that the native scheduler stopped owning or running that incarnation, and an empty `.claude/scheduled_tasks.json` is not standalone completion proof. Durable promotion requires causally ordered, stable file snapshots together with the exact `scheduled_tasks.lock` owner/lifetime boundary; ID reuse, a late or foreign lease, a live owner, missing/malformed evidence, or an empty file written after the relevant owner began remains fail closed. Session-only uncertainty without that exact delete ends only with its host lifetime; this also lets an exited pre-install host stop blocking after restart, while its durable files and every host guard are still checked.
 
 After the idle gate, the existing durable delivery engine takes over:
 
@@ -134,17 +162,17 @@ Visible title: ✅ <conversation-or-project>
 Body:  [final message ·] [project ·] origin · #thread8
 ```
 
-The visible title is exactly one completion/status emoji supplied by ntfy plus the local conversation title, or the project directory when title sharing is disabled or unavailable. The JSON `title` contains only that text value. Codex titles come from its read-only state database or local session index; Claude titles come from bounded `ai-title`/`custom-title` transcript metadata. The single default `white_check_mark` tag supplies the emoji; the notifier does not add `Codex`, `Claude`, `done`, a model name, a status label, or another decorative emoji.
+The visible title is exactly one completion/status emoji supplied by ntfy plus the local conversation title, or the project directory when title sharing is disabled or unavailable. The JSON `title` contains only that text value. Codex titles come from bounded read-only database/index lookups; Claude Code and AudnCode titles come from bounded `ai-title`/`custom-title` metadata. Display text is NFC-normalized, strips unsafe control/bidi formatting, and is capped at 60 complete clusters and 240 UTF-8 bytes; invalid scalar text falls back instead of emitting replacement characters. The single tag supplies the emoji; the notifier does not add a provider name, `done`, a model name, a status label, or another decorative emoji.
 
 With the default `markdown: false`, the body is one line and its context has no labels such as `Project:`, `Source:`, or `Thread:`. With the privacy default `include_message: false`, it contains only the necessary project (when not already in the title), origin, and `#` plus the first eight thread-ID characters. With `include_message: true`, a redacted final-message excerpt is prepended; presentational Markdown is reduced to compact plain text while link labels and table-cell text remain, and `max_message_chars` defaults to 180. The complete ntfy `message` is hard-capped at 3,500 UTF-8 bytes regardless of that character setting. An explicit `markdown: true` opt-in preserves Markdown and message lines in the optional excerpt.
 
-Notification taps do nothing extra by default. For Codex only, setting `include_task_link: true` adds the authenticated HTTPS task URL `https://chatgpt.com/codex/tasks/<thread-id>` as [ntfy's `click` target](https://docs.ntfy.sh/publish/#click-action). Claude notifications deliberately omit that ChatGPT URL; Claude does not document a deep link for reopening an existing local Code session.
+Notification taps do nothing extra by default. For Codex only, setting `include_task_link: true` adds the authenticated HTTPS task URL `https://chatgpt.com/codex/tasks/<thread-id>` as [ntfy's `click` target](https://docs.ntfy.sh/publish/#click-action). Claude Code and AudnCode notifications deliberately omit that ChatGPT URL because it cannot identify those local sessions.
 
-Fresh installs use one ntfy tag, `white_check_mark`. Apart from the emoji rendered from that tag, the templates add no decorative emoji to title or body. Markdown is off, and default priority 3 is represented by omitting `priority` from the outgoing JSON. Custom non-default priorities are still sent explicitly.
+Every outgoing payload has exactly one ntfy tag. Success uses the first valid configured tag or `white_check_mark`; any terminal non-success uses `warning`. Older comma-separated or array configurations with several tags are accepted but normalized to the first valid member and logged generically. Apart from the one emoji rendered by ntfy, the templates add no decorative emoji. Markdown is off, and default priority 3 is represented by omitting `priority`.
 
 ## When to use it
 
-Use this project when your priority is one durable phone/desktop push after a local Codex or Windows Claude Code task has no more work, including concurrent sessions and temporary network outages. See [Alternatives and adjacent projects](docs/alternatives.md) for different transports and agents.
+Use this project when your priority is one durable phone/desktop push after a local Codex, Windows Claude Code, or Windows AudnCode task has no more work, including concurrent sessions and temporary network outages. See [Alternatives and adjacent projects](docs/alternatives.md) for different transports and agents.
 
 ## Supported environments
 
@@ -152,6 +180,7 @@ Use this project when your priority is one durable phone/desktop push after a lo
 | --- | --- | --- | --- |
 | Windows 10/11 | modern `Stop` + legacy `notify` + rollout watcher | Task Scheduler | `install.ps1` |
 | Claude Code on Windows | main-agent `Stop`/`StopFailure`, ordered prompt start, transcript goal gate; active work and `/goal` loops fail closed | same Windows worker | `install.ps1 -EnableClaudeCode` |
+| AudnCode on Windows | seven ordered synchronous lifecycle hooks plus guarded background, queue, team/task, CCR, cron-lease, and Ctrl+B sidechain gates | same Windows worker | `install.ps1 -EnableAudnCode` |
 | WSL2 | local signals, Windows bridge, registered rollout root, native fallback | Windows worker / Python fallback | `install.ps1` |
 | Native Linux | modern `Stop` + legacy `notify` + rollout watcher | systemd user service or on-demand | `install-linux.sh` |
 | Remote SSH, Windows | remote signals and rollout state | remote Task Scheduler | `install-remote-windows.ps1` |
@@ -174,7 +203,8 @@ The Windows/WSL quick start above prompts for the topic with hidden input on a f
 5. preserves or installs the root-level legacy `notify` command;
 6. registers the managed modern `hooks.Stop` command without replacing unrelated hook handlers;
 7. when `-EnableClaudeCode` is present, atomically merges ordered synchronous `Stop`/`StopFailure`/`UserPromptSubmit` and optional asynchronous `Notification` handlers into the user Claude settings and includes that file in rollback;
-8. installs the WSL classifier, bridge, and native fallback, then registers that distribution's Codex/SQLite roots with the Windows recovery watcher.
+8. when `-EnableAudnCode` is present, preserves unrelated entries and atomically installs hook shape 8 with seven synchronous 60-second handlers (`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification`, `PostToolUse`, and `SubagentStart`), exact matchers, and a trusted expected-event argument; it sets the 1,000 ms idle threshold, manages the private observation marker, and removes only verified orphaned old-shape hook processes; a machine-global transaction lock serializes every installer touching the shared scheduled task, then a per-home lock protects AudnCode marker changes and compare-and-swap rollback;
+9. installs the WSL classifier, bridge, and native fallback, then registers that distribution's Codex/SQLite roots with the Windows recovery watcher.
 
 For Windows without WSL:
 
@@ -254,7 +284,7 @@ Leave `strict` enabled when “no intermediate notifications” is more importan
 | `include_task_link` | `false` | Add an HTTPS `click` target for the exact task. This sends the full thread ID to ntfy. |
 | `include_task_link_action` | `false` | Also show one **Open task** `view` action. It has no effect unless `include_task_link` is enabled. |
 | `include_full_path` | `false` | Do not add the sanitized full working-directory path to the body. |
-| `tags` | `["white_check_mark"]` | Use one default ntfy tag instead of duplicating an emoji in text. |
+| `tags` | `["white_check_mark"]` | Select one success tag. Multiple legacy values normalize to the first valid member; empty/invalid input falls back to `white_check_mark`, while any terminal non-success uses `warning`. |
 | `priority` | `3` | Use ntfy's default priority; the field is omitted from outgoing JSON when it is 3. |
 | `markdown` | `false` | Send the compact body as plain text. |
 | `suppress_subagents` | `true` | Never send a descendant/subagent completion as its own notification. |
@@ -315,7 +345,7 @@ By default, the ntfy title contains only the project name; the single configured
 
 `include_message` is checked again when an outbox record is sent. Turning it off prevents final-message content in already queued records from leaving the host, but it does not erase the local record, backups, dead letters, a request already in flight, or a notification already accepted by ntfy.
 
-Idle detection reads local Codex lifecycle metadata and read-only SQLite status fields. It queries goal **status**, not the goal objective. The rollout watcher persists path, offset, timestamps, and thread identity—not user prompt bodies. The notifier still needs local read access to Codex rollout files to identify lifecycle markers. With Claude enabled, a memory-bounded reverse scan finds only the newest relevant `goal_status` lifecycle attachment and stores its state plus opaque marker; it does not extract, store, log, or send the goal condition/reason.
+Idle detection reads local Codex lifecycle metadata and read-only SQLite status fields. It queries goal **status**, not the goal objective. The rollout watcher persists path, offset, timestamps, and thread identity—not user prompt bodies. The notifier still needs local read access to Codex rollout files to identify lifecycle markers. With Claude enabled, a memory-bounded reverse scan finds only the newest relevant `goal_status` lifecycle attachment and stores its state plus opaque marker; it does not extract, store, log, or send the goal condition/reason. With AudnCode enabled, the notifier validates the session UUID, transcript location below the configured AudnCode `projects` directory, prompt epoch, host PID/start identity, hook ordering, background IDs, queue operations, task/team state, terminal sidechain evidence, and—only for `StopFailure`—one matching error record after the prompt cursor. Hook JSON is decoded as strict UTF-8 and capped at 8 MiB, so malformed or oversized input is rejected instead of silently producing corrupted characters or unbounded memory use.
 
 Read [Security and privacy](docs/security-and-privacy.md) before enabling message content or copying credentials to remote hosts. Never attach raw config, rollout, database, state, backup, or log files to a public issue.
 
@@ -324,6 +354,10 @@ Read [Security and privacy](docs/security-and-privacy.md) before enabling messag
 - Modern hooks require explicit user review through `/hooks`. The installer never edits the trust store.
 - Claude support currently targets local Claude Code on Windows. The ordinary Claude Chat tab does not expose Claude Code hooks, user interrupts do not emit `Stop`, and hosted work without a local hook is outside the observation boundary.
 - Claude `/goal` finality relies on a memory-bounded reverse scan of Claude's local transcript `attachment.goal_status` records without loading the full transcript. That is an upstream local format and may require an adapter update if Claude changes it; missing or malformed active-goal evidence fails closed instead of sending an intermediate alert.
+- AudnCode support targets the public local AudnCode 0.9.x build on Windows and depends on upstream hook payloads, process/session markers, transcript/queue/error records, team/task directories, CCR sidecars, scheduler lease/files, and sidechain naming. Hooks run only in trusted workspaces. Missing, mismatched, recursive, oversized, ambiguous, or out-of-order evidence fails closed.
+- The public build does not expose durable consumption for successful `SendMessage`, a definitive end for overlapping same-ID resumed local agents, or every ID removed by `clearCommandQueue`, kill-all, or some Ctrl+B paths. These conditions can withhold a true final notification even after host exit; the notifier does not convert them into an intermediate alert. Fresh asynchronous agents without those ambiguity sources can release on counted exact terminal evidence.
+- `/ultrareview` starts a CCR/remote task before the prompt hook and may persist its identity sidecar later. The pre-armed claim stays busy until exact matching remote terminal proof; sidecar deletion, a later prompt, or a different task's terminal is not enough.
+- `CronDelete` is terminal only for an exact correlated session-only incarnation from the same runtime and host. For durable jobs it remains an observation, and an empty `scheduled_tasks.json` is not completion proof; durable finality depends on causally ordered file snapshots and the exact native scheduler lease owner. Missing, malformed, reused, late, or foreign evidence remains fail closed.
 - `strict` mode suppresses a candidate locally as `unverifiable` when matching rollout, root classification, or completion evidence is still missing after `idle_probe_grace_seconds`. This avoids a false final notification but can withhold a true one after an upstream format or storage change.
 - `balanced` can notify after `idle_probe_grace_seconds` when otherwise valid evidence stays unknown or unavailable, so it has a higher false-positive risk. It never promotes malformed UTF-8/lifecycle data or a partial trailing JSONL record.
 - Rollout and local Codex database schemas are upstream implementation details and may require adapter updates.

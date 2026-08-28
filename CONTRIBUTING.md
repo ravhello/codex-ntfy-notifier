@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for helping improve Codex ntfy Notifier. This is an unofficial community project and is not affiliated with OpenAI, Anthropic, or ntfy.
+Thank you for helping improve Codex ntfy Notifier. This is an unofficial community project and is not affiliated with OpenAI, Anthropic, AudnCode, or ntfy.
 
 Contributions are welcome for idle detection, delivery reliability, platform compatibility, privacy, security, tests, and documentation. Keep changes focused on notifying when a supported root coding-agent task has no more work rather than turning the repository into a general notification framework.
 
@@ -20,13 +20,13 @@ Search existing issues and review [Troubleshooting](docs/troubleshooting.md). Fo
 A useful public bug report includes:
 
 - notifier version and operating system/runtime versions;
-- whether Codex runs in the app, VS Code, CLI, WSL, or through Remote SSH;
+- which integration is affected (Codex, Claude Code, or AudnCode) and whether it runs in the app, VS Code, CLI, WSL, or through Remote SSH;
 - the expected and observed behavior;
 - a minimal reproduction that uses a fake topic and fake credentials;
 - sanitized doctor output and relevant log lines;
 - whether the hook/watcher, pending idle gate, outbox, worker, and HTTP stages were reached.
 
-Never attach `ntfy-config.json`, `hooks.json`, Codex session/rollout/database data, pending/outbox records, dead letters, backups, environment dumps, or raw logs. Replace topics, URLs, tokens, usernames, hostnames, paths, thread/turn IDs, goal state, and message content before posting.
+Never attach `ntfy-config.json`, provider hook settings, Codex/Claude Code/AudnCode session, transcript, rollout, database, queue, team/task, CCR, or scheduler files, pending/outbox records, backups, environment dumps, or raw logs. Describe the minimum relevant structure and replace topics, URLs, tokens, usernames, hostnames, paths, IDs, goal state, prompts, and assistant content before posting.
 
 ## Development requirements
 
@@ -156,6 +156,8 @@ Preserve these invariants:
 - invalid records isolated without stopping the rest of the queue;
 - active-child orphan handling is explicit and bounded by `subagent_orphan_seconds`;
 - installers preserve unrelated `hooks.json` groups/handlers/metadata, register only managed `Stop`, and never edit the Codex trust store;
+- AudnCode lifecycle changes preserve shape-8 parity: seven synchronous 60-second events, exact matchers, trusted expected-event arguments, and fail-closed tests for `SendMessage`, same-ID resumes, teams, CCR, and causal cron lease/file evidence;
+- an AudnCode team releases only after `TeamDelete` removes its directory; `isActive: false` and membership removal are never standalone finality proof; `CronDelete` closes only an exact same-runtime session-only incarnation, while durable cron finality still requires native lease/file evidence;
 - secrets absent from doctor output, logs, exceptions, tests, and repository history;
 - private permissions for config, hooks, state, staging, and backups.
 
@@ -188,7 +190,7 @@ Before requesting review:
 - for installer changes, test idempotence and prove unrelated `hooks.json` handlers/metadata survive;
 - update `README.md`, `README.it.md`, or `docs/` for user-visible behavior;
 - add an entry under `Unreleased` in [CHANGELOG.md](CHANGELOG.md);
-- keep `VERSION`, the PowerShell `$ScriptVersion`, and Python `VERSION` in sync when preparing a release;
+- keep `VERSION`, PowerShell `$ScriptVersion`, Python `VERSION`, and installer `$NotifierVersion` in sync when preparing a release;
 - inspect `git diff --check` and the staged diff;
 - scan the full commit history for accidental secrets or personal data;
 - confirm that no real server, topic, token, hostname, username, or private path was added.

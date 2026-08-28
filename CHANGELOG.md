@@ -6,6 +6,73 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-08-28
+
+### Added
+
+- Added opt-in AudnCode support on Windows with hook shape 8: seven synchronous 60-second handlers for `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification`, `PostToolUse`, and `SubagentStart`. `SessionStart` matches `^(startup|resume|clear)$`, `Notification` matches `idle_prompt`, and `PostToolUse` matches exactly `Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage`.
+- Added AudnCode correlation using a synthesized prompt identity, session epoch, validated transcript path, hook-process ordering, and a host-runtime identity derived from AudnCode home, PID, and `startedAt`. The runtime-scoped background registry survives `/clear` and `/resume` while rejecting stale markers and PID reuse.
+- Added final-idle probes for persisted command-queue operations (`enqueue`, `dequeue`, `remove`, and `popAll`) aggregated across the ordered session lineage of one host runtime, background tool IDs and explicit terminal IDs, session/team/custom task lists, team activity, and main-session Ctrl+B sidechains.
+- Added `-EnableAudnCode`, `-AudnCodeHome`, and `-AudnCodeIdleThresholdMs` installer options. The default 1,000 ms final-idle threshold is written to the active AudnCode global configuration.
+- Added AudnCode `CronCreate`/`CronDelete` observation, a host-scoped cron registry, and causal reconciliation against `.claude/scheduled_tasks.json` plus the native `scheduled_tasks.lock` owner/lifetime. An exact correlated `CronDelete` closes only a session-only incarnation owned by that host; durable deletes remain diagnostic, and an empty task file is not standalone completion proof.
+- Added the private, generation-stamped AudnCode hook-observation marker `.codex-ntfy-hooks.json`. Hosts predating a new or repaired hook shape remain fail closed until restart, while an identical reinstall preserves the generation and needs no restart.
+- Added installer-controlled expected-event arguments to every managed AudnCode hook. Prompt/tool events arm a durable per-home ingress token before host discovery, stdin read, or JSON parsing and transfer it to the exact host-runtime guard without an unprotected interval.
+- Added bounded AudnCode evidence processing: 8 MiB raw hook input, 512 MiB/4,096 relevant records across queue lineage, 1,048,576-character queue lines, 65,536-character queue content, 1 MiB team/task files, and 1,024 team members. Exceeding a limit fails closed.
+- Added guarded `SessionStart` coverage for direct initial-plan/complex-content queries that can bypass `UserPromptSubmit`, counted `SubagentStart` coverage for resumed local-agent incarnations, and pre-armed CCR claims for `/ultrareview` remote work.
+
+### Changed
+
+- AudnCode `Stop` is treated only as a completion candidate. A normal result is promoted only after a later, matching `idle_prompt`; `StopFailure` replaces only that idle proof after a unique current-prompt transcript error is correlated, while every other final-idle gate remains required. `agent_completed` is ignored because it does not prove that the complete AudnCode query loop has returned.
+- All managed AudnCode hooks run synchronously with a 60-second upstream timeout because AudnCode 0.9.x notifications do not carry `prompt_id`. Process-start ordering prevents a delayed idle process from an older prompt from releasing newer work.
+- A retained non-lead team directory blocks until AudnCode's `TeamDelete` removes it. `isActive: false`, a missing member, or an empty member list is not terminal proof. Explicit session, team, and valid `CLAUDE_CODE_TASK_LIST_ID` task lists must contain only completed tasks.
+- A Ctrl+B main-session sidechain remains active until a correlated terminal `<task-notification>` appears in either native external main-session form: a `user` record with `origin.kind: task-notification`, or an `attachment` record with `type: queued_command` and `commandMode: task-notification`. Control lines remain anchored while raw XML characters in result/summary text are tolerated; pasted or sidechain-local records are not proof.
+- AudnCode background evidence receives a minimum 1.25-second settle window after normal `idle_prompt` or correlated `StopFailure` terminal proof, independent of the general idle grace. The complete gate runs three times while the record is still pending; the third pass precedes its locked outbox commit.
+- AudnCode settings and the final-idle threshold normally hot-reload for the next turn, but a first installation or changed hook shape requires AudnCode to be closed before installation and reopened after the observation marker is committed. Hook execution still requires the current workspace to be trusted by AudnCode.
+- AudnCode notifications reuse the compact provider-neutral presentation: one ntfy status emoji plus the conversation/project title, no `done` word or model name, a label-free body, and strict UTF-8 handling.
+- The adapter documents the public-build boundary: exact counted terminal evidence can close a fresh asynchronous local agent, but successful/malformed `SendMessage`, overlapping same-ID resumed agents, and unresolved CCR work remain sticky when the public runtime provides no durable consumption/identity proof.
+- Outgoing notifications now always contain exactly one tag: `warning` for every terminal non-success, otherwise the first valid configured tag or `white_check_mark`. Legacy multi-value settings are normalized instead of blocking an upgrade.
+- Display text is normalized to NFC, strips unsafe control/bidi formatting, preserves complete grapheme-like emoji sequences, and never emits invalid scalars or U+FFFD. Titles are capped at 60 display clusters and 240 UTF-8 bytes; messages remain capped at 3,500 bytes without splitting a cluster.
+
+### Fixed
+
+- Prevented intermediate AudnCode stops, recursive stops, subagent events, mismatched transcripts, stale session epochs, delayed old idle events, and unordered hook launches from producing a final notification.
+- Prevented missing, ambiguous, delayed-old, duplicated, malformed, unstable, or payload-mismatched AudnCode `StopFailure` transcript evidence from being treated as a terminal chat.
+- Prevented queued commands, background Agent/Bash/PowerShell/Monitor work, successful or malformed `SendMessage`, unresolved same-ID incarnations, explicit/custom goal tasks, retained non-lead teams, CCR work, and Ctrl+B sidechains from being mistaken for a final idle state.
+- Preserved independent delivery and deduplication across simultaneous AudnCode sessions and existing Codex or Claude Code sessions.
+- Resolved a shared-session-UUID collision between live AudnCode windows without cross-attributing output: the superseded host remains a hard gate until that exact process lifetime supplies an ordered `Stop` then `idle_prompt`, after which only its lifetime is retired and the current owner can complete.
+- Kept a superseded host as a hard gate after `Stop` plus `idle_prompt` until that exact host runtime also proves its background, cron, and lifecycle guards clear; foreground idle alone can no longer forget work owned by the previous window.
+- Made the AudnCode installer follow a nonblank `CLAUDE_CONFIG_DIR` by default while keeping explicit `-AudnCodeHome` precedence, so separate configuration profiles can be installed per home without silently wiring the default profile instead.
+- Prevented AudnCode `Stop` plus foreground idle from notifying while scheduled work remains. Only a non-replayed same-runtime `CronDelete`, proven by its stable post-cursor transcript `tool_use`/`tool_result` pair, can close a session-only incarnation; durable delete requests and empty durable files cannot release work without the causal native scheduler lease/file boundary. Reused IDs and late, foreign, missing, malformed, synthetic, or ambiguous evidence remain fail closed.
+- Pre-armed `SessionStart`, `UserPromptSubmit`, `PostToolUse`, and `SubagentStart` before slower correlation as applicable, then pre-armed background/cron lifecycle mutations in session and host state. A killed, timed-out, oversized, malformed, event-mismatched, or uncorrelated hook leaves durable busy/lost evidence that later terminal events cannot clear.
+- Tracked overlapping background and cron hooks with independent bounded guard tokens; one completed mutation can no longer clear another launch/create/delete still in flight.
+- Kept uncorrelated or failed lifecycle observations sticky across concurrent successful commits, and reconstructed the exact host guard from fallback session correlation whenever possible, so one valid hook cannot heal evidence lost by another.
+- Treated every successful `Monitor` result as a background launch and recognized Agent `isAsync` plus Bash/PowerShell user/automatic-background flags. A claimed asynchronous launch without a valid ID now fails closed.
+- Rechecked live session pre-arm, registry-validity, lifecycle-loss, pending-token, and all exact host-guard states under fixed-order locks through final outbox promotion, closing the race in which a new launch could begin after the last idle snapshot.
+- Held the per-home ingress fallback lock ahead of the exact ingress, background, and cron guards through the pending-to-outbox move. A hook that has started discovery can no longer be hidden in the gap between the first fallback read and the host-guard lock.
+- Preserved every exited superseded host tuple until that exact runtime independently proves ingress, background, cron-lifecycle, remote, team/task, sidechain, and durable-cron finality. A later valid hook from the surviving window can no longer prune detached work merely because the former parent process exited.
+- Rechecked observed host lifetimes while the session lock is held and made failed fresh or resumed `SubagentStart` registration leave sticky lifecycle-loss evidence before ingress completes, so a late event cannot disappear during a handoff.
+- Required the exact cron lifecycle guard to be clear in exited-host finality; an empty cron registry or task file cannot mask a pending, lost, or malformed cron mutation.
+- Released process-bound and session-only uncertainty after the exact AudnCode host lifetime exits, including the otherwise unobservable memory-only cron state of a host that predates hook installation. Observability uses the independently verified Windows process start rather than a potentially delayed session-marker timestamp; structural runtime validity is tracked separately and must validate canonically without repair before finality. Every host guard must still be clear, and active, missing-when-expected, malformed, or unstable durable cron evidence across every project in the runtime lineage remains blocking.
+- Compacted no-cron logical session history without dropping the current registration or any active cron owner, so more than 256 `/clear` lineages do not permanently mute an otherwise idle runtime.
+- Compacted long AudnCode session lineages only after every discarded session independently proves terminal local state, empty remote claims, no live sidecars, no pending lifecycle guard, and tombstoned sidechains. Reused sessions move to the durable lineage tail, while an old live remote agent keeps the complete history fail closed.
+- Avoided rewriting unchanged empty AudnCode remote-claim state on every idle probe, reducing needless disk churn and notification latency on long-running sessions.
+- Preserved cron registry identity across the busy-to-idle state rewrite.
+- Preserved live AudnCode background, cron, and lifecycle-guard records during retention cleanup, including windows open beyond the normal state-retention age.
+- Installer upgrades stop only verified orphaned legacy AudnCode hook processes; current-shape or still-parented processes are preserved.
+
+### Security and rollback
+
+- AudnCode transcript paths must match the session UUID, exist below the configured AudnCode `projects` directory, and correlate with the locked session state. Malformed UTF-8, payloads above 8 MiB, and trusted-event mismatches fail closed.
+- The public AudnCode 0.9.x build can omit a correlatable ID or durable consumption proof for `SendMessage`, overlapping same-ID resumes, `clearCommandQueue`, kill-all, some Ctrl+B paths, and session-only cron firing. The notifier may withhold a true final notification when exact evidence is absent; it never promotes uncertainty into an intermediate notification.
+- The Windows installer preserves unrelated AudnCode settings/hooks, atomically replaces the settings file, and creates private reference snapshots of pre-existing settings, global configuration, and the hook-observation marker. One global installer mutex serializes the shared task and `CodexHome` transaction before the nested per-home marker lock. Process shutdown and task ownership require exact canonical paths and process lifetimes. After a later failure, conditional per-event/per-field rollback changes only managed hooks and `messageIdleNotifThresholdMs` values that still match this installation; even a post-write marker ACL/verification failure is rolled back under the same lock and only while the full content still equals the value written by that run. AudnCode itself exposes no shared settings lock, so it should be closed during hook-changing installs.
+- The Remote Windows helper now performs strict UTF-8 and semantic preflight before any mutation, rejects non-object JSON roots, removes foreign explicit ACL entries before staging secrets, and rolls back file bytes, ACLs, state, backups, and scheduled-task state with compare-and-swap checks after any late failure.
+- The selective AudnCode uninstall procedure now serializes shared settings at PowerShell's full supported JSON depth instead of risking truncation of deeply nested unrelated configuration.
+- JSON configuration, queue/state, lifecycle, title, and watcher paths now reject invalid UTF-8/Unicode scalars. Invalid source titles fall back to the project and invalid optional message text is omitted rather than repaired with replacement characters.
+- Canonicalized valid JSON Unicode escapes before applying Codex lifecycle semantics in both runtimes, so an escaped later `task_started` invalidates an earlier staged terminal instead of producing an intermediate notification.
+- Made authoritative SQLite spawn edges override generic source metadata, preventing a child session recorded as `source=vscode` from bypassing default subagent suppression.
+- Confined database-derived rollout paths to canonical `sessions` or `archived_sessions` roots, rejected traversal/reparse escapes, and required the embedded session identity to match before lifecycle evidence is trusted.
+- Upgrades now add missing `include_message` and `include_thread_title` fields as `false` on local Windows, Remote Windows, Linux, and WSL. Existing explicit opt-ins are preserved.
+
 ## [2.5.2] - 2026-07-18
 
 ### Fixed
@@ -221,7 +288,8 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.2...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.6.0...HEAD
+[2.6.0]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.2...v2.6.0
 [2.5.2]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.2
 [2.5.1]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.1
 [2.5.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.0

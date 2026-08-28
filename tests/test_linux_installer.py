@@ -249,43 +249,53 @@ class LinuxInstallerTests(unittest.TestCase):
         self.assertIn(nested, text)
         self.assertEqual(text.count("notify = ["), 2)
 
-    def test_legacy_bom_config_preserves_content_and_title_behavior(self) -> None:
-        codex_home = self.root / "legacy" / ".codex"
-        codex_home.mkdir(parents=True)
-        legacy = {
-            "server": "https://ntfy.sh",
-            "topic": "legacy-test-topic",
-            "tags": ["computer", "white_check_mark"],
-            "max_message_chars": 900,
-            "markdown": True,
-            "watch_roots": [{"path": r"\\wsl.localhost\Source\home\user\.codex"}],
-        }
-        (codex_home / "ntfy-config.json").write_text(json.dumps(legacy), encoding="utf-8-sig")
+    def test_legacy_bom_config_uses_private_defaults_and_preserves_explicit_opt_in(self) -> None:
+        for case_name, explicit_content_opt_in in (("missing", None), ("explicit", True)):
+            with self.subTest(case=case_name):
+                codex_home = self.root / f"legacy-{case_name}" / ".codex"
+                codex_home.mkdir(parents=True)
+                legacy = {
+                    "server": "https://ntfy.sh",
+                    "topic": "legacy-test-topic",
+                    "tags": ["computer", "white_check_mark"],
+                    "max_message_chars": 900,
+                    "markdown": True,
+                    "watch_roots": [{"path": r"\\wsl.localhost\Source\home\user\.codex"}],
+                }
+                if explicit_content_opt_in is not None:
+                    legacy["include_message"] = explicit_content_opt_in
+                    legacy["include_thread_title"] = explicit_content_opt_in
+                (codex_home / "ntfy-config.json").write_text(
+                    json.dumps(legacy), encoding="utf-8-sig"
+                )
 
-        result = self.run_installer(codex_home, topic=None)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        migrated = json.loads((codex_home / "ntfy-config.json").read_text(encoding="utf-8"))
-        self.assertTrue(migrated["include_message"])
-        self.assertTrue(migrated["include_thread_title"])
-        self.assertFalse(migrated["include_task_link"])
-        self.assertFalse(migrated["include_task_link_action"])
-        self.assertFalse(migrated["allow_insecure_auth"])
-        self.assertEqual(migrated["idle_detection_mode"], "strict")
-        self.assertEqual(migrated["idle_grace_seconds"], 1.5)
-        self.assertEqual(migrated["idle_probe_grace_seconds"], 30)
-        self.assertTrue(migrated["goal_aware"])
-        self.assertEqual(migrated["goal_poll_seconds"], 1)
-        self.assertEqual(migrated["subagent_orphan_seconds"], 1800)
-        self.assertTrue(migrated["suppress_technical_turns"])
-        self.assertTrue(migrated["watch_rollouts"])
-        self.assertEqual(migrated["watch_scan_seconds"], 2)
-        self.assertEqual(migrated["watch_discovery_seconds"], 60)
-        self.assertEqual(migrated["watch_initial_replay_seconds"], 15)
-        self.assertEqual(migrated["watch_roots"], [])
-        self.assertEqual(migrated["dead_retention_days"], 30)
-        self.assertEqual(migrated["tags"], ["white_check_mark"])
-        self.assertEqual(migrated["max_message_chars"], 900)
-        self.assertTrue(migrated["markdown"])
+                result = self.run_installer(codex_home, topic=None)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                migrated = json.loads(
+                    (codex_home / "ntfy-config.json").read_text(encoding="utf-8")
+                )
+                expected_content_opt_in = bool(explicit_content_opt_in)
+                self.assertEqual(migrated["include_message"], expected_content_opt_in)
+                self.assertEqual(migrated["include_thread_title"], expected_content_opt_in)
+                self.assertFalse(migrated["include_task_link"])
+                self.assertFalse(migrated["include_task_link_action"])
+                self.assertFalse(migrated["allow_insecure_auth"])
+                self.assertEqual(migrated["idle_detection_mode"], "strict")
+                self.assertEqual(migrated["idle_grace_seconds"], 1.5)
+                self.assertEqual(migrated["idle_probe_grace_seconds"], 30)
+                self.assertTrue(migrated["goal_aware"])
+                self.assertEqual(migrated["goal_poll_seconds"], 1)
+                self.assertEqual(migrated["subagent_orphan_seconds"], 1800)
+                self.assertTrue(migrated["suppress_technical_turns"])
+                self.assertTrue(migrated["watch_rollouts"])
+                self.assertEqual(migrated["watch_scan_seconds"], 2)
+                self.assertEqual(migrated["watch_discovery_seconds"], 60)
+                self.assertEqual(migrated["watch_initial_replay_seconds"], 15)
+                self.assertEqual(migrated["watch_roots"], [])
+                self.assertEqual(migrated["dead_retention_days"], 30)
+                self.assertEqual(migrated["tags"], ["white_check_mark"])
+                self.assertEqual(migrated["max_message_chars"], 900)
+                self.assertTrue(migrated["markdown"])
 
     def test_unrelated_systemd_unit_is_never_overwritten(self) -> None:
         home = self.root / "linux home"

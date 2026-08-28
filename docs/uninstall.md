@@ -1,12 +1,12 @@
 # Uninstall and rollback
 
-These procedures apply to version 2.5.2. They are intentionally explicit because `~/.codex` belongs to Codex and `~/.claude/settings.json` may contain unrelated Claude configuration; never remove either whole directory.
+These procedures apply to version 2.6.0. They are intentionally explicit because `~/.codex`, `~/.claude`, and `~/.openclaude` belong to their respective tools and may contain unrelated configuration; never remove those whole directories.
 
 An **uninstall** removes only this project’s managed `notify` command, `notify-ntfy` hook handlers, scripts, and worker while preserving unrelated Codex settings and hooks. A **rollback** restores the timestamped snapshot taken immediately before a particular installation or upgrade. Decide which outcome is wanted before deleting anything.
 
 ## Before changing files
 
-1. Close or reload Codex app/CLI processes and VS Code windows after the procedure so they do not retain old hook configuration.
+1. Close or reload affected Codex, Claude Code, and AudnCode surfaces after the procedure so they do not retain old hook configuration. AudnCode normally hot-reloads for the next turn, but an already-running turn should finish first.
 2. Run doctor and inspect both `pending_idle` and `queued`. Wait for both to reach zero, or explicitly accept that idle candidates and network-ready notifications will be discarded.
 3. Select the correct host and user. Each local, WSL, and Remote SSH environment can have a separate `~/.codex`.
 4. Make a private copy of any config or state that may be needed for rollback. It can contain credentials and message content.
@@ -37,18 +37,140 @@ Run these commands in Windows PowerShell as the same user that installed the not
 ### 1. Stop and remove the managed worker
 
 ```powershell
-Stop-ScheduledTask -TaskName CodexNtfyWatcher -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName CodexNtfyWatcher -Confirm:$false -ErrorAction SilentlyContinue
+$CodexHome = [IO.Path]::GetFullPath((Join-Path $HOME '.codex')) # replace when customized
+$ManagedNotifier = [IO.Path]::GetFullPath((Join-Path $CodexHome 'notify-ntfy.ps1'))
+$ManagedWatcher = [IO.Path]::GetFullPath((Join-Path $CodexHome 'watch-codex-ntfy.ps1'))
+$ManagedSupervisor = [IO.Path]::GetFullPath((Join-Path $CodexHome 'watch-codex-ntfy-hidden.vbs'))
 
-Get-CimInstance Win32_Process |
-  Where-Object {
-    $_.Name -in @('powershell.exe', 'pwsh.exe', 'wscript.exe') -and
-    $_.CommandLine -match '(?i)\.codex\\(?:watch-codex-ntfy(?:-hidden)?\.(?:ps1|vbs)|notify-ntfy\.ps1.*-(?:Worker|Continuous))'
-  } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+if (-not ('CodexNtfy.Uninstall.NativeCommandLine' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace CodexNtfy.Uninstall {
+  public static class NativeCommandLine {
+    [DllImport("shell32.dll", SetLastError = true)]
+    public static extern IntPtr CommandLineToArgvW(
+      [MarshalAs(UnmanagedType.LPWStr)] string commandLine,
+      out int argumentCount
+    );
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr LocalFree(IntPtr memory);
+  }
+}
+'@
+}
+
+function Split-WindowsCommandLine {
+  param([AllowEmptyString()][string]$CommandLine)
+  if ([string]::IsNullOrWhiteSpace($CommandLine) -or $CommandLine.Length -gt 131072) { return }
+  $Count = 0
+  $Pointer = [CodexNtfy.Uninstall.NativeCommandLine]::CommandLineToArgvW($CommandLine, [ref]$Count)
+  if ($Pointer -eq [IntPtr]::Zero -or $Count -le 0) { return }
+  try {
+    for ($Index = 0; $Index -lt $Count; $Index++) {
+      $Item = [Runtime.InteropServices.Marshal]::ReadIntPtr($Pointer, $Index * [IntPtr]::Size)
+      [Runtime.InteropServices.Marshal]::PtrToStringUni($Item)
+    }
+  } finally {
+    [void][CodexNtfy.Uninstall.NativeCommandLine]::LocalFree($Pointer)
+  }
+}
+
+function Test-ArgumentPresent {
+  param([string[]]$Arguments, [string]$Expected)
+  return @($Arguments | Where-Object {
+    [string]::Equals([string]$_, $Expected, [StringComparison]::OrdinalIgnoreCase)
+  }).Count -gt 0
+}
+
+function Test-OwnedNotifierProcess {
+  param([object]$Process)
+  $Name = [string]$Process.Name
+  $CommandLine = [string]$Process.CommandLine
+  $Arguments = @(Split-WindowsCommandLine $CommandLine)
+  if ($Arguments.Count -lt 2 -or
+      -not [string]::Equals([IO.Path]::GetFileName($Arguments[0]), $Name, [StringComparison]::OrdinalIgnoreCase)) {
+    return $false
+  }
+  if ($Name -ieq 'wscript.exe') {
+    if ($Arguments.Count -ne 4 -or $Arguments[1] -ine '//B' -or $Arguments[2] -ine '//Nologo') { return $false }
+    try {
+      return [string]::Equals(
+        [IO.Path]::GetFullPath($Arguments[3]),
+        $ManagedSupervisor,
+        [StringComparison]::OrdinalIgnoreCase
+      )
+    } catch { return $false }
+  }
+  if ($Name -notin @('powershell.exe', 'pwsh.exe')) { return $false }
+  $FileIndexes = @(for ($Index = 1; $Index -lt $Arguments.Count; $Index++) {
+    if ($Arguments[$Index] -ieq '-File') { $Index }
+  })
+  if ($FileIndexes.Count -ne 1 -or $FileIndexes[0] + 1 -ge $Arguments.Count) { return $false }
+  try { $Script = [IO.Path]::GetFullPath($Arguments[$FileIndexes[0] + 1]) } catch { return $false }
+  if ([string]::Equals($Script, $ManagedWatcher, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+  if (-not [string]::Equals($Script, $ManagedNotifier, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+  foreach ($Mode in @('-Worker', '-Continuous', '-ScanRollouts', '-Maintenance')) {
+    if (Test-ArgumentPresent $Arguments $Mode) { return $true }
+  }
+  return $false
+}
+
+function Test-OwnedWatcherTask {
+  param([object]$Task)
+  if ($null -eq $Task) { return $false }
+  $Actions = @($Task.Actions)
+  if ($Actions.Count -ne 1) { return $false }
+  try {
+    $ExpectedExecutable = [IO.Path]::GetFullPath((Join-Path $env:WINDIR 'System32\wscript.exe'))
+    $ActualExecutable = [IO.Path]::GetFullPath([string]$Actions[0].Execute)
+    $ActualWorkingDirectory = [IO.Path]::GetFullPath([string]$Actions[0].WorkingDirectory)
+    $ExpectedArguments = '//B //Nologo "{0}"' -f $ManagedSupervisor
+    return [string]::Equals($ActualExecutable, $ExpectedExecutable, [StringComparison]::OrdinalIgnoreCase) -and
+      [string]::Equals([string]$Actions[0].Arguments, $ExpectedArguments, [StringComparison]::OrdinalIgnoreCase) -and
+      [string]::Equals($ActualWorkingDirectory, $CodexHome, [StringComparison]::OrdinalIgnoreCase)
+  } catch { return $false }
+}
+
+$Task = Get-ScheduledTask -TaskName CodexNtfyWatcher -ErrorAction SilentlyContinue
+if ($null -ne $Task) {
+  if (-not (Test-OwnedWatcherTask $Task)) { throw 'CodexNtfyWatcher is not owned by this Codex home; preserved.' }
+  $CurrentTask = Get-ScheduledTask -TaskName CodexNtfyWatcher -ErrorAction SilentlyContinue
+  if ($null -ne $CurrentTask) {
+    if (-not (Test-OwnedWatcherTask $CurrentTask)) { throw 'CodexNtfyWatcher changed before stop; preserved.' }
+    Stop-ScheduledTask -TaskName CodexNtfyWatcher -ErrorAction SilentlyContinue
+    $CurrentTask = Get-ScheduledTask -TaskName CodexNtfyWatcher -ErrorAction SilentlyContinue
+    if ($null -ne $CurrentTask) {
+      if (-not (Test-OwnedWatcherTask $CurrentTask)) { throw 'CodexNtfyWatcher changed before removal; preserved.' }
+      Unregister-ScheduledTask -TaskName CodexNtfyWatcher -Confirm:$false
+    }
+  }
+}
+
+$Snapshots = @(Get-CimInstance Win32_Process | Where-Object { Test-OwnedNotifierProcess $_ } | ForEach-Object {
+  [pscustomobject]@{
+    ProcessId = [int]$_.ProcessId
+    CreationDate = $_.CreationDate
+    Name = [string]$_.Name
+    ExecutablePath = [string]$_.ExecutablePath
+    CommandLine = [string]$_.CommandLine
+  }
+})
+foreach ($Snapshot in $Snapshots) {
+  $Current = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $Snapshot.ProcessId) -ErrorAction SilentlyContinue
+  if ($null -eq $Current) { continue }
+  if ($Current.CreationDate -ne $Snapshot.CreationDate -or
+      [string]$Current.Name -cne $Snapshot.Name -or
+      [string]$Current.ExecutablePath -cne $Snapshot.ExecutablePath -or
+      [string]$Current.CommandLine -cne $Snapshot.CommandLine -or
+      -not (Test-OwnedNotifierProcess $Current)) {
+    throw "Process identity changed before stop; preserved PID $($Snapshot.ProcessId)."
+  }
+  Stop-Process -Id $Snapshot.ProcessId -Force
+}
 ```
 
-Review the process list before using `Stop-Process` in a customized installation.
+The task and process checks are deliberately tied to the selected canonical `CodexHome`. An unrelated task, a command that merely contains a similar filename, or a PID whose creation time/command changed between discovery and use is preserved instead of being stopped.
 
 ### 2. Restore or remove the managed hooks
 
@@ -76,18 +198,44 @@ Select-String -Path "$HOME\.codex\config.toml" -Pattern '^\s*notify\s*='
 
 If a previous non-project hook should be restored, copy its exact root-level `notify = [...]` line from a trusted pre-install backup. Do not add a second root-level `notify` key.
 
-Remove the modern handler selectively. This script scans every hook event so it also cleans up a managed handler left by an older preview, but it retains unrelated handlers, groups, events, and top-level metadata:
+Remove the modern handler selectively. This script scans every hook event, but removes only the current local or Remote Windows managed command shape: the exact Windows PowerShell executable, exact canonical installed script after `-File`, fixed launcher switches, optional quoted remote `-Origin`, and final `-HookEvent` marker must all match. It retains unrelated or historical unknown handlers, groups, events, and top-level metadata, then uses a same-directory atomic replacement after comparing the original bytes again:
 
 ```powershell
-$HooksPath = Join-Path $HOME '.codex\hooks.json'
+$CodexHome = [IO.Path]::GetFullPath((Join-Path $HOME '.codex')) # replace when customized
+$HooksPath = Join-Path $CodexHome 'hooks.json'
+$ManagedScript = [IO.Path]::GetFullPath((Join-Path $CodexHome 'notify-ntfy.ps1'))
+$Utf8Strict = New-Object Text.UTF8Encoding($false, $true)
+
+function Test-ManagedCodexHookHandler {
+  param([object]$Handler, [string]$ExpectedScript)
+  if ($null -eq $Handler -or $Handler -isnot [System.Management.Automation.PSCustomObject] -or
+      [string]$Handler.type -ne 'command') { return $false }
+  $CommandProperty = $Handler.PSObject.Properties['command']
+  if ($null -eq $CommandProperty -or $CommandProperty.Value -isnot [string]) { return $false }
+  $WindowsPowerShell = [IO.Path]::GetFullPath((Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+  $Prefix = '"{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{1}"' -f
+    $WindowsPowerShell, $ExpectedScript
+  $Pattern = '(?i)^' + [regex]::Escape($Prefix) +
+    '(?:\s+-Origin\s+"(?:\\.|[^"\\])*")?\s+-HookEvent$'
+  return [string]$CommandProperty.Value -match $Pattern
+}
+
 if (Test-Path -LiteralPath $HooksPath -PathType Leaf) {
-  $Document = Get-Content -LiteralPath $HooksPath -Raw | ConvertFrom-Json
+  $OriginalBytes = [IO.File]::ReadAllBytes($HooksPath)
+  $BomOffset = if ($OriginalBytes.Length -ge 3 -and $OriginalBytes[0] -eq 0xEF -and
+      $OriginalBytes[1] -eq 0xBB -and $OriginalBytes[2] -eq 0xBF) { 3 } else { 0 }
+  $OriginalText = $Utf8Strict.GetString($OriginalBytes, $BomOffset, $OriginalBytes.Length - $BomOffset)
+  try { $Document = $OriginalText | ConvertFrom-Json } catch { throw "Invalid JSON in ${HooksPath}: $($_.Exception.Message)" }
+  if ($null -eq $Document -or $Document -isnot [System.Management.Automation.PSCustomObject]) {
+    throw "$HooksPath must contain a JSON object."
+  }
   $HooksProperty = $Document.PSObject.Properties['hooks']
   $Changed = $false
 
-  if ($null -ne $HooksProperty -and
-      $null -ne $HooksProperty.Value -and
-      $HooksProperty.Value -is [System.Management.Automation.PSCustomObject]) {
+  if ($null -ne $HooksProperty -and $null -ne $HooksProperty.Value) {
+    if ($HooksProperty.Value -isnot [System.Management.Automation.PSCustomObject]) {
+      throw "hooks in $HooksPath must contain a JSON object."
+    }
     $Events = $HooksProperty.Value
     foreach ($EventProperty in @($Events.PSObject.Properties)) {
       if ($EventProperty.Value -isnot [array]) { continue }
@@ -106,20 +254,7 @@ if (Test-Path -LiteralPath $HooksPath -PathType Leaf) {
         }
 
         $OriginalHandlers = @($HandlersProperty.Value)
-        $KeptHandlers = @($OriginalHandlers | Where-Object {
-          $Managed = $false
-          if ($null -ne $_ -and $_ -is [System.Management.Automation.PSCustomObject]) {
-            foreach ($Field in @('command', 'commandWindows', 'command_windows')) {
-              $Property = $_.PSObject.Properties[$Field]
-              if ($null -ne $Property -and
-                  $Property.Value -is [string] -and
-                  $Property.Value -match '(?i)notify-ntfy') {
-                $Managed = $true
-              }
-            }
-          }
-          -not $Managed
-        })
+        $KeptHandlers = @($OriginalHandlers | Where-Object { -not (Test-ManagedCodexHookHandler $_ $ManagedScript) })
 
         if ($KeptHandlers.Count -ne $OriginalHandlers.Count) {
           $RemovedFromEvent = $true
@@ -144,19 +279,29 @@ if (Test-Path -LiteralPath $HooksPath -PathType Leaf) {
   }
 
   if ($Changed) {
-    $PrivateBackup = "$HooksPath.pre-ntfy-uninstall-$(Get-Date -Format yyyyMMdd-HHmmss)"
-    Copy-Item -LiteralPath $HooksPath -Destination $PrivateBackup
-    $Utf8NoBom = New-Object Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($HooksPath, (($Document | ConvertTo-Json -Depth 32) + [Environment]::NewLine), $Utf8NoBom)
+    $Rendered = ($Document | ConvertTo-Json -Depth 100) + [Environment]::NewLine
+    [void]$Utf8Strict.GetByteCount($Rendered)
+    $OriginalAcl = [IO.File]::GetAccessControl($HooksPath)
+    $PrivateBackup = "$HooksPath.pre-ntfy-uninstall-$([Guid]::NewGuid().ToString('N'))"
+    $TempPath = Join-Path (Split-Path -Parent $HooksPath) ('.' + (Split-Path -Leaf $HooksPath) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+      $Empty = [IO.File]::Open($TempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+      $Empty.Dispose()
+      [IO.File]::SetAccessControl($TempPath, $OriginalAcl)
+      [IO.File]::WriteAllText($TempPath, $Rendered, $Utf8Strict)
+      $CurrentBytes = [IO.File]::ReadAllBytes($HooksPath)
+      if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$OriginalBytes, [byte[]]$CurrentBytes)) {
+        throw "hooks.json changed during uninstall; no changes were written: $HooksPath"
+      }
+      [IO.File]::Replace($TempPath, $HooksPath, $PrivateBackup)
+    } finally {
+      if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Force }
+    }
   }
 }
 ```
 
-If `$Changed` was true, inspect the diff against `$PrivateBackup` locally. Then verify that no managed command remains:
-
-```powershell
-Select-String -Path "$HOME\.codex\hooks.json" -Pattern 'notify-ntfy' -ErrorAction SilentlyContinue
-```
+If `$Changed` was true, inspect the diff against `$PrivateBackup` locally. Rerunning the same block should be an idempotent no-op. A broad text search can still find an unrelated tool with a similar name, so it is not ownership proof; the exact structured predicate above is the verification boundary. Preserve an older or custom shape that does not match it and compare that handler with its trusted installation backup before removing it manually.
 
 Do not delete all of `hooks.json` and do not edit Codex’s hook trust store. A retained approval does not execute anything without a registered hook command; removing trust entries is outside this uninstall.
 
@@ -238,6 +383,216 @@ if (Test-Path -LiteralPath $SettingsPath -PathType Leaf) {
 
 Verify locally with `Select-String -LiteralPath $SettingsPath -Pattern ([regex]::Escape($ManagedScript))`. An empty result confirms removal of this installation. Do not delete the whole Claude settings file.
 
+#### Remove the optional AudnCode handlers
+
+Skip this block if the notifier was not installed with `-EnableAudnCode`. Close every AudnCode window so it cannot rewrite `settings.json` during the transaction. Version 2.6.0 shape 8 has seven synchronous events: `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification: idle_prompt`, `PostToolUse: Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage`, and `SubagentStart`, all with 60-second timeouts. The cleanup scans every event so the current exact command shape and an earlier structured exec/args shape are removed. Set the same custom `-CodexHome`/`-AudnCodeHome` used at install time. Both predicates require the exact installed script, AudnCode home, origin, input marker, and hook marker; unrelated settings, groups, and handlers remain. The code rejects malformed UTF-8, replacement characters, and invalid JSON scalars before any write:
+
+```powershell
+$CodexHome = [IO.Path]::GetFullPath((Join-Path $HOME '.codex')) # replace when customized
+$ManagedScript = [IO.Path]::GetFullPath((Join-Path $CodexHome 'notify-ntfy.ps1'))
+$ManagedQuotedScript = "'" + $ManagedScript.Replace("'", "''") + "'"
+$AudnHome = if ([string]::IsNullOrWhiteSpace($env:CLAUDE_CONFIG_DIR)) {
+  [IO.Path]::GetFullPath((Join-Path $HOME '.openclaude'))
+} else {
+  [IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR)
+} # replace with the installed -AudnCodeHome when explicitly customized
+$SettingsPath = Join-Path $AudnHome 'settings.json'
+$ManagedQuotedHome = "'" + $AudnHome.Replace("'", "''") + "'"
+$AllowedAudnEvents = @('SessionStart', 'UserPromptSubmit', 'Stop', 'StopFailure', 'Notification', 'PostToolUse', 'SubagentStart')
+$ManagedCommandPrefix = "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & " +
+  $ManagedQuotedScript + " -AudnCodeHook -ReadStdin -Origin 'AudnCode' -AudnCodeHome " + $ManagedQuotedHome
+$ManagedCommandPattern = '(?i)^' + [regex]::Escape($ManagedCommandPrefix) +
+  '\s+-AudnCodeExpectedEvent\s+''(?:' + (($AllowedAudnEvents | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')''$'
+
+$Utf8Strict = New-Object Text.UTF8Encoding($false, $true)
+function Assert-SafeUnicodeScalarText {
+  param([AllowEmptyString()][string]$Text, [string]$Label)
+  for ($Index = 0; $Index -lt $Text.Length; $Index++) {
+    $Code = [int][char]$Text[$Index]
+    if ($Code -eq 0xFFFD) { throw "$Label contains U+FFFD replacement text." }
+    if ($Code -ge 0xD800 -and $Code -le 0xDBFF) {
+      if ($Index + 1 -ge $Text.Length) { throw "$Label contains an unpaired high surrogate." }
+      $Low = [int][char]$Text[$Index + 1]
+      if ($Low -lt 0xDC00 -or $Low -gt 0xDFFF) { throw "$Label contains an unpaired high surrogate." }
+      $Index++
+    } elseif ($Code -ge 0xDC00 -and $Code -le 0xDFFF) {
+      throw "$Label contains an unpaired low surrogate."
+    }
+  }
+}
+function Assert-JsonUnicodeScalars {
+  param([object]$Value, [string]$Label)
+  if ($null -eq $Value) { return }
+  if ($Value -is [string]) { Assert-SafeUnicodeScalarText $Value $Label; return }
+  if ($Value -is [Collections.IDictionary]) {
+    foreach ($Key in $Value.Keys) {
+      Assert-SafeUnicodeScalarText ([string]$Key) "$Label key"
+      Assert-JsonUnicodeScalars $Value[$Key] "$Label.$Key"
+    }
+    return
+  }
+  if ($Value -is [pscustomobject]) {
+    foreach ($Property in $Value.PSObject.Properties) {
+      Assert-SafeUnicodeScalarText ([string]$Property.Name) "$Label property"
+      Assert-JsonUnicodeScalars $Property.Value "$Label.$($Property.Name)"
+    }
+    return
+  }
+  if ($Value -is [Collections.IEnumerable]) {
+    foreach ($Item in $Value) { Assert-JsonUnicodeScalars $Item "$Label[]" }
+  }
+}
+function ConvertFrom-StrictJsonBytes {
+  param([byte[]]$Bytes, [string]$Label)
+  $Offset = if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) { 3 } else { 0 }
+  $Text = $Utf8Strict.GetString($Bytes, $Offset, $Bytes.Length - $Offset)
+  Assert-SafeUnicodeScalarText $Text $Label
+  try { $Value = $Text | ConvertFrom-Json } catch { throw "Invalid JSON in ${Label}: $($_.Exception.Message)" }
+  Assert-JsonUnicodeScalars $Value $Label
+  return $Value
+}
+function Test-ManagedAudnCodeHandler {
+  param([object]$Handler)
+  if ($null -eq $Handler -or $Handler -isnot [pscustomobject] -or [string]$Handler.type -ne 'command') {
+    return $false
+  }
+  $CommandProperty = $Handler.PSObject.Properties['command']
+  if ($null -ne $CommandProperty -and $CommandProperty.Value -is [string] -and
+      [string]$CommandProperty.Value -match $ManagedCommandPattern) {
+    return $true
+  }
+  $ArgsProperty = $Handler.PSObject.Properties['args']
+  if ($null -eq $ArgsProperty -or $ArgsProperty.Value -isnot [array]) { return $false }
+  $Args = @($ArgsProperty.Value | ForEach-Object { [string]$_ })
+  $FileIndexes = @(for ($Index = 0; $Index -lt $Args.Count; $Index++) { if ($Args[$Index] -ieq '-File') { $Index } })
+  $HomeIndexes = @(for ($Index = 0; $Index -lt $Args.Count; $Index++) { if ($Args[$Index] -ieq '-AudnCodeHome') { $Index } })
+  $OriginIndexes = @(for ($Index = 0; $Index -lt $Args.Count; $Index++) { if ($Args[$Index] -ieq '-Origin') { $Index } })
+  $EventIndexes = @(for ($Index = 0; $Index -lt $Args.Count; $Index++) { if ($Args[$Index] -ieq '-AudnCodeExpectedEvent') { $Index } })
+  if ($FileIndexes.Count -ne 1 -or $FileIndexes[0] + 1 -ge $Args.Count -or
+      $HomeIndexes.Count -ne 1 -or $HomeIndexes[0] + 1 -ge $Args.Count -or
+      $OriginIndexes.Count -ne 1 -or $OriginIndexes[0] + 1 -ge $Args.Count -or
+      $EventIndexes.Count -gt 1 -or ($EventIndexes.Count -eq 1 -and $EventIndexes[0] + 1 -ge $Args.Count) -or
+      @($Args | Where-Object { $_ -ieq '-AudnCodeHook' }).Count -ne 1 -or
+      @($Args | Where-Object { $_ -ieq '-ReadStdin' }).Count -ne 1 -or
+      -not [string]::Equals($Args[$OriginIndexes[0] + 1], 'AudnCode', [StringComparison]::OrdinalIgnoreCase)) {
+    return $false
+  }
+  try {
+    if (-not [string]::Equals([IO.Path]::GetFullPath($Args[$FileIndexes[0] + 1]), $ManagedScript, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([IO.Path]::GetFullPath($Args[$HomeIndexes[0] + 1]), $AudnHome, [StringComparison]::OrdinalIgnoreCase)) {
+      return $false
+    }
+  } catch { return $false }
+  return $EventIndexes.Count -eq 0 -or $Args[$EventIndexes[0] + 1] -in $AllowedAudnEvents
+}
+
+if (Test-Path -LiteralPath $SettingsPath -PathType Leaf) {
+  $OriginalBytes = [IO.File]::ReadAllBytes($SettingsPath)
+  $OriginalAcl = [IO.File]::GetAccessControl($SettingsPath)
+  $Document = ConvertFrom-StrictJsonBytes $OriginalBytes $SettingsPath
+  if ($null -eq $Document -or $Document -isnot [pscustomobject]) { throw "$SettingsPath must contain a JSON object." }
+  $HooksProperty = $Document.PSObject.Properties['hooks']
+  $Changed = $false
+  if ($null -ne $HooksProperty -and
+      $null -ne $HooksProperty.Value -and
+      $HooksProperty.Value -is [System.Management.Automation.PSCustomObject]) {
+    $Events = $HooksProperty.Value
+    foreach ($EventProperty in @($Events.PSObject.Properties)) {
+      if ($EventProperty.Value -isnot [array]) { continue }
+      $KeptGroups = New-Object 'System.Collections.Generic.List[object]'
+      $RemovedFromEvent = $false
+      foreach ($Group in @($EventProperty.Value)) {
+        if ($null -eq $Group -or $Group -isnot [System.Management.Automation.PSCustomObject]) {
+          $KeptGroups.Add($Group)
+          continue
+        }
+        $HandlersProperty = $Group.PSObject.Properties['hooks']
+        if ($null -eq $HandlersProperty -or $HandlersProperty.Value -isnot [array]) {
+          $KeptGroups.Add($Group)
+          continue
+        }
+        $OriginalHandlers = @($HandlersProperty.Value)
+        $KeptHandlers = @($OriginalHandlers | Where-Object {
+          -not (Test-ManagedAudnCodeHandler $_)
+        })
+        if ($KeptHandlers.Count -ne $OriginalHandlers.Count) { $RemovedFromEvent = $true }
+        if ($KeptHandlers.Count -gt 0) {
+          $HandlersProperty.Value = @($KeptHandlers)
+          $KeptGroups.Add($Group)
+        } elseif ($OriginalHandlers.Count -eq 0) {
+          $KeptGroups.Add($Group)
+        }
+      }
+      if ($RemovedFromEvent) {
+        $Changed = $true
+        if ($KeptGroups.Count -gt 0) {
+          $EventProperty.Value = @($KeptGroups.ToArray())
+        } else {
+          $Events.PSObject.Properties.Remove($EventProperty.Name)
+        }
+      }
+    }
+  }
+  if ($Changed) {
+    $PrivateBackup = "$SettingsPath.pre-ntfy-uninstall-$(Get-Date -Format yyyyMMdd-HHmmss)-$([Guid]::NewGuid().ToString('N'))"
+    $TempPath = Join-Path (Split-Path -Parent $SettingsPath) ('.' + (Split-Path -Leaf $SettingsPath) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $Rendered = ($Document | ConvertTo-Json -Depth 100) + [Environment]::NewLine
+    Assert-SafeUnicodeScalarText $Rendered "rendered AudnCode settings"
+    [void]$Utf8Strict.GetByteCount($Rendered)
+    try {
+      # The empty temp can briefly inherit its directory ACL, but no settings
+      # content is written until it has the exact ACL of settings.json.
+      $Empty = [IO.File]::Open($TempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+      $Empty.Dispose()
+      [IO.File]::SetAccessControl($TempPath, $OriginalAcl)
+      [IO.File]::WriteAllText($TempPath, $Rendered, $Utf8Strict)
+      $CurrentBytes = [IO.File]::ReadAllBytes($SettingsPath)
+      if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$OriginalBytes, [byte[]]$CurrentBytes)) {
+        throw "AudnCode settings changed during uninstall; no changes were written: $SettingsPath"
+      }
+      [IO.File]::Replace($TempPath, $SettingsPath, $PrivateBackup)
+    } finally {
+      if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Force }
+    }
+  }
+}
+```
+
+Verify locally with `Select-String -LiteralPath $SettingsPath -Pattern ([regex]::Escape($ManagedScript))`. Then, in the same PowerShell session (the block reuses the strict helpers above), remove only this project's observation marker after validating ownership. Recognized historical hook-shape versions remain removable; an unknown, malformed, or concurrently changed marker is preserved for review:
+
+```powershell
+$MarkerPath = Join-Path $AudnHome '.codex-ntfy-hooks.json'
+if (Test-Path -LiteralPath $MarkerPath -PathType Leaf) {
+  $MarkerBytes = [IO.File]::ReadAllBytes($MarkerPath)
+  $Marker = ConvertFrom-StrictJsonBytes $MarkerBytes $MarkerPath
+  $ShapeProperty = $Marker.PSObject.Properties['hook_shape_version']
+  $KnownHistoricalShape = $null -eq $ShapeProperty
+  if ($null -ne $ShapeProperty) {
+    try { $KnownHistoricalShape = [int]$ShapeProperty.Value -ge 1 -and [int]$ShapeProperty.Value -le 8 } catch { $KnownHistoricalShape = $false }
+  }
+  $OwnedMarker = [string]$Marker.kind -eq 'codex-ntfy-audncode-hooks' -and
+    [int]$Marker.schema -eq 1 -and
+    $KnownHistoricalShape -and
+    [string]$Marker.generation -match '^[a-f0-9]{32}$' -and
+    [string]::Equals([IO.Path]::GetFullPath([string]$Marker.audncode_home), $AudnHome, [StringComparison]::OrdinalIgnoreCase)
+  if (-not $OwnedMarker) { throw "Unrecognized AudnCode marker; preserved for review: $MarkerPath" }
+  $CurrentMarkerBytes = [IO.File]::ReadAllBytes($MarkerPath)
+  if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$MarkerBytes, [byte[]]$CurrentMarkerBytes)) {
+    throw "AudnCode marker changed during uninstall; preserved: $MarkerPath"
+  }
+  Copy-Item -LiteralPath $MarkerPath -Destination "$MarkerPath.pre-uninstall-$([Guid]::NewGuid().ToString('N'))"
+  $CurrentMarkerBytes = [IO.File]::ReadAllBytes($MarkerPath)
+  if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$MarkerBytes, [byte[]]$CurrentMarkerBytes)) {
+    throw "AudnCode marker changed after backup; preserved: $MarkerPath"
+  }
+  Remove-Item -LiteralPath $MarkerPath -Force
+}
+```
+
+Reopen AudnCode after removing the hooks and marker. Do not delete all of `settings.json` or the entire `.openclaude` directory.
+
+The installer also sets `messageIdleNotifThresholdMs` in AudnCode's active global configuration. Leaving that ordinary timing preference in place is safe and is the recommended manual-uninstall behavior. Automatic installation-failure rollback uses AudnCode's configuration lease and field-level compare-and-swap; a later hand-written whole-file or field rollback cannot reproduce that transaction safely and could erase newer authentication, session, or preference data. Do not restore `audncode-global.json` over the active file. If the threshold must change, close AudnCode and set the preference through AudnCode's supported configuration path.
+
 ### 3. Remove managed files
 
 First assert that the path is the standard Codex home, then remove only named project files:
@@ -271,11 +626,11 @@ Remove-Item -LiteralPath (Join-Path $CodexHome 'ntfy-backups') -Recurse -Force -
 
 ### 4. Reload affected coding-agent surfaces
 
-Reload the Codex app/CLI and every local VS Code window. If Claude handlers were removed, also reload Claude Desktop's Code tab, standalone Claude Code CLI processes, and editor windows using Claude Code. A process that already read Codex hook files or Claude `settings.json` can continue invoking a deleted script until it reloads the configuration or restarts.
+Reload the Codex app/CLI and every local VS Code window. If Claude handlers were removed, also reload Claude Desktop's Code tab, standalone Claude Code CLI processes, and editor windows using Claude Code. AudnCode normally hot-reloads its files for the next turn; end any already-running turn before deleting the script. A process that already read a hook file can continue invoking a deleted script until it reloads the configuration or restarts.
 
 ## Roll back Windows to a selected backup
 
-Local Windows backups can include the managed scripts, private config, `config.toml`, `hooks.json`, the pre-install `claude-settings.json` when Claude support was enabled, and an exported `CodexNtfyWatcher.xml` when that task existed before the installer run. Restore the Claude snapshot only when it will not overwrite unrelated changes made after installation; otherwise use the selective cleanup above. If installation used a custom `-ClaudeHome`, assign that same absolute directory in the rollback block.
+Local Windows backups can include the managed scripts, private config, `config.toml`, `hooks.json`, pre-install Claude/AudnCode settings, an AudnCode global reference snapshot, and a prior `CodexNtfyWatcher.xml`. The block below restores Codex-managed files and optionally Claude settings. It deliberately does **not** restore either AudnCode file wholesale: use the strict selective handler/marker procedure above and leave the ordinary threshold preference in place. Whole-file AudnCode restoration can erase authentication, sessions, or preferences written after the snapshot. If installation used a custom `-ClaudeHome`, assign that same absolute directory below.
 
 Stop the current worker as above. Assign a timestamp explicitly, validate that it is directly under the backup root, and restore the files it contains:
 
@@ -332,9 +687,9 @@ if (Test-Path -LiteralPath $SavedTask -PathType Leaf) {
 }
 ```
 
-This full rollback restores or removes Codex `hooks.json` exactly as captured and restores Claude `settings.json` only when the selected backup contains its pre-install snapshot. Do not restore either whole file when later unrelated hook/settings changes must survive; use the selective handler cleanup instead.
+This rollback restores or removes Codex `hooks.json` as captured and restores Claude settings only when the selected snapshot is intentionally safe to apply. It never restores AudnCode settings or global configuration: use the strict selective cleanup above, and remove a newly created provider file only after proving it contains no unrelated data. An absent provider snapshot never authorizes deleting a current file.
 
-Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.5.2 uses record schema 1 and retains the `pending/` and `watch/` state introduced in 2.4.0; compatibility with an arbitrary older build is not guaranteed.
+Runtime state is not part of the rollback snapshot. Before running substantially older notifier code, move `ntfy-state` to a private, timestamped sibling instead of letting an incompatible version process it. Version 2.6.0 keeps queue and pending-candidate records at schema 1, uses schema 2 for AudnCode lifecycle guards, and retains the `pending/` and `watch/` state introduced in 2.4.0; compatibility with an arbitrary older build is not guaranteed.
 
 Remote Windows backups use the same scheduled-task XML snapshot. The installer refuses to overwrite a task named `CodexNtfyWatcher` unless its action belongs to this project, and an installation failure restores the prior definition and running state automatically.
 
@@ -366,38 +721,70 @@ Inside WSL:
 
 1. privately back up `~/.codex/config.toml` and `~/.codex/hooks.json`;
 2. remove only the root-level line containing `notify-ntfy-wsl.sh`;
-3. remove only command handlers containing `notify-ntfy` from `hooks.json`;
+3. remove only structured command handlers carrying `--hook-event` and the exact resolved notifier path from `hooks.json`;
 4. verify that no unrelated `notify` line or hook changed;
 5. stop any native fallback worker;
 6. remove only the WSL-managed files.
 
-Use this Python cleanup for `hooks.json`. It preserves unrelated handlers, groups, event names, and top-level metadata; it does not edit the Codex trust store:
+Use this Python cleanup for `hooks.json`. It recognizes only a `type: command` handler with one of the installed parsed argument shapes: the exact resolved `notify-ntfy-wsl.sh` from this `CODEX_HOME` immediately followed by `--hook-event`, or a Python interpreter immediately followed by the exact resolved `notify-ntfy.py` and `--hook-event`. It preserves unrelated handlers, groups, event names, and top-level metadata, compares the original bytes immediately before a same-directory atomic replacement, and does not edit the Codex trust store:
 
 ```sh
 python3 - <<'PY'
 import json
 import os
-import shutil
-import time
+import re
+import shlex
+import stat
+import uuid
 from pathlib import Path
 
-path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "hooks.json"
-if not path.is_file():
+home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+path = home / "hooks.json"
+try:
+    original_stat = path.lstat()
+except FileNotFoundError:
     raise SystemExit(0)
+if not stat.S_ISREG(original_stat.st_mode) or path.is_symlink():
+    raise SystemExit(f"hooks.json is not a regular non-symlink file: {path}")
 
-document = json.loads(path.read_text(encoding="utf-8"))
+original_bytes = path.read_bytes()
+document = json.loads(original_bytes.decode("utf-8-sig"))
+if not isinstance(document, dict):
+    raise SystemExit("hooks.json must contain a JSON object")
 events = document.get("hooks")
 if not isinstance(events, dict):
     raise SystemExit("hooks.json has no hooks object; inspect it manually")
 
+wsl_script = (home / "notify-ntfy-wsl.sh").resolve(strict=False)
+python_script = (home / "notify-ntfy.py").resolve(strict=False)
+
+def resolved_absolute(argument):
+    candidate = Path(argument).expanduser()
+    return candidate.resolve(strict=False) if candidate.is_absolute() else None
+
 def managed(handler):
-    if not isinstance(handler, dict):
+    if not isinstance(handler, dict) or handler.get("type") != "command":
         return False
-    return any(
-        isinstance(handler.get(field), str)
-        and "notify-ntfy" in handler[field].lower()
-        for field in ("command", "commandWindows", "command_windows")
-    )
+    for field in ("command", "commandWindows", "command_windows"):
+        command = handler.get(field)
+        if not isinstance(command, str):
+            continue
+        try:
+            arguments = shlex.split(command, posix=True)
+        except ValueError:
+            continue
+        if arguments.count("--hook-event") != 1:
+            continue
+        marker_index = arguments.index("--hook-event")
+        if marker_index == 1 and resolved_absolute(arguments[0]) == wsl_script:
+            return True
+        if (
+            marker_index == 2
+            and re.fullmatch(r"python(?:3(?:\.\d+)*)?", Path(arguments[0]).name)
+            and resolved_absolute(arguments[1]) == python_script
+        ):
+            return True
+    return False
 
 changed = False
 for event_name, groups in list(events.items()):
@@ -409,15 +796,15 @@ for event_name, groups in list(events.items()):
         if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
             kept_groups.append(group)
             continue
-        original = group["hooks"]
-        remaining = [handler for handler in original if not managed(handler)]
-        if len(remaining) != len(original):
+        original_handlers = group["hooks"]
+        remaining = [handler for handler in original_handlers if not managed(handler)]
+        if len(remaining) != len(original_handlers):
             changed = removed_from_event = True
         if remaining:
             updated = dict(group)
             updated["hooks"] = remaining
             kept_groups.append(updated)
-        elif not original:
+        elif not original_handlers:
             kept_groups.append(group)
     if removed_from_event:
         if kept_groups:
@@ -426,19 +813,86 @@ for event_name, groups in list(events.items()):
             del events[event_name]
 
 if changed:
-    backup = path.with_name(path.name + ".pre-ntfy-uninstall-" + time.strftime("%Y%m%d-%H%M%S"))
-    shutil.copy2(path, backup)
-    temporary = path.with_name(path.name + ".ntfy-uninstall.tmp")
-    temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-    temporary.chmod(path.stat().st_mode & 0o777)
-    os.replace(temporary, path)
+    rendered = (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    suffix = uuid.uuid4().hex
+    backup = path.with_name(path.name + ".pre-ntfy-uninstall-" + suffix)
+    temporary = path.with_name("." + path.name + "." + suffix + ".tmp")
+    backup_fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(backup_fd, "wb") as handle:
+        handle.write(original_bytes)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        temporary_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IMODE(original_stat.st_mode),
+        )
+        with os.fdopen(temporary_fd, "wb") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        current_stat = path.lstat()
+        if (
+            not stat.S_ISREG(current_stat.st_mode)
+            or path.is_symlink()
+            or (current_stat.st_dev, current_stat.st_ino) != (original_stat.st_dev, original_stat.st_ino)
+            or path.read_bytes() != original_bytes
+        ):
+            raise RuntimeError(f"hooks.json changed during uninstall; no changes were written: {path}")
+        os.replace(temporary, path)
+        path.chmod(stat.S_IMODE(original_stat.st_mode))
+    finally:
+        temporary.unlink(missing_ok=True)
 PY
 ```
 
+Stop only a native fallback worker whose argument vector has the installed shape: a Python interpreter, then the exact resolved script from this `CODEX_HOME`, then an exact `--worker` token. The helper snapshots the immutable process start-time field from `/proc/<pid>/stat` plus the NUL-delimited command line, then reads both again before sending `SIGTERM`; a reused or changed PID is preserved:
+
 ```sh
+python3 - <<'PY'
+import os
+import re
+import signal
+from pathlib import Path
+
+home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+managed_script = (home / "notify-ntfy.py").resolve(strict=False)
+
+def identity(process):
+    try:
+        raw_stat = process.joinpath("stat").read_bytes()
+        _, separator, trailing_fields = raw_stat.rpartition(b")")
+        fields = trailing_fields.strip().split()
+        if not separator or len(fields) < 20:
+            return None
+        start_time = fields[19]  # field 22; fields here begin at proc-stat field 3
+        return (start_time, process.joinpath("cmdline").read_bytes())
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+
+for process in Path("/proc").iterdir():
+    if not process.name.isdigit() or int(process.name) == os.getpid():
+        continue
+    snapshot = identity(process)
+    if snapshot is None:
+        continue
+    arguments = [os.fsdecode(value) for value in snapshot[1].split(b"\0") if value]
+    owned = (
+        len(arguments) >= 3
+        and re.fullmatch(r"python(?:3(?:\.\d+)*)?", Path(arguments[0]).name)
+        and Path(arguments[1]).is_absolute()
+        and Path(arguments[1]).resolve(strict=False) == managed_script
+        and "--worker" in arguments[2:]
+    )
+    if not owned:
+        continue
+    if identity(process) != snapshot:
+        raise SystemExit(f"process identity changed before stop; preserved PID {process.name}")
+    os.kill(int(process.name), signal.SIGTERM)
+PY
+
 grep -nE '^[[:space:]]*notify[[:space:]]*=' "$HOME/.codex/config.toml"
-grep -n 'notify-ntfy' "$HOME/.codex/hooks.json" 2>/dev/null || true
-pkill -f '[n]otify-ntfy.py --worker' 2>/dev/null || true
 rm -f -- "$HOME/.codex/notify-ntfy-wsl.sh" "$HOME/.codex/notify-ntfy.py"
 ```
 
@@ -461,14 +915,7 @@ systemctl --user daemon-reload 2>/dev/null || true
 systemctl --user reset-failed codex-ntfy.service 2>/dev/null || true
 ```
 
-An on-demand worker normally exits when both `pending/` and `outbox/` are empty. A genuinely busy task can keep a pending record alive; unknown evidence is instead suppressed after `idle_probe_grace_seconds` in strict mode. To stop a worker deliberately, first review matching processes, then terminate them:
-
-```sh
-pgrep -af 'notify-ntfy.py.*--worker' || true
-pkill -f '[n]otify-ntfy.py.*--worker' 2>/dev/null || true
-```
-
-That pattern can match more than one custom Codex home for the same user; review before running it.
+An on-demand worker normally exits when both `pending/` and `outbox/` are empty. A genuinely busy task can keep a pending record alive; unknown evidence is instead suppressed after `idle_probe_grace_seconds` in strict mode. To stop one deliberately, run the exact `/proc` identity helper from the WSL section above with this host's intended `CODEX_HOME`; do not use a name-only `pkill`, which can match another custom home.
 
 ### 2. Restore or remove the managed hooks
 

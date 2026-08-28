@@ -149,8 +149,8 @@ def migrate_private_config(path: Path) -> None:
         raise RuntimeError("private config must contain a JSON object")
     changed = False
     for key, value in {
-        "include_message": True,
-        "include_thread_title": True,
+        "include_message": False,
+        "include_thread_title": False,
         "include_task_link": False,
         "include_task_link_action": False,
         "allow_insecure_auth": False,

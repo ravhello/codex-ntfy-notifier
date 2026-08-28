@@ -17,10 +17,14 @@ basis through GitHub; there is no service-level agreement.
    for a proposed capability instead.
 
 A useful report identifies the notifier version, operating system, Python or
-PowerShell version, provider/surface (Codex app, Codex/Claude VS Code, Claude Desktop Code tab, CLI, WSL, or Remote SSH),
+PowerShell version, provider/surface (Codex app, Codex or Claude VS Code, Claude Desktop Code tab, AudnCode app, CLI, WSL, or Remote SSH),
 expected behavior, observed behavior, and minimal reproduction steps. Include
 sanitized doctor output when relevant. Do not use a live ntfy endpoint or
 credential in a reproduction.
+
+For a ChatGPT-linked report, say whether it is a local Codex task whose optional
+notification link opens `chatgpt.com/codex/tasks/...`. Ordinary ChatGPT chats
+without local Codex lifecycle state are not observed by this project.
 
 ## Protect private data
 
@@ -50,13 +54,13 @@ Only the latest patch release receives fixes. The current support line is:
 
 | Version | Status |
 | --- | --- |
-| Latest 2.5.x patch | Supported |
-| 2.4.x and earlier | Unsupported; upgrade to the latest release |
+| Latest 2.6.x patch | Supported |
+| 2.5.x and earlier | Unsupported; upgrade to the latest release |
 | Private or modified builds | Reproduce on the latest published release when possible |
 
 Release availability and security support can change. Check the
 [release list](https://github.com/ravhello/codex-ntfy-notifier/releases) and
 [security policy](SECURITY.md) before reporting a problem.
 
-Upstream problems in Codex, Claude Code, ntfy, VS Code, Python, PowerShell, SSH, WSL, systemd,
+Upstream problems in Codex, Claude Code, AudnCode, ntfy, VS Code, Python, PowerShell, SSH, WSL, systemd,
 or an operating system may be redirected to the corresponding project.

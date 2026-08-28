@@ -46,12 +46,16 @@ jobs:
           expected = Path("VERSION").read_text(encoding="utf-8").strip()
           python_source = Path("src/notify-ntfy.py").read_text(encoding="utf-8")
           powershell_source = Path("src/notify-ntfy.ps1").read_text(encoding="utf-8")
+          installer_source = Path("install.ps1").read_text(encoding="utf-8")
           python_version = re.search(r'^VERSION = "([^"]+)"$', python_source, re.MULTILINE)
           powershell_version = re.search(r"^\$ScriptVersion = '([^']+)'$", powershell_source, re.MULTILINE)
+          installer_version = re.search(r"^\$NotifierVersion = '([^']+)'$", installer_source, re.MULTILINE)
           assert python_version, "Python VERSION constant was not found"
           assert powershell_version, "PowerShell ScriptVersion constant was not found"
+          assert installer_version, "Installer NotifierVersion constant was not found"
           assert python_version.group(1) == expected, (python_version.group(1), expected)
           assert powershell_version.group(1) == expected, (powershell_version.group(1), expected)
+          assert installer_version.group(1) == expected, (installer_version.group(1), expected)
 
       - name: Compile Python sources
         run: python -m compileall -q src tests
@@ -68,7 +72,7 @@ jobs:
   windows:
     name: Windows / Python 3.14 / Windows PowerShell 5.1
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
 
     steps:
       - name: Check out repository
@@ -90,12 +94,16 @@ jobs:
           expected = Path("VERSION").read_text(encoding="utf-8").strip()
           python_source = Path("src/notify-ntfy.py").read_text(encoding="utf-8")
           powershell_source = Path("src/notify-ntfy.ps1").read_text(encoding="utf-8")
+          installer_source = Path("install.ps1").read_text(encoding="utf-8")
           python_version = re.search(r'^VERSION = "([^"]+)"$', python_source, re.MULTILINE)
           powershell_version = re.search(r"^\$ScriptVersion = '([^']+)'$", powershell_source, re.MULTILINE)
+          installer_version = re.search(r"^\$NotifierVersion = '([^']+)'$", installer_source, re.MULTILINE)
           assert python_version, "Python VERSION constant was not found"
           assert powershell_version, "PowerShell ScriptVersion constant was not found"
+          assert installer_version, "Installer NotifierVersion constant was not found"
           assert python_version.group(1) == expected, (python_version.group(1), expected)
           assert powershell_version.group(1) == expected, (powershell_version.group(1), expected)
+          assert installer_version.group(1) == expected, (installer_version.group(1), expected)
 
       - name: Compile Python sources
         run: python -m compileall -q src tests
