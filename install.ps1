@@ -219,10 +219,117 @@ function Write-TextAtomic {
   } else { '' }
   $normalizeAclSddl = {
     param([string]$Sddl)
-    # ReplaceFile may set the semantically equivalent AutoInherited control
-    # bit while preserving owner, group, protection, and every ACE.
     return [regex]::Replace($Sddl, 'D:(P?)(AR)?AI(?=\()', 'D:$1$2')
   }
+  $getAclRuleSignature = {
+    param([object]$Rule, [bool]$IncludeInherited)
+    return ('{0}|{1}|{2}|{3}|{4}{5}' -f `
+        $Rule.IdentityReference.Value,
+        [int]$Rule.AccessControlType,
+        [int64]$Rule.FileSystemRights,
+        [int]$Rule.InheritanceFlags,
+        [int]$Rule.PropagationFlags,
+        $(if ($IncludeInherited) { '|' + [string][int][bool]$Rule.IsInherited } else { '' }))
+  }
+  $repairServer2025InheritedAceCopies = {
+    param([string]$AclPath, [object]$ExpectedAcl, [object]$ActualAcl)
+    try {
+      if ($ExpectedAcl.GetOwner([Security.Principal.SecurityIdentifier]) -ne
+            $ActualAcl.GetOwner([Security.Principal.SecurityIdentifier]) -or
+          $ExpectedAcl.GetGroup([Security.Principal.SecurityIdentifier]) -ne
+            $ActualAcl.GetGroup([Security.Principal.SecurityIdentifier]) -or
+          $ExpectedAcl.AreAccessRulesProtected -ne $ActualAcl.AreAccessRulesProtected) {
+        return $false
+      }
+      $expectedRules = @($ExpectedAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+      $actualRules = @($ActualAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+      $inheritedExpected = @($expectedRules | Where-Object { $_.IsInherited })
+      if ($inheritedExpected.Count -eq 0 -or
+          $actualRules.Count -ne ($expectedRules.Count + $inheritedExpected.Count)) {
+        return $false
+      }
+      $prefixCount = $inheritedExpected.Count
+      for ($index = 0; $index -lt $expectedRules.Count; $index++) {
+        if ((& $getAclRuleSignature $actualRules[$prefixCount + $index] $true) -cne
+            (& $getAclRuleSignature $expectedRules[$index] $true)) {
+          return $false
+        }
+      }
+      $extraRules = @($actualRules[0..($prefixCount - 1)])
+      $extraType = $extraRules[0].AccessControlType
+      if ($extraType -notin @(
+            [Security.AccessControl.AccessControlType]::Allow,
+            [Security.AccessControl.AccessControlType]::Deny
+          ) -or
+          @($extraRules | Where-Object {
+              $_.IsInherited -or $_.AccessControlType -ne $extraType
+            }).Count -ne 0 -or
+          @($inheritedExpected | Where-Object {
+              $_.AccessControlType -ne $extraType
+            }).Count -ne 0) {
+        return $false
+      }
+      $extraSignatures = @($extraRules | ForEach-Object {
+          & $getAclRuleSignature $_ $false
+        } | Sort-Object)
+      $inheritedCloneSignatures = @($inheritedExpected | ForEach-Object {
+          & $getAclRuleSignature $_ $false
+        } | Sort-Object)
+      if (($extraSignatures -join "`n") -cne ($inheritedCloneSignatures -join "`n")) {
+        return $false
+      }
+      foreach ($rule in $inheritedExpected) {
+        $explicitClone = New-Object Security.AccessControl.FileSystemAccessRule(
+          $rule.IdentityReference,
+          $rule.FileSystemRights,
+          $rule.InheritanceFlags,
+          $rule.PropagationFlags,
+          $rule.AccessControlType
+        )
+        [void]$ActualAcl.RemoveAccessRuleSpecific($explicitClone)
+      }
+      & $setFileAcl $AclPath $ActualAcl
+      $repairedAcl = & $getFileAcl $AclPath
+      $repairedSddl = $repairedAcl.GetSecurityDescriptorSddlForm($aclSections)
+      return [string]::Equals(
+        (& $normalizeAclSddl $repairedSddl),
+        (& $normalizeAclSddl $destinationSddl),
+        [StringComparison]::Ordinal
+      )
+    } catch {
+      return $false
+    }
+  }
+  $getAclRulesFingerprint = {
+    param([object]$Acl, [bool]$IncludeInherited)
+    $lines = @(
+      $Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
+        Where-Object { $IncludeInherited -or -not $_.IsInherited } |
+        ForEach-Object {
+          '{0}|{1}|{2}|{3}|{4}|{5}' -f `
+            $_.IdentityReference.Value,
+            [int]$_.AccessControlType,
+            [int64]$_.FileSystemRights,
+            [int]$_.InheritanceFlags,
+            [int]$_.PropagationFlags,
+            [int][bool]$_.IsInherited
+        } |
+        Sort-Object
+    )
+    return ($lines -join "`n")
+  }
+  $destinationOwner = if ($null -ne $destinationAcl) {
+    $destinationAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+  } else { '' }
+  $destinationGroup = if ($null -ne $destinationAcl) {
+    $destinationAcl.GetGroup([Security.Principal.SecurityIdentifier]).Value
+  } else { '' }
+  $destinationExplicitRules = if ($null -ne $destinationAcl) {
+    & $getAclRulesFingerprint $destinationAcl $false
+  } else { '' }
+  $destinationAllRules = if ($null -ne $destinationAcl) {
+    & $getAclRulesFingerprint $destinationAcl $true
+  } else { '' }
   $temp = Join-Path $directory ('.{0}.{1}.tmp' -f (Split-Path -Leaf $Path), [Guid]::NewGuid().ToString('N'))
   $backup = Join-Path $directory ('.{0}.{1}.rollback' -f (Split-Path -Leaf $Path), [Guid]::NewGuid().ToString('N'))
   $preserveBackup = $false
@@ -246,30 +353,29 @@ function Write-TextAtomic {
         # the same inheritance model instead: the same parent supplies inherited
         # rules, while only the target's explicit rules are copied.
         $tempAcl = & $getFileAcl $temp
-        $initialTempSddl = $tempAcl.GetSecurityDescriptorSddlForm($aclSections)
-        if (-not [string]::Equals($initialTempSddl, $destinationSddl, [StringComparison]::Ordinal)) {
-          $targetOwner = $destinationAcl.GetOwner([Security.Principal.SecurityIdentifier])
-          $targetGroup = $destinationAcl.GetGroup([Security.Principal.SecurityIdentifier])
-          if ($tempAcl.GetOwner([Security.Principal.SecurityIdentifier]) -ne $targetOwner) {
-            $tempAcl.SetOwner($targetOwner)
-          }
-          if ($tempAcl.GetGroup([Security.Principal.SecurityIdentifier]) -ne $targetGroup) {
-            $tempAcl.SetGroup($targetGroup)
-          }
-          if ($tempAcl.AreAccessRulesProtected -ne $destinationAcl.AreAccessRulesProtected) {
-            $tempAcl.SetAccessRuleProtection($destinationAcl.AreAccessRulesProtected, $false)
-          }
-          foreach ($rule in @($tempAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
-            [void]$tempAcl.RemoveAccessRuleSpecific($rule)
-          }
-          foreach ($rule in @($destinationAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
-            [void]$tempAcl.AddAccessRule($rule)
-          }
-          & $setFileAcl $temp $tempAcl
+        $targetOwner = $destinationAcl.GetOwner([Security.Principal.SecurityIdentifier])
+        $targetGroup = $destinationAcl.GetGroup([Security.Principal.SecurityIdentifier])
+        if ($tempAcl.GetOwner([Security.Principal.SecurityIdentifier]) -ne $targetOwner) {
+          $tempAcl.SetOwner($targetOwner)
         }
+        if ($tempAcl.GetGroup([Security.Principal.SecurityIdentifier]) -ne $targetGroup) {
+          $tempAcl.SetGroup($targetGroup)
+        }
+        $tempAcl.SetAccessRuleProtection($destinationAcl.AreAccessRulesProtected, $false)
+        foreach ($rule in @($tempAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+          [void]$tempAcl.RemoveAccessRuleSpecific($rule)
+        }
+        foreach ($rule in @($destinationAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+          [void]$tempAcl.AddAccessRule($rule)
+        }
+        & $setFileAcl $temp $tempAcl
         $preparedAcl = & $getFileAcl $temp
         $preparedSddl = $preparedAcl.GetSecurityDescriptorSddlForm($aclSections)
-        if (-not [string]::Equals((& $normalizeAclSddl $preparedSddl), (& $normalizeAclSddl $destinationSddl), [StringComparison]::Ordinal)) {
+        if (-not [string]::Equals(
+            (& $normalizeAclSddl $preparedSddl),
+            (& $normalizeAclSddl $destinationSddl),
+            [StringComparison]::Ordinal
+          )) {
           throw 'the temporary file ACL is not equivalent to the destination ACL'
         }
       } catch {
@@ -324,8 +430,17 @@ function Write-TextAtomic {
       }
       $installedAcl = & $getFileAcl $Path
       $installedSddl = $installedAcl.GetSecurityDescriptorSddlForm($aclSections)
-      if (-not [string]::Equals((& $normalizeAclSddl $installedSddl), (& $normalizeAclSddl $destinationSddl), [StringComparison]::Ordinal)) {
-        throw 'the atomic replacement did not preserve the destination ACL'
+      if (-not [string]::Equals(
+          (& $normalizeAclSddl $installedSddl),
+          (& $normalizeAclSddl $destinationSddl),
+          [StringComparison]::Ordinal
+        )) {
+        # Windows Server 2025 may prepend explicit copies of one homogeneous
+        # inherited Allow/Deny run. Repair only that exact, non-broadening
+        # pattern; every other owner/group/protection/ACE delta fails closed.
+        if (-not (& $repairServer2025InheritedAceCopies $Path $destinationAcl $installedAcl)) {
+          throw 'the atomic replacement did not preserve the destination ACL'
+        }
       }
     } else {
       # A same-directory move is atomic for a newly created destination and

@@ -108,6 +108,11 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q src tests
 
+      - name: Diagnose Windows Server 2025 ACL compatibility
+        run: |
+          python -m unittest discover -s tests -v -k test_audncode_managed_recovery_suppresses_transient_and_recovered_failures
+          python -m unittest discover -s tests -v -k test_windows_installer_merges_claude_hooks_idempotently
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 

@@ -629,17 +629,39 @@ class NotifierContractTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self._windows_current_sid = result.stdout.strip()
-        icacls = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "icacls.exe"
+        acl_env = os.environ.copy()
+        acl_env.update(
+            {
+                "CODEX_NTFY_TEST_ACL_PATH": str(path),
+                "CODEX_NTFY_TEST_ACL_CURRENT_SID": self._windows_current_sid,
+            }
+        )
         result = subprocess.run(
             [
-                str(icacls),
-                str(path),
-                "/inheritance:r",
-                "/grant:r",
-                f"*{self._windows_current_sid}:(OI)(CI)F",
-                "*S-1-5-18:(OI)(CI)F",
-                "*S-1-5-32-544:(OI)(CI)F",
+                str(WINDOWS_POWERSHELL),
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                r"""
+$acl = [Security.AccessControl.DirectorySecurity]::new()
+$acl.SetAccessRuleProtection($true, $false)
+$inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+  [Security.AccessControl.InheritanceFlags]::ObjectInherit
+foreach ($sidText in @($env:CODEX_NTFY_TEST_ACL_CURRENT_SID, 'S-1-5-18', 'S-1-5-32-544')) {
+  $sid = [Security.Principal.SecurityIdentifier]::new($sidText)
+  $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+    $sid,
+    [Security.AccessControl.FileSystemRights]::FullControl,
+    $inheritance,
+    [Security.AccessControl.PropagationFlags]::None,
+    [Security.AccessControl.AccessControlType]::Allow
+  )
+  [void]$acl.AddAccessRule($rule)
+}
+[IO.Directory]::SetAccessControl($env:CODEX_NTFY_TEST_ACL_PATH, $acl)
+""",
             ],
+            env=acl_env,
             capture_output=True,
             text=True,
             timeout=30,
@@ -649,17 +671,35 @@ class NotifierContractTests(unittest.TestCase):
     def protect_audncode_recovery_file(self, path: Path) -> None:
         if not hasattr(self, "_windows_current_sid"):
             self.protect_audncode_recovery_directory(path.parent)
-        icacls = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "icacls.exe"
+        acl_env = os.environ.copy()
+        acl_env.update(
+            {
+                "CODEX_NTFY_TEST_ACL_PATH": str(path),
+                "CODEX_NTFY_TEST_ACL_CURRENT_SID": self._windows_current_sid,
+            }
+        )
         result = subprocess.run(
             [
-                str(icacls),
-                str(path),
-                "/inheritance:r",
-                "/grant:r",
-                f"*{self._windows_current_sid}:F",
-                "*S-1-5-18:F",
-                "*S-1-5-32-544:F",
+                str(WINDOWS_POWERSHELL),
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                r"""
+$acl = [Security.AccessControl.FileSecurity]::new()
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($sidText in @($env:CODEX_NTFY_TEST_ACL_CURRENT_SID, 'S-1-5-18', 'S-1-5-32-544')) {
+  $sid = [Security.Principal.SecurityIdentifier]::new($sidText)
+  $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+    $sid,
+    [Security.AccessControl.FileSystemRights]::FullControl,
+    [Security.AccessControl.AccessControlType]::Allow
+  )
+  [void]$acl.AddAccessRule($rule)
+}
+[IO.File]::SetAccessControl($env:CODEX_NTFY_TEST_ACL_PATH, $acl)
+""",
             ],
+            env=acl_env,
             capture_output=True,
             text=True,
             timeout=30,

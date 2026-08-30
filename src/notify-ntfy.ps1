@@ -3671,7 +3671,10 @@ function Test-AudnCodeManagedRecoveryPrivateAcl {
     )
     foreach ($path in @($RecoveryRoot, $ManagerDirectory, $MarkerPath)) {
       $isDirectory = [IO.Directory]::Exists($path)
-      if (-not $isDirectory -and -not [IO.File]::Exists($path)) { return $false }
+      if (-not $isDirectory -and -not [IO.File]::Exists($path)) {
+        Write-RuntimeLog 'diagnostic: managed recovery ACL path is absent'
+        return $false
+      }
       if ($PSVersionTable.PSEdition -eq 'Core') {
         $fileSystemInfo = if ($isDirectory) {
           [IO.DirectoryInfo]::new($path)
@@ -3699,22 +3702,37 @@ function Test-AudnCodeManagedRecoveryPrivateAcl {
           [Security.Principal.SecurityIdentifier]
         ))
       if (-not $acl.AreAccessRulesProtected -or
-          @($rules | Where-Object { $_.IsInherited }).Count -ne 0) { return $false }
+          @($rules | Where-Object { $_.IsInherited }).Count -ne 0) {
+        Write-RuntimeLog ("diagnostic: managed recovery ACL protection mismatch protected={0} inherited={1} sddl={2}" -f `
+            [bool]$acl.AreAccessRulesProtected,
+            @($rules | Where-Object { $_.IsInherited }).Count,
+            $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))
+        return $false
+      }
       $present = @{}
       foreach ($rule in $rules) {
         $sid = $rule.IdentityReference.Value
         if ($sid -notin $required -or
             $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+          Write-RuntimeLog ("diagnostic: managed recovery ACL unexpected rule sid={0} type={1} inherited={2} rights={3} sddl={4}" -f `
+              $sid, $rule.AccessControlType, [bool]$rule.IsInherited, $rule.FileSystemRights,
+              $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))
           return $false
         }
         $present[$sid] = $true
       }
       foreach ($sid in $required) {
-        if (-not $present.ContainsKey($sid)) { return $false }
+        if (-not $present.ContainsKey($sid)) {
+          Write-RuntimeLog ("diagnostic: managed recovery ACL missing required sid={0} sddl={1}" -f `
+              $sid, $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))
+          return $false
+        }
       }
     }
     return $true
   } catch {
+    Write-RuntimeLog ("diagnostic: managed recovery ACL inspection threw {0}: {1}" -f `
+        $_.Exception.GetType().FullName, $_.Exception.Message)
     return $false
   }
 }
@@ -3740,12 +3758,21 @@ function Read-AudnCodeManagedRecoveryMarker {
     $recoveryRoot = [IO.Path]::GetFullPath((Join-Path $canonicalHome $AudnCodeManagedRecoveryRootName))
     $canonicalPath = [IO.Path]::GetFullPath($MarkerPath)
     $markerDirectory = [IO.Path]::GetFullPath((Split-Path -Parent $canonicalPath))
-    if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHome -TargetPath $canonicalPath) -or
-        -not (Test-Path -LiteralPath $canonicalPath -PathType Leaf) -or
-        -not (Test-AudnCodeManagedRecoveryPrivateAcl `
+    if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHome -TargetPath $canonicalPath)) {
+      Write-RuntimeLog 'diagnostic: managed recovery marker failed canonical/no-reparse gate'
+      return $invalid
+    }
+    if (-not (Test-Path -LiteralPath $canonicalPath -PathType Leaf)) {
+      Write-RuntimeLog 'diagnostic: managed recovery marker is not a leaf'
+      return $invalid
+    }
+    if (-not (Test-AudnCodeManagedRecoveryPrivateAcl `
           -RecoveryRoot $recoveryRoot `
           -ManagerDirectory $markerDirectory `
-          -MarkerPath $canonicalPath)) { return $invalid }
+          -MarkerPath $canonicalPath)) {
+      Write-RuntimeLog 'diagnostic: managed recovery marker failed private ACL gate'
+      return $invalid
+    }
 
     $before = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
     if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
