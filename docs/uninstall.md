@@ -281,19 +281,65 @@ if (Test-Path -LiteralPath $HooksPath -PathType Leaf) {
   if ($Changed) {
     $Rendered = ($Document | ConvertTo-Json -Depth 100) + [Environment]::NewLine
     [void]$Utf8Strict.GetByteCount($Rendered)
-    $OriginalAcl = [IO.File]::GetAccessControl($HooksPath)
+    $OriginalAcl = try { [IO.File]::GetAccessControl($HooksPath) } catch {
+      Get-Acl -LiteralPath $HooksPath -ErrorAction Stop
+    }
+    $AclSections = [Security.AccessControl.AccessControlSections]::Access -bor
+      [Security.AccessControl.AccessControlSections]::Owner -bor
+      [Security.AccessControl.AccessControlSections]::Group
+    $OriginalSddl = $OriginalAcl.GetSecurityDescriptorSddlForm($AclSections)
+    $NormalizeAclSddl = { param([string]$Sddl) [regex]::Replace($Sddl, 'D:(P?)(AR)?AI(?=\()', 'D:$1$2') }
     $PrivateBackup = "$HooksPath.pre-ntfy-uninstall-$([Guid]::NewGuid().ToString('N'))"
     $TempPath = Join-Path (Split-Path -Parent $HooksPath) ('.' + (Split-Path -Leaf $HooksPath) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
     try {
       $Empty = [IO.File]::Open($TempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
       $Empty.Dispose()
-      [IO.File]::SetAccessControl($TempPath, $OriginalAcl)
+      $TempAcl = try { [IO.File]::GetAccessControl($TempPath) } catch {
+        Get-Acl -LiteralPath $TempPath -ErrorAction Stop
+      }
+      $InitialTempSddl = $TempAcl.GetSecurityDescriptorSddlForm($AclSections)
+      if (-not [string]::Equals($InitialTempSddl, $OriginalSddl, [StringComparison]::Ordinal)) {
+        $TargetOwner = $OriginalAcl.GetOwner([Security.Principal.SecurityIdentifier])
+        $TargetGroup = $OriginalAcl.GetGroup([Security.Principal.SecurityIdentifier])
+        if ($TempAcl.GetOwner([Security.Principal.SecurityIdentifier]) -ne $TargetOwner) { $TempAcl.SetOwner($TargetOwner) }
+        if ($TempAcl.GetGroup([Security.Principal.SecurityIdentifier]) -ne $TargetGroup) { $TempAcl.SetGroup($TargetGroup) }
+        if ($TempAcl.AreAccessRulesProtected -ne $OriginalAcl.AreAccessRulesProtected) {
+          $TempAcl.SetAccessRuleProtection($OriginalAcl.AreAccessRulesProtected, $false)
+        }
+        foreach ($Rule in @($TempAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+          [void]$TempAcl.RemoveAccessRuleSpecific($Rule)
+        }
+        foreach ($Rule in @($OriginalAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+          [void]$TempAcl.AddAccessRule($Rule)
+        }
+        try { [IO.File]::SetAccessControl($TempPath, $TempAcl) } catch {
+          Set-Acl -LiteralPath $TempPath -AclObject $TempAcl -ErrorAction Stop
+        }
+      }
+      $PreparedAcl = try { [IO.File]::GetAccessControl($TempPath) } catch {
+        Get-Acl -LiteralPath $TempPath -ErrorAction Stop
+      }
+      $PreparedSddl = $PreparedAcl.GetSecurityDescriptorSddlForm($AclSections)
+      if (-not [string]::Equals((& $NormalizeAclSddl $PreparedSddl), (& $NormalizeAclSddl $OriginalSddl), [StringComparison]::Ordinal)) {
+        throw "temporary hooks.json ACL is not equivalent to the destination"
+      }
       [IO.File]::WriteAllText($TempPath, $Rendered, $Utf8Strict)
       $CurrentBytes = [IO.File]::ReadAllBytes($HooksPath)
       if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$OriginalBytes, [byte[]]$CurrentBytes)) {
         throw "hooks.json changed during uninstall; no changes were written: $HooksPath"
       }
-      [IO.File]::Replace($TempPath, $HooksPath, $PrivateBackup)
+      [IO.File]::Replace($TempPath, $HooksPath, $PrivateBackup, $false)
+      $InstalledAcl = try { [IO.File]::GetAccessControl($HooksPath) } catch {
+        Get-Acl -LiteralPath $HooksPath -ErrorAction Stop
+      }
+      $InstalledSddl = $InstalledAcl.GetSecurityDescriptorSddlForm($AclSections)
+      if (-not [string]::Equals((& $NormalizeAclSddl $InstalledSddl), (& $NormalizeAclSddl $OriginalSddl), [StringComparison]::Ordinal)) {
+        $FailedPath = "$HooksPath.failed-ntfy-uninstall-$([Guid]::NewGuid().ToString('N'))"
+        try { [IO.File]::Replace($PrivateBackup, $HooksPath, $FailedPath, $false) } finally {
+          if (Test-Path -LiteralPath $FailedPath) { Remove-Item -LiteralPath $FailedPath -Force }
+        }
+        throw "hooks.json ACL changed during uninstall; the original file was restored"
+      }
     } finally {
       if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Force }
     }
@@ -385,7 +431,7 @@ Verify locally with `Select-String -LiteralPath $SettingsPath -Pattern ([regex]:
 
 #### Remove the optional AudnCode handlers
 
-Skip this block if the notifier was not installed with `-EnableAudnCode`. Close every AudnCode window so it cannot rewrite `settings.json` during the transaction. Version 2.6.0 shape 8 has seven synchronous events: `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification: idle_prompt`, `PostToolUse: Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage`, and `SubagentStart`, all with 60-second timeouts. The cleanup scans every event so the current exact command shape and an earlier structured exec/args shape are removed. Set the same custom `-CodexHome`/`-AudnCodeHome` used at install time. Both predicates require the exact installed script, AudnCode home, origin, input marker, and hook marker; unrelated settings, groups, and handlers remain. The code rejects malformed UTF-8, replacement characters, and invalid JSON scalars before any write:
+Skip this block if the notifier was not installed with `-EnableAudnCode`. Close every AudnCode window so it cannot rewrite `settings.json` during the transaction. Version 2.6.0 shape 9 has seven synchronous events: `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification: ^(idle_prompt|permission_prompt)$`, `PostToolUse: ^(Agent|AskUserQuestion|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage)$`, and `SubagentStart`, all with 60-second timeouts. The cleanup scans every event so the current exact command shape and an earlier structured exec/args shape are removed. Set the same custom `-CodexHome`/`-AudnCodeHome` used at install time. Both predicates require the exact installed script, AudnCode home, origin, input marker, and hook marker; unrelated settings, groups, and handlers remain. The code rejects malformed UTF-8, replacement characters, and invalid JSON scalars before any write:
 
 ```powershell
 $CodexHome = [IO.Path]::GetFullPath((Join-Path $HOME '.codex')) # replace when customized
@@ -488,7 +534,14 @@ function Test-ManagedAudnCodeHandler {
 
 if (Test-Path -LiteralPath $SettingsPath -PathType Leaf) {
   $OriginalBytes = [IO.File]::ReadAllBytes($SettingsPath)
-  $OriginalAcl = [IO.File]::GetAccessControl($SettingsPath)
+  $OriginalAcl = try { [IO.File]::GetAccessControl($SettingsPath) } catch {
+    Get-Acl -LiteralPath $SettingsPath -ErrorAction Stop
+  }
+  $AclSections = [Security.AccessControl.AccessControlSections]::Access -bor
+    [Security.AccessControl.AccessControlSections]::Owner -bor
+    [Security.AccessControl.AccessControlSections]::Group
+  $OriginalSddl = $OriginalAcl.GetSecurityDescriptorSddlForm($AclSections)
+  $NormalizeAclSddl = { param([string]$Sddl) [regex]::Replace($Sddl, 'D:(P?)(AR)?AI(?=\()', 'D:$1$2') }
   $Document = ConvertFrom-StrictJsonBytes $OriginalBytes $SettingsPath
   if ($null -eq $Document -or $Document -isnot [pscustomobject]) { throw "$SettingsPath must contain a JSON object." }
   $HooksProperty = $Document.PSObject.Properties['hooks']
@@ -544,13 +597,52 @@ if (Test-Path -LiteralPath $SettingsPath -PathType Leaf) {
       # content is written until it has the exact ACL of settings.json.
       $Empty = [IO.File]::Open($TempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
       $Empty.Dispose()
-      [IO.File]::SetAccessControl($TempPath, $OriginalAcl)
+      $TempAcl = try { [IO.File]::GetAccessControl($TempPath) } catch {
+        Get-Acl -LiteralPath $TempPath -ErrorAction Stop
+      }
+      $InitialTempSddl = $TempAcl.GetSecurityDescriptorSddlForm($AclSections)
+      if (-not [string]::Equals($InitialTempSddl, $OriginalSddl, [StringComparison]::Ordinal)) {
+        $TargetOwner = $OriginalAcl.GetOwner([Security.Principal.SecurityIdentifier])
+        $TargetGroup = $OriginalAcl.GetGroup([Security.Principal.SecurityIdentifier])
+        if ($TempAcl.GetOwner([Security.Principal.SecurityIdentifier]) -ne $TargetOwner) { $TempAcl.SetOwner($TargetOwner) }
+        if ($TempAcl.GetGroup([Security.Principal.SecurityIdentifier]) -ne $TargetGroup) { $TempAcl.SetGroup($TargetGroup) }
+        if ($TempAcl.AreAccessRulesProtected -ne $OriginalAcl.AreAccessRulesProtected) {
+          $TempAcl.SetAccessRuleProtection($OriginalAcl.AreAccessRulesProtected, $false)
+        }
+        foreach ($Rule in @($TempAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+          [void]$TempAcl.RemoveAccessRuleSpecific($Rule)
+        }
+        foreach ($Rule in @($OriginalAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+          [void]$TempAcl.AddAccessRule($Rule)
+        }
+        try { [IO.File]::SetAccessControl($TempPath, $TempAcl) } catch {
+          Set-Acl -LiteralPath $TempPath -AclObject $TempAcl -ErrorAction Stop
+        }
+      }
+      $PreparedAcl = try { [IO.File]::GetAccessControl($TempPath) } catch {
+        Get-Acl -LiteralPath $TempPath -ErrorAction Stop
+      }
+      $PreparedSddl = $PreparedAcl.GetSecurityDescriptorSddlForm($AclSections)
+      if (-not [string]::Equals((& $NormalizeAclSddl $PreparedSddl), (& $NormalizeAclSddl $OriginalSddl), [StringComparison]::Ordinal)) {
+        throw "temporary AudnCode settings ACL is not equivalent to the destination"
+      }
       [IO.File]::WriteAllText($TempPath, $Rendered, $Utf8Strict)
       $CurrentBytes = [IO.File]::ReadAllBytes($SettingsPath)
       if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$OriginalBytes, [byte[]]$CurrentBytes)) {
         throw "AudnCode settings changed during uninstall; no changes were written: $SettingsPath"
       }
-      [IO.File]::Replace($TempPath, $SettingsPath, $PrivateBackup)
+      [IO.File]::Replace($TempPath, $SettingsPath, $PrivateBackup, $false)
+      $InstalledAcl = try { [IO.File]::GetAccessControl($SettingsPath) } catch {
+        Get-Acl -LiteralPath $SettingsPath -ErrorAction Stop
+      }
+      $InstalledSddl = $InstalledAcl.GetSecurityDescriptorSddlForm($AclSections)
+      if (-not [string]::Equals((& $NormalizeAclSddl $InstalledSddl), (& $NormalizeAclSddl $OriginalSddl), [StringComparison]::Ordinal)) {
+        $FailedPath = "$SettingsPath.failed-ntfy-uninstall-$([Guid]::NewGuid().ToString('N'))"
+        try { [IO.File]::Replace($PrivateBackup, $SettingsPath, $FailedPath, $false) } finally {
+          if (Test-Path -LiteralPath $FailedPath) { Remove-Item -LiteralPath $FailedPath -Force }
+        }
+        throw "AudnCode settings ACL changed during uninstall; the original file was restored"
+      }
     } finally {
       if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Force }
     }
@@ -568,7 +660,7 @@ if (Test-Path -LiteralPath $MarkerPath -PathType Leaf) {
   $ShapeProperty = $Marker.PSObject.Properties['hook_shape_version']
   $KnownHistoricalShape = $null -eq $ShapeProperty
   if ($null -ne $ShapeProperty) {
-    try { $KnownHistoricalShape = [int]$ShapeProperty.Value -ge 1 -and [int]$ShapeProperty.Value -le 8 } catch { $KnownHistoricalShape = $false }
+    try { $KnownHistoricalShape = [int]$ShapeProperty.Value -ge 1 -and [int]$ShapeProperty.Value -le 9 } catch { $KnownHistoricalShape = $false }
   }
   $OwnedMarker = [string]$Marker.kind -eq 'codex-ntfy-audncode-hooks' -and
     [int]$Marker.schema -eq 1 -and

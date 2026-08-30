@@ -6,11 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [2.6.0] - 2026-08-28
+## [2.6.0] - 2026-08-30
 
 ### Added
 
-- Added opt-in AudnCode support on Windows with hook shape 8: seven synchronous 60-second handlers for `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification`, `PostToolUse`, and `SubagentStart`. `SessionStart` matches `^(startup|resume|clear)$`, `Notification` matches `idle_prompt`, and `PostToolUse` matches exactly `Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage`.
+- Added opt-in AudnCode support on Windows with hook shape 9: seven synchronous 60-second handlers for `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification`, `PostToolUse`, and `SubagentStart`. `SessionStart` matches `^(startup|resume|clear)$`, `Notification` matches `^(idle_prompt|permission_prompt)$`, and `PostToolUse` matches exactly `^(Agent|AskUserQuestion|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage)$`.
+- Added one compact `permission_prompt` notification for a transcript-proven root `AskUserQuestion`. Its durable session, root prompt epoch, and `tool_use.id` identity deduplicates resumes; generic permissions, nested or sidechain questions, ambiguous tails, and already answered questions fail closed. A correlated answer opens a new epoch before execution continues, so a later final result can notify exactly once.
+- Added an optional per-attempt managed-recovery contract for AudnCode launchers. A declared revision-1 marker holds `StopFailure`, `recovered` cancels it, and only an exact revision-2 `exhausted` marker with the same transcript error UUID may continue through the ordinary finality gates. Missing, malformed, rewritten, path-escaped, reparse, permission-broadened, process-reused, or identity-mismatched declared markers never fall back to a false terminal notification. Recovery root, manager directory, and marker DACLs are protected and restricted to the current user, SYSTEM, and Administrators; marker age alone never rejects or promotes an attempt.
 - Added AudnCode correlation using a synthesized prompt identity, session epoch, validated transcript path, hook-process ordering, and a host-runtime identity derived from AudnCode home, PID, and `startedAt`. The runtime-scoped background registry survives `/clear` and `/resume` while rejecting stale markers and PID reuse.
 - Added final-idle probes for persisted command-queue operations (`enqueue`, `dequeue`, `remove`, and `popAll`) aggregated across the ordered session lineage of one host runtime, background tool IDs and explicit terminal IDs, session/team/custom task lists, team activity, and main-session Ctrl+B sidechains.
 - Added `-EnableAudnCode`, `-AudnCodeHome`, and `-AudnCodeIdleThresholdMs` installer options. The default 1,000 ms final-idle threshold is written to the active AudnCode global configuration.
@@ -35,6 +37,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Hardened bounded stdin handling on Windows PowerShell 5.1 so oversized or stalled AudnCode hook payloads fail closed without racing an asynchronous Console read during process shutdown.
+- Made the recovered-failure write-ahead journal portable between Windows PowerShell 5.1 and PowerShell 7 by hashing the producer's exact serialized JSON instead of engine-specific reserialization. Cleanup uses immutable logical Stop identity rather than mutable queue fields, accepts a newer valid duplicate Stop, and recognizes exact delivery or terminal suppression receipts. A content-free active index limits reconciliation to live journals; deterministic restart repair erases the content-bearing successor across every two-file crash gap while the identity-only replay tombstone remains permanent.
 - Prevented intermediate AudnCode stops, recursive stops, subagent events, mismatched transcripts, stale session epochs, delayed old idle events, and unordered hook launches from producing a final notification.
 - Prevented missing, ambiguous, delayed-old, duplicated, malformed, unstable, or payload-mismatched AudnCode `StopFailure` transcript evidence from being treated as a terminal chat.
 - Prevented queued commands, background Agent/Bash/PowerShell/Monitor work, successful or malformed `SendMessage`, unresolved same-ID incarnations, explicit/custom goal tasks, retained non-lead teams, CCR work, and Ctrl+B sidechains from being mistaken for a final idle state.
@@ -59,6 +63,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Preserved cron registry identity across the busy-to-idle state rewrite.
 - Preserved live AudnCode background, cron, and lifecycle-guard records during retention cleanup, including windows open beyond the normal state-retention age.
 - Installer upgrades stop only verified orphaned legacy AudnCode hook processes; current-shape or still-parented processes are preserved.
+- Canonicalized AudnCode home and transcript paths before any durable ingress arm, preventing Windows 8.3 aliases such as `RUNNER~1` from splitting one session into unrelated host/runtime records under long-running CI or multi-window use.
+- Preserved inherited and explicit Windows ACLs across atomic Claude/AudnCode settings updates without materializing inherited entries as duplicate explicit permissions. Replacement rollback now releases its compare handle before restoring, and the documented uninstall follows the same metadata-safe algorithm on Windows PowerShell 5.1 and PowerShell 7.
+- Made legacy AudnCode orphan cleanup compare the parent process creation time as well as its PID, so PID reuse cannot keep an obsolete hook alive while an unverifiable lifetime remains fail closed.
 
 ### Security and rollback
 

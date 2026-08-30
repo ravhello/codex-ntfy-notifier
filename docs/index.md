@@ -8,8 +8,9 @@ description: Idle-only, durable ntfy notifications for local Codex tasks and opt
 
 # Know when your coding task is actually idle
 
-Codex ntfy Notifier provides final-only ntfy alerts for supported local coding
-chats across Windows, WSL, Linux, and host-local Remote SSH installs. Intermediate
+Codex ntfy Notifier provides final-only completion alerts for supported local coding
+chats, plus a separate exact-once AudnCode intervention alert for a verified
+unanswered root `AskUserQuestion`, across Windows, WSL, Linux, and host-local Remote SSH installs. Intermediate
 signals stay behind a provider-specific idle gate, while a durable outbox retries
 transient delivery failures. Codex tasks can run in the Codex app, VS Code, or CLI
 and can optionally link to their authenticated ChatGPT task page; ordinary ChatGPT
@@ -64,11 +65,15 @@ merges its managed handlers without replacing existing user hooks:
 .\install.ps1 -WslDistro Ubuntu -EnableClaudeCode -EnableAudnCode
 ```
 
-AudnCode hook shape 8 uses seven synchronous 60-second events: `SessionStart`,
+AudnCode hook shape 9 uses seven synchronous 60-second events: `SessionStart`,
 `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification`, `PostToolUse`, and
 `SubagentStart`. `SessionStart` matches `^(startup|resume|clear)$`, `Notification`
-matches `idle_prompt`, and `PostToolUse` matches exactly
-`Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage`.
+matches `^(idle_prompt|permission_prompt)$`, and `PostToolUse` matches exactly
+`^(Agent|AskUserQuestion|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage)$`.
+`permission_prompt` is a separate exact-once intervention signal only for one
+unanswered root `AskUserQuestion`; it is never a completion. Managed launchers
+may also declare a private per-attempt recovery marker so recovered provider
+errors stay silent and only definitive exhaustion can notify.
 Each command supplies a trusted expected event; ingress is armed before strict
 UTF-8 input is read, with an 8 MiB cap. A 1,000 ms idle threshold feeds a gate
 with a minimum 1.25-second settle and repeated pre-commit checks. Queue,

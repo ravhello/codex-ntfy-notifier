@@ -123,8 +123,8 @@ $ExpectedMatchers = [ordered]@{
   UserPromptSubmit = $null
   Stop = $null
   StopFailure = $null
-  Notification = 'idle_prompt'
-  PostToolUse = 'Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage'
+  Notification = '^(idle_prompt|permission_prompt)$'
+  PostToolUse = '^(Agent|AskUserQuestion|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage)$'
   SubagentStart = $null
 }
 $ManagedQuotedScript = "'" + $ManagedScript.Replace("'", "''") + "'"
@@ -207,19 +207,23 @@ if (-not (Test-Path -LiteralPath $GlobalPath -PathType Leaf)) { throw "AudnCode 
 ($Utf8Strict.GetString([IO.File]::ReadAllBytes($GlobalPath)) | ConvertFrom-Json).messageIdleNotifThresholdMs
 ```
 
-Expect hook shape 8 with one project-managed group for each of these seven synchronous events:
+Expect hook shape 9 with one project-managed group for each of these seven synchronous events:
 
 - `SessionStart` with only `^(startup|resume|clear)$`;
 - `UserPromptSubmit` with no matcher;
 - `Stop` with no matcher;
 - `StopFailure` with no matcher;
-- `Notification` with only `idle_prompt`;
-- `PostToolUse` with exactly `Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage`;
+- `Notification` with exactly `^(idle_prompt|permission_prompt)$`;
+- `PostToolUse` with exactly `^(Agent|AskUserQuestion|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage)$`;
 - `SubagentStart` with no matcher.
 
 For the single project-managed row under each event, expect `Present`, `MatcherMatches`, `ManagedHandler`, and `TrustedExpectedEvent` to be `true`, `Async` to be `false`, and `Timeout` to be `60`. The diagnostic reports booleans instead of printing the private command path. The default threshold is `1000` ms; a deliberate value from 1,000 through 60,000 can be installed with `-AudnCodeIdleThresholdMs`. If `disableAllHooks` is `true`, AudnCode will not execute the handlers.
 
 AudnCode `Stop` is not a final signal. It creates or refreshes a candidate, which remains pending until a later matching `idle_prompt` proves that the foreground query loop returned. `StopFailure` is accepted only when one current-prompt assistant error record after the saved transcript cursor matches the hook error evidence. That proven failure bypasses only `idle_prompt`: settle time, ingress/lifecycle guards, runtime identity, command queue, background IDs, team/task state, sidechains, cron evidence, repeated snapshots, and the locked promotion boundary still apply. Do not add `agent_completed`; it is not used as AudnCode finality. A late idle or error from an older prompt fails closed through transcript cursor, prompt epoch, timestamp, and hook-process ordering.
+
+`permission_prompt` is deliberately separate from completion. It notifies only when the current root transcript ends in exactly one unanswered `AskUserQuestion` tool call. A generic tool permission, copied/spoofed question text, nested or sidechain call, multiple unresolved questions, matching `tool_result`, or provider-error tail is ignored. Reopening or resuming the same question does not notify again; after the exact answer, `PostToolUse: AskUserQuestion` opens a new epoch so the eventual final result can notify once.
+
+If a managed launcher exports `CODEX_NTFY_AUDNCODE_RECOVERY_MARKER`, revision 1 means recovery is still active and must not notify. Revision 2 `recovered` cancels that error; only revision 2 `exhausted` with the same transcript error UUID can continue. A missing or malformed declared marker, wrong path/schema/UUID/state/reason, PID/start/ancestry mismatch where the manager must be live, reparse component, unprotected/inherited/broadened ACL, revision rollback, rewritten terminal, or failure-UUID mismatch stays fail closed. A terminal marker may legitimately outlive its manager, and there is no age-based TTL. Absence of the environment variable keeps ordinary AudnCode behavior.
 
 Managed hook stdin is strict UTF-8 and capped at 8 MiB. `SessionStart`, `UserPromptSubmit`, `PostToolUse`, and `SubagentStart` arm durable ingress before slower correlation as applicable, then transfer it to the exact host-runtime guard. Reaching the 60-second hook timeout, malformed/oversized input, an event mismatch, or an interrupted transfer can intentionally leave the host fail closed. This cannot protect an event for which AudnCode never launched the hook process.
 
@@ -229,7 +233,7 @@ Foreground idle is still not whole-runtime idle. The gate binds the logical sess
 
 Evidence limits are fail-closed, not truncation-as-idle. Version 2.6.0 permits at most 512 MiB of queue transcripts across the runtime lineage, 4,096 relevant queue records, 1,048,576 characters per line, 65,536 characters per queue content field, 1 MiB per team/task JSON file, and 1,024 team members. If a valid workload exceeds one of these bounds, preserve the files and report a sanitized reproduction; do not move the candidate manually.
 
-AudnCode hot-reloads ordinary settings but has no shared lock for `settings.json`. Close it before a first install or shape change, then verify shape 8 and reopen after `.codex-ntfy-hooks.json` is created or rotated. An identical reinstall preserves the generation. During upgrade the installer stops only verified orphan notifier hook processes from obsolete shapes; it does not terminate current-shape or still-parented processes. Do not copy the marker between homes. Hooks still require AudnCode workspace trust.
+AudnCode hot-reloads ordinary settings but has no shared lock for `settings.json`. Close it before a first install or shape change, then verify shape 9 and reopen after `.codex-ntfy-hooks.json` is created or rotated. An identical reinstall preserves the generation. During upgrade the installer stops only verified orphan notifier hook processes from obsolete shapes; it does not terminate current-shape or still-parented processes. Do not copy the marker between homes. Hooks still require AudnCode workspace trust.
 
 Known public-build limits can explain a permanently retained candidate. Successful/malformed `SendMessage` has no resolved recipient or durable consumption acknowledgement; overlapping resumed local agents can reuse one ID; `clearCommandQueue`, kill-all, and some Ctrl+B paths can omit the removed ID. `/ultrareview` requires the exact CCR/remote task identity and terminal record. Session-only cron firing omits its ID; only a later exact same-runtime `CronDelete` closes that incarnation. For durable cron work, a delete response or empty `scheduled_tasks.json` does not prove completion: causal stable file snapshots plus the exact scheduler lease owner/lifetime are required. These gaps can suppress a true final alert, but cannot produce an intermediate one.
 
@@ -341,7 +345,7 @@ Confirm all of the following:
 - the alert comes from this installation/topic rather than an older custom hook or another notifier;
 - no duplicate/legacy managed notifier handlers remain under `UserPromptExpansion`, `SubagentStop`, or unexpected hook groups; the single managed `UserPromptSubmit` is intentional;
 - only one intended `notify-ntfy` `Stop` group exists per environment;
-- AudnCode has exactly the seven shape-8 synchronous event groups, 60-second timeouts, and matchers listed above, with no old direct-publish or `agent_completed` handler, and every command has the correct trusted expected event;
+- AudnCode has exactly the seven shape-9 synchronous event groups, 60-second timeouts, and matchers listed above, with no old direct-publish or `agent_completed` handler, and every command has the correct trusted expected event;
 - every worker was restarted after upgrade;
 - `suppress_subagents` and `suppress_technical_turns` are `true`;
 - Windows, WSL, and SSH environments are not publishing to the same topic through separate old installations.

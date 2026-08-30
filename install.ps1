@@ -25,7 +25,7 @@ $TaskName = 'CodexNtfyWatcher'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Utf8StrictNoBom = New-Object System.Text.UTF8Encoding($false, $true)
 $NotifierVersion = '2.6.0'
-$AudnCodeHookShapeVersion = 8
+$AudnCodeHookShapeVersion = 9
 $AudnCodeHookObservationMarkerName = '.codex-ntfy-hooks.json'
 $AudnCodeSettingsQuietWindowMilliseconds = 750
 $AudnCodeSessionMarkerMaxBytes = 64 * 1024
@@ -194,13 +194,35 @@ function Write-TextAtomic {
   }
 
   $destinationExists = Test-Path -LiteralPath $Path -PathType Leaf
+  $getFileAcl = {
+    param([string]$AclPath)
+    try { return [System.IO.File]::GetAccessControl($AclPath) } catch {
+      return Get-Acl -LiteralPath $AclPath -ErrorAction Stop
+    }
+  }
+  $setFileAcl = {
+    param([string]$AclPath, [object]$Acl)
+    try { [System.IO.File]::SetAccessControl($AclPath, $Acl) } catch {
+      Set-Acl -LiteralPath $AclPath -AclObject $Acl -ErrorAction Stop
+    }
+  }
   $destinationAcl = if ($destinationExists) {
-    try { [System.IO.File]::GetAccessControl($Path) } catch {
-      try { Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
-        throw "Could not read the destination ACL before atomically replacing ${Path}: $($_.Exception.Message)"
-      }
+    try { & $getFileAcl $Path } catch {
+      throw "Could not read the destination ACL before atomically replacing ${Path}: $($_.Exception.Message)"
     }
   } else { $null }
+  $aclSections = [Security.AccessControl.AccessControlSections]::Access -bor
+    [Security.AccessControl.AccessControlSections]::Owner -bor
+    [Security.AccessControl.AccessControlSections]::Group
+  $destinationSddl = if ($null -ne $destinationAcl) {
+    $destinationAcl.GetSecurityDescriptorSddlForm($aclSections)
+  } else { '' }
+  $normalizeAclSddl = {
+    param([string]$Sddl)
+    # ReplaceFile may set the semantically equivalent AutoInherited control
+    # bit while preserving owner, group, protection, and every ACE.
+    return [regex]::Replace($Sddl, 'D:(P?)(AR)?AI(?=\()', 'D:$1$2')
+  }
   $temp = Join-Path $directory ('.{0}.{1}.tmp' -f (Split-Path -Leaf $Path), [Guid]::NewGuid().ToString('N'))
   $backup = Join-Path $directory ('.{0}.{1}.rollback' -f (Split-Path -Leaf $Path), [Guid]::NewGuid().ToString('N'))
   $preserveBackup = $false
@@ -217,10 +239,41 @@ function Write-TextAtomic {
     )
     $empty.Dispose()
     if ($null -ne $destinationAcl) {
-      try { [System.IO.File]::SetAccessControl($temp, $destinationAcl) } catch {
-        try { Set-Acl -LiteralPath $temp -AclObject $destinationAcl -ErrorAction Stop } catch {
-          throw "Could not protect the atomic replacement for ${Path}: $($_.Exception.Message)"
+      try {
+        # A descriptor copied wholesale from another file materializes its
+        # inherited ACEs as explicit ACEs on the temporary file. ReplaceFile
+        # then merges the destination's inherited DACL a second time. Rebuild
+        # the same inheritance model instead: the same parent supplies inherited
+        # rules, while only the target's explicit rules are copied.
+        $tempAcl = & $getFileAcl $temp
+        $initialTempSddl = $tempAcl.GetSecurityDescriptorSddlForm($aclSections)
+        if (-not [string]::Equals($initialTempSddl, $destinationSddl, [StringComparison]::Ordinal)) {
+          $targetOwner = $destinationAcl.GetOwner([Security.Principal.SecurityIdentifier])
+          $targetGroup = $destinationAcl.GetGroup([Security.Principal.SecurityIdentifier])
+          if ($tempAcl.GetOwner([Security.Principal.SecurityIdentifier]) -ne $targetOwner) {
+            $tempAcl.SetOwner($targetOwner)
+          }
+          if ($tempAcl.GetGroup([Security.Principal.SecurityIdentifier]) -ne $targetGroup) {
+            $tempAcl.SetGroup($targetGroup)
+          }
+          if ($tempAcl.AreAccessRulesProtected -ne $destinationAcl.AreAccessRulesProtected) {
+            $tempAcl.SetAccessRuleProtection($destinationAcl.AreAccessRulesProtected, $false)
+          }
+          foreach ($rule in @($tempAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+            [void]$tempAcl.RemoveAccessRuleSpecific($rule)
+          }
+          foreach ($rule in @($destinationAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+            [void]$tempAcl.AddAccessRule($rule)
+          }
+          & $setFileAcl $temp $tempAcl
         }
+        $preparedAcl = & $getFileAcl $temp
+        $preparedSddl = $preparedAcl.GetSecurityDescriptorSddlForm($aclSections)
+        if (-not [string]::Equals((& $normalizeAclSddl $preparedSddl), (& $normalizeAclSddl $destinationSddl), [StringComparison]::Ordinal)) {
+          throw 'the temporary file ACL is not equivalent to the destination ACL'
+        }
+      } catch {
+        throw "Could not protect the atomic replacement for ${Path}: $($_.Exception.Message)"
       }
     } else {
       Protect-PrivatePath $temp
@@ -262,7 +315,18 @@ function Write-TextAtomic {
     if ($destinationExists) {
       # File.Replace is a same-volume atomic swap. Its private rollback copy is
       # retained only long enough to restore the prior file if the swap fails.
-      [System.IO.File]::Replace($temp, $Path, $backup, $true)
+      # Do not ignore metadata/ACL merge errors. A successful content swap with
+      # a silently changed security descriptor is not a successful install.
+      [System.IO.File]::Replace($temp, $Path, $backup, $false)
+      if ($null -ne $destinationLock) {
+        $destinationLock.Dispose()
+        $destinationLock = $null
+      }
+      $installedAcl = & $getFileAcl $Path
+      $installedSddl = $installedAcl.GetSecurityDescriptorSddlForm($aclSections)
+      if (-not [string]::Equals((& $normalizeAclSddl $installedSddl), (& $normalizeAclSddl $destinationSddl), [StringComparison]::Ordinal)) {
+        throw 'the atomic replacement did not preserve the destination ACL'
+      }
     } else {
       # A same-directory move is atomic for a newly created destination and
       # fails closed if another writer creates the path first.
@@ -274,7 +338,7 @@ function Write-TextAtomic {
       try {
         if (Test-Path -LiteralPath $Path -PathType Leaf) {
           $failed = Join-Path $directory ('.{0}.{1}.failed' -f (Split-Path -Leaf $Path), [Guid]::NewGuid().ToString('N'))
-          try { [System.IO.File]::Replace($backup, $Path, $failed, $true) } finally {
+          try { [System.IO.File]::Replace($backup, $Path, $failed, $false) } finally {
             if (Test-Path -LiteralPath $failed) {
               Remove-Item -LiteralPath $failed -Force -ErrorAction SilentlyContinue
             }
@@ -817,9 +881,6 @@ function Ensure-ClaudeCodeHooks {
     [string]$ScriptPath
   )
 
-  $settingsAcl = if (Test-Path -LiteralPath $SettingsPath) {
-    try { Get-Acl -LiteralPath $SettingsPath } catch { $null }
-  } else { $null }
   $original = if (Test-Path -LiteralPath $SettingsPath) {
     Read-StrictUtf8Text -Path $SettingsPath
   } else { '' }
@@ -924,11 +985,6 @@ function Ensure-ClaudeCodeHooks {
   $rendered = ($document | ConvertTo-Json -Depth 32) + [Environment]::NewLine
   if ($rendered -ne $original) {
     Write-TextAtomic -Path $SettingsPath -Content $rendered
-    if ($null -ne $settingsAcl) {
-      try { Set-Acl -LiteralPath $SettingsPath -AclObject $settingsAcl } catch {
-        throw "Claude settings were updated, but their original ACL could not be restored: $($_.Exception.Message)"
-      }
-    }
   }
 }
 
@@ -1188,9 +1244,9 @@ function Ensure-AudnCodeHooks {
         # only to the three lifecycle sources that precede direct initial work.
         @([pscustomobject][ordered]@{ matcher = '^(startup|resume|clear)$'; hooks = @($handler) })
       } elseif ($eventName -eq 'Notification') {
-        @([pscustomobject][ordered]@{ matcher = 'idle_prompt'; hooks = @($handler) })
+        @([pscustomobject][ordered]@{ matcher = '^(idle_prompt|permission_prompt)$'; hooks = @($handler) })
       } elseif ($eventName -eq 'PostToolUse') {
-        @([pscustomobject][ordered]@{ matcher = 'Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage'; hooks = @($handler) })
+        @([pscustomobject][ordered]@{ matcher = '^(Agent|AskUserQuestion|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage)$'; hooks = @($handler) })
       } else {
         @([pscustomobject][ordered]@{ hooks = @($handler) })
       }
@@ -1563,7 +1619,6 @@ function Restore-AudnCodeHooks {
       Write-Warning 'AudnCode settings disappeared after installation; rollback preserved that concurrent change.'
       return
     }
-    $settingsAcl = try { Get-Acl -LiteralPath $SettingsPath } catch { $null }
     $original = Read-StrictUtf8Text -Path $SettingsPath
     try { $document = ConvertFrom-StrictJsonText -Text $original } catch {
       throw "Invalid JSON in ${SettingsPath} during rollback: $($_.Exception.Message)"
@@ -1630,11 +1685,6 @@ function Restore-AudnCodeHooks {
       Remove-Item -LiteralPath $SettingsPath -Force -ErrorAction Stop
     } else {
       Write-TextAtomic -Path $SettingsPath -Content $rendered -ExpectedContent $original
-      if ($null -ne $settingsAcl) {
-        try { Set-Acl -LiteralPath $SettingsPath -AclObject $settingsAcl } catch {
-          throw "AudnCode settings were rolled back, but their ACL could not be restored: $($_.Exception.Message)"
-        }
-      }
     }
     return
   }
@@ -1876,15 +1926,8 @@ function Ensure-AudnCodeIdleThreshold {
   )
 
   $MutationState.Value = $null
-  $operation = [pscustomobject]@{
-    DidWrite = $false
-    ConfigAcl = $null
-  }
   $null = Invoke-WithAudnCodeGlobalConfigLock -GlobalConfigPath $GlobalConfigPath -Action {
     $filePreviouslyPresent = Test-Path -LiteralPath $GlobalConfigPath -PathType Leaf
-    $operation.ConfigAcl = if ($filePreviouslyPresent) {
-      try { Get-Acl -LiteralPath $GlobalConfigPath } catch { $null }
-    } else { $null }
     $original = if ($filePreviouslyPresent) {
       Read-StrictUtf8Text -Path $GlobalConfigPath
     } else { '' }
@@ -1917,16 +1960,10 @@ function Ensure-AudnCodeIdleThreshold {
     } else {
       $property.Value = $ThresholdMs
     }
-    Write-TextAtomic -Path $GlobalConfigPath -Content (($document | ConvertTo-Json -Depth 100) + [Environment]::NewLine)
-    $operation.DidWrite = $true
-  }
-
-  if ($operation.DidWrite -and $null -ne $operation.ConfigAcl) {
-    try { Set-Acl -LiteralPath $GlobalConfigPath -AclObject $operation.ConfigAcl } catch {
-      throw "AudnCode global configuration was updated, but its original ACL could not be restored: $($_.Exception.Message)"
-    }
-  } elseif ($operation.DidWrite) {
-    Protect-PrivatePath $GlobalConfigPath
+    Write-TextAtomic `
+      -Path $GlobalConfigPath `
+      -Content (($document | ConvertTo-Json -Depth 100) + [Environment]::NewLine) `
+      -ExpectedContent $(if ($filePreviouslyPresent) { $original } else { $null })
   }
 }
 
@@ -1939,16 +1976,11 @@ function Restore-AudnCodeIdleThreshold {
   if ($null -eq $MutationState -or -not [bool](Get-ObjectValue -Object $MutationState -Name 'Applied' -Default $false)) {
     return
   }
-  $operation = [pscustomobject]@{
-    DidWrite = $false
-    ConfigAcl = $null
-  }
   $null = Invoke-WithAudnCodeGlobalConfigLock -GlobalConfigPath $GlobalConfigPath -Action {
     if (-not (Test-Path -LiteralPath $GlobalConfigPath -PathType Leaf)) {
       Write-Warning 'AudnCode global configuration disappeared after installation; rollback left that concurrent change untouched.'
       return
     }
-    $operation.ConfigAcl = try { Get-Acl -LiteralPath $GlobalConfigPath } catch { $null }
     $original = Read-StrictUtf8Text -Path $GlobalConfigPath
     try {
       $document = if ([string]::IsNullOrWhiteSpace($original)) {
@@ -1980,14 +2012,10 @@ function Restore-AudnCodeIdleThreshold {
       Remove-Item -LiteralPath $GlobalConfigPath -Force -ErrorAction Stop
       return
     }
-    Write-TextAtomic -Path $GlobalConfigPath -Content (($document | ConvertTo-Json -Depth 100) + [Environment]::NewLine)
-    $operation.DidWrite = $true
-  }
-
-  if ($operation.DidWrite -and $null -ne $operation.ConfigAcl) {
-    try { Set-Acl -LiteralPath $GlobalConfigPath -AclObject $operation.ConfigAcl } catch {
-      throw "AudnCode global configuration was rolled back, but its ACL could not be restored: $($_.Exception.Message)"
-    }
+    Write-TextAtomic `
+      -Path $GlobalConfigPath `
+      -Content (($document | ConvertTo-Json -Depth 100) + [Environment]::NewLine) `
+      -ExpectedContent $original
   }
 }
 
@@ -2462,7 +2490,13 @@ function Remove-LegacyAudnCodeHookOrphans {
       if ($null -eq $createdUtc -or
           ([DateTime]::UtcNow - $createdUtc).TotalSeconds -le $minimumAgeSeconds) { continue }
       $parentPid = [int]$process.ParentProcessId
-      if ($parentPid -gt 0 -and $snapshotByPid.ContainsKey($parentPid)) { continue }
+      if ($parentPid -gt 0 -and $snapshotByPid.ContainsKey($parentPid)) {
+        $parentCreatedUtc = Get-CimProcessCreationUtc -Process $snapshotByPid[$parentPid]
+        # A newer process with the same PID is not this child's historical
+        # parent. Missing lifetime evidence remains fail-closed.
+        if ($null -eq $parentCreatedUtc) { continue }
+        if ($parentCreatedUtc -le $createdUtc) { continue }
+      }
       $candidates.Add([pscustomobject]@{
           pid = [int]$process.ProcessId
           parent_pid = $parentPid
@@ -2495,7 +2529,11 @@ function Remove-LegacyAudnCodeHookOrphans {
         }
         if ([int]$candidate.parent_pid -gt 0) {
           $currentParent = @(Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $candidate.parent_pid) -ErrorAction Stop)
-          if ($currentParent.Count -ne 0) { continue }
+          if ($currentParent.Count -gt 1) { continue }
+          if ($currentParent.Count -eq 1) {
+            $currentParentCreatedUtc = Get-CimProcessCreationUtc -Process $currentParent[0]
+            if ($null -eq $currentParentCreatedUtc -or $currentParentCreatedUtc -le $currentCreatedUtc) { continue }
+          }
         }
         Stop-Process -Id ([int]$candidate.pid) -Force -ErrorAction Stop
         $deadline = [DateTimeOffset]::UtcNow.AddSeconds(5)

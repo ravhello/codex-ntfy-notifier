@@ -78,6 +78,7 @@ $SentDir = Join-Path $StateRoot 'sent'
 $SuppressedDir = Join-Path $StateRoot 'suppressed'
 $DeadDir = Join-Path $StateRoot 'dead'
 $MutationLocksDir = Join-Path $StateRoot 'mutation-locks'
+$RecoveryJournalsDir = Join-Path $StateRoot 'recovery-journals'
 $ClaudeSessionsDir = Join-Path $StateRoot 'claude-sessions'
 $WorkerLockPath = Join-Path $StateRoot 'worker.lock'
 $DeliveryLockPath = Join-Path $StateRoot 'delivery.lock'
@@ -115,7 +116,7 @@ if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
   $AudnCodeQueueMaxTranscriptBytes = $testAudnCodeQueueMaxTranscriptBytes
 }
 $AudnCodeHookObservationMarkerName = '.codex-ntfy-hooks.json'
-$AudnCodeHookShapeVersion = 8
+$AudnCodeHookShapeVersion = 9
 $AudnCodeLifecycleMaxPendingTokens = 32
 $AudnCodeSessionMaxHostLifetimes = 8
 $AudnCodeSessionStartBusyEventRank = 1
@@ -124,11 +125,15 @@ $AudnCodeStopFailureMaxTailBytes = [int64](8 * 1024 * 1024)
 $AudnCodeStopFailureMaxRecords = 4096
 $AudnCodeStopFailureMaxLineChars = 1024 * 1024
 $AudnCodeStopFailureAnchorBytes = 256
+$AudnCodeManagedRecoveryRootName = 'codex-ntfy-recovery'
+$AudnCodeManagedRecoveryKind = 'codex-ntfy-audncode-recovery'
+$AudnCodeManagedRecoveryMaxBytes = [int64](64 * 1024)
 $AudnCodeRemoteAgentMaxFiles = 256
 $AudnCodeRemoteAgentMaxClaims = 64
 $AudnCodeRemoteAgentMetadataMaxBytes = [int64](1024 * 1024)
 $MaxRawNotificationBytes = 8 * 1024 * 1024
 $RawNotificationReadTimeoutMilliseconds = 20000
+$script:AbandonedRawNotificationRead = $null
 $testRawNotificationReadTimeoutMilliseconds = 0
 if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
     [int]::TryParse(
@@ -162,7 +167,10 @@ $script:RolloutWatchTruncatedReplays = 0
 $script:RolloutWatchCorruptFiles = 0
 
 function Ensure-RuntimeDirectories {
-  foreach ($path in @($StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir, $DeadDir, $MutationLocksDir, $ClaudeSessionsDir)) {
+  foreach ($path in @(
+      $StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir,
+      $DeadDir, $MutationLocksDir, $RecoveryJournalsDir, $ClaudeSessionsDir
+    )) {
     if (-not (Test-Path -LiteralPath $path)) {
       New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
@@ -1111,12 +1119,15 @@ function Get-RawNotification {
     $stream = $null
     $memory = $null
     $pendingRead = $null
+    $buffer = $null
+    $oversized = $false
     $deadline = [Diagnostics.Stopwatch]::StartNew()
+    $script:AbandonedRawNotificationRead = $null
     try {
       $stream = [Console]::OpenStandardInput()
       $memory = New-Object System.IO.MemoryStream
       $buffer = New-Object byte[] 8192
-      $total = 0
+      [int64]$total = 0
       while ($true) {
         $remainingMilliseconds = $RawNotificationReadTimeoutMilliseconds - [int]$deadline.ElapsedMilliseconds
         if ($remainingMilliseconds -le 0) {
@@ -1125,8 +1136,9 @@ function Get-RawNotification {
         # AudnCode owns the outer 30-second hook deadline. BeginRead keeps this
         # process independently bounded when that wrapper is terminated while
         # its inherited pipe writer remains open. Its ThreadPool callback is a
-        # background worker; disposing our stream in finally releases the OS
-        # read handle even when EOF never arrives.
+        # background worker. A timed-out read stays strongly referenced until
+        # this one-shot hook terminates at the OS boundary after fail-closed
+        # state is durable; disposing here races Windows PowerShell 5.1.
         $pendingRead = $stream.BeginRead($buffer, 0, $buffer.Length, $null, $null)
         if (-not $pendingRead.AsyncWaitHandle.WaitOne($remainingMilliseconds)) {
           throw [TimeoutException]::new('notify stdin did not reach EOF before the safety deadline')
@@ -1135,11 +1147,21 @@ function Get-RawNotification {
         $pendingRead.AsyncWaitHandle.Close()
         $pendingRead = $null
         if ($read -le 0) { break }
-        $total += $read
-        if ($total -gt $MaxRawNotificationBytes) {
-          throw "notify payload exceeds the $MaxRawNotificationBytes byte limit"
+        if (-not $oversized) {
+          $total += $read
+          if ($total -gt $MaxRawNotificationBytes) {
+            # Keep draining without retaining content until EOF or the same
+            # absolute deadline. Disposing Console stdin while Windows
+            # PowerShell 5.1's BeginRead callback is winding down can crash the
+            # host in SafeHandle.DangerousAddRef and replace exit 0 with rc=2.
+            $oversized = $true
+          } else {
+            $memory.Write($buffer, 0, $read)
+          }
         }
-        $memory.Write($buffer, 0, $read)
+      }
+      if ($oversized) {
+        throw "notify payload exceeds the $MaxRawNotificationBytes byte limit"
       }
       # Decode exactly one contract. GetString uses the strict decoder above,
       # so malformed UTF-8 throws instead of introducing replacement glyphs.
@@ -1151,9 +1173,17 @@ function Get-RawNotification {
     } finally {
       $deadline.Stop()
       if ($null -ne $memory) { $memory.Dispose() }
-      if ($null -ne $stream) { $stream.Dispose() }
       if ($null -ne $pendingRead) {
-        try { $pendingRead.AsyncWaitHandle.Close() } catch { }
+        # The hook process is one-shot. Keep the stream, APM result, and buffer
+        # alive until Environment.Exit below terminates the pending read at the
+        # OS boundary; disposing either managed handle here races its callback.
+        $script:AbandonedRawNotificationRead = [pscustomobject]@{
+          stream = $stream
+          async_result = $pendingRead
+          buffer = $buffer
+        }
+      } elseif ($null -ne $stream) {
+        $stream.Dispose()
       }
     }
   }
@@ -1204,6 +1234,20 @@ function New-EventRecord {
   if ($CandidateKind -eq 'audncode_stop_failure' -and $candidateIdentity -notmatch '^[a-f0-9]{64}$') {
     throw 'invalid AudnCode StopFailure candidate identity'
   }
+  $interventionRootUuid = [string](Get-FirstObjectValue $Event @('audncode-intervention-root-uuid', 'audncode_intervention_root_uuid'))
+  $interventionToolUseId = [string](Get-FirstObjectValue $Event @('audncode-intervention-tool-use-id', 'audncode_intervention_tool_use_id'))
+  $interventionProofHash = [string](Get-FirstObjectValue $Event @('audncode-intervention-proof-hash', 'audncode_intervention_proof_hash'))
+  if ($CandidateKind -eq 'audncode_intervention') {
+    $parsedInterventionRoot = [Guid]::Empty
+    if ($Provider -ne 'claude' -or $candidateIdentity -notmatch '^[a-f0-9]{64}$' -or
+        -not [Guid]::TryParseExact($interventionRootUuid, 'D', [ref]$parsedInterventionRoot) -or
+        [string]::IsNullOrWhiteSpace($interventionToolUseId) -or $interventionToolUseId.Length -gt 512 -or
+        $interventionToolUseId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$' -or
+        $interventionProofHash -notmatch '^[a-f0-9]{64}$') {
+      throw 'invalid AudnCode intervention identity'
+    }
+    $interventionRootUuid = $parsedInterventionRoot.ToString('D')
+  }
   $weakIdentity = [string]::IsNullOrWhiteSpace($threadId) -or [string]::IsNullOrWhiteSpace($turnId)
   $identity = if ($weakIdentity) {
     if ($Provider -eq 'codex') {
@@ -1214,7 +1258,15 @@ function New-EventRecord {
   } else {
     if ($Provider -eq 'codex') { "codex-ntfy/v1|$threadId|$turnId" } else { "codex-ntfy/v1|$Provider|$threadId|$turnId" }
   }
-  $key = if ($weakIdentity) {
+  $key = if ($CandidateKind -eq 'audncode_intervention') {
+    # Resume creates a new local epoch, but it does not create a new question.
+    # Keep delivery identity stable across that lifecycle while persisting the
+    # epoch in candidate_identity for the transcript proof itself.
+    Get-Sha256Hex (
+      'audncode-question-dedup/v1|' + $threadId + '|' +
+      $interventionRootUuid + '|' + $interventionToolUseId
+    )
+  } elseif ($weakIdentity) {
     Get-Sha256Hex $identity
   } else {
     # Queue/receipt identity stays one-per-prompt across Stop and StopFailure.
@@ -1259,6 +1311,24 @@ function New-EventRecord {
     audncode_stop_failure_line_hash = [string](Get-FirstObjectValue $Event @('audncode-stop-failure-line-hash', 'audncode_stop_failure_line_hash'))
     audncode_stop_failure_proof_hash = [string](Get-FirstObjectValue $Event @('audncode-stop-failure-proof-hash', 'audncode_stop_failure_proof_hash'))
     audncode_stop_failure_ambiguous = $false
+    audncode_intervention_root_uuid = $interventionRootUuid
+    audncode_intervention_tool_use_id = $interventionToolUseId
+    audncode_intervention_proof_hash = $interventionProofHash
+    audncode_recovery_managed = [bool](Get-FirstObjectValue $Event @('audncode-recovery-managed', 'audncode_recovery_managed'))
+    audncode_recovery_binding_invalid = $false
+    audncode_recovery_marker_path = [string](Get-FirstObjectValue $Event @('audncode-recovery-marker-path', 'audncode_recovery_marker_path'))
+    audncode_recovery_home = [string](Get-FirstObjectValue $Event @('audncode-recovery-home', 'audncode_recovery_home'))
+    audncode_recovery_binding = [string](Get-FirstObjectValue $Event @('audncode-recovery-binding', 'audncode_recovery_binding'))
+    audncode_recovery_manager_instance_id = [string](Get-FirstObjectValue $Event @('audncode-recovery-manager-instance-id', 'audncode_recovery_manager_instance_id'))
+    audncode_recovery_operation_id = [string](Get-FirstObjectValue $Event @('audncode-recovery-operation-id', 'audncode_recovery_operation_id'))
+    audncode_recovery_attempt_id = [string](Get-FirstObjectValue $Event @('audncode-recovery-attempt-id', 'audncode_recovery_attempt_id'))
+    audncode_recovery_manager_pid = [int](Get-FirstObjectValue $Event @('audncode-recovery-manager-pid', 'audncode_recovery_manager_pid'))
+    audncode_recovery_manager_process_start_utc_ticks = [int64](Get-FirstObjectValue $Event @('audncode-recovery-manager-process-start-utc-ticks', 'audncode_recovery_manager_process_start_utc_ticks'))
+    audncode_recovery_created_unix_ms = [int64](Get-FirstObjectValue $Event @('audncode-recovery-created-unix-ms', 'audncode_recovery_created_unix_ms'))
+    audncode_recovery_initial_state = [string](Get-FirstObjectValue $Event @('audncode-recovery-initial-state', 'audncode_recovery_initial_state'))
+    audncode_recovery_initial_revision = [int](Get-FirstObjectValue $Event @('audncode-recovery-initial-revision', 'audncode_recovery_initial_revision'))
+    audncode_recovery_observed_revision = [int](Get-FirstObjectValue $Event @('audncode-recovery-initial-revision', 'audncode_recovery_initial_revision'))
+    audncode_recovery_terminal_hash = [string](Get-FirstObjectValue $Event @('audncode-recovery-terminal-hash', 'audncode_recovery_terminal_hash'))
     candidate_rollout_path = Sanitize-NotificationText -Text ([string](Get-FirstObjectValue $Event @('transcript_path', 'transcript-path', 'rollout_path', 'rollout-path'))) -MaxLength 1200
     rollout_sequence = [int64](Get-FirstObjectValue $Event @('rollout-sequence', 'rollout_sequence'))
     created_at = $now.ToString('o')
@@ -1315,6 +1385,7 @@ function Upgrade-PendingRecordFromStop {
   }
   $existing = Read-JsonFile -Path $Path
   Assert-QueuedRecord -Record $existing -ExpectedKey $IncomingRecord.key
+  $recoveredFailureToJournal = $null
 
   # A /goal can emit several Stop events with the same prompt id. Keep the
   # original active marker as the gate anchor while refreshing the candidate
@@ -1330,10 +1401,35 @@ function Upgrade-PendingRecordFromStop {
       return $true
     }
     if ($incomingKind -eq 'audncode_stop') {
-      # A transcript-proven failure is terminal without idle_prompt. Never let a
-      # later ordinary Stop downgrade it to the weaker two-signal path.
-      Write-RuntimeLog "kept stronger AudnCode StopFailure evidence key=$($IncomingRecord.key.Substring(0, 12))"
-      return $true
+      $replaceRecoveredFailure = $false
+      if ([bool](Get-ObjectValue $existing 'audncode_recovery_managed' $false)) {
+        # Add-PendingEvent owns the per-key lock. If provider recovery already
+        # succeeded, publish its identity-specific tombstone first and then let
+        # the real Stop replace the failed attempt in the same critical section.
+        # An old asynchronous StopFailure replay can therefore linearize only
+        # before the tombstone or after it, and is suppressed in both cases.
+        $receiptDisposition = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $existing
+        $receiptState = [string](Get-ObjectValue $receiptDisposition 'state' 'unverifiable')
+        if ($receiptState -eq 'exact-duplicate') {
+          $replaceRecoveredFailure = $true
+          $recoveredFailureToJournal = $existing
+        } elseif ($receiptState -eq 'absent') {
+          $recoveryGate = Get-AudnCodeManagedRecoveryRecordGate -Record $existing
+          if ([string](Get-ObjectValue $recoveryGate 'state' 'unverifiable') -eq 'cancelled' -and
+              [string](Get-ObjectValue $recoveryGate 'reason' '') -eq 'audncode-managed-recovery-succeeded') {
+            $replaceRecoveredFailure = $true
+            $recoveredFailureToJournal = $existing
+          }
+        }
+      }
+      if (-not $replaceRecoveredFailure) {
+        # A transcript-proven failure is terminal without idle_prompt. Never let
+        # an ordinary Stop downgrade it unless exact managed recovery has already
+        # been durably recorded above.
+        Write-RuntimeLog "kept stronger AudnCode StopFailure evidence key=$($IncomingRecord.key.Substring(0, 12))"
+        return $true
+      }
+      Write-RuntimeLog "accepted AudnCode Stop after managed provider recovery key=$($IncomingRecord.key.Substring(0, 12))"
     }
     if ($incomingKind -eq 'audncode_stop_failure') {
       $existingIdentity = [string](Get-ObjectValue $existing 'candidate_identity' '')
@@ -1345,6 +1441,58 @@ function Upgrade-PendingRecordFromStop {
         Set-RecordValue -Record $existing -Name 'candidate_revision' -Value ([Guid]::NewGuid().ToString('N'))
         Write-JsonAtomic -Path $Path -Value $existing
         Write-RuntimeLog "ignored ambiguous AudnCode StopFailure evidence key=$($IncomingRecord.key.Substring(0, 12))"
+        return $true
+      }
+      $existingRecoveryManaged = [bool](Get-ObjectValue $existing 'audncode_recovery_managed' $false)
+      $incomingRecoveryManaged = [bool](Get-ObjectValue $IncomingRecord 'audncode_recovery_managed' $false)
+      if ($existingRecoveryManaged -and -not $incomingRecoveryManaged) {
+        # A duplicate hook without the inherited launcher environment cannot
+        # downgrade an already-attested managed failure into an ordinary one.
+        return $true
+      } elseif ($existingRecoveryManaged -and $incomingRecoveryManaged -and
+          [string](Get-ObjectValue $existing 'audncode_recovery_binding' '') -ne
+            [string](Get-ObjectValue $IncomingRecord 'audncode_recovery_binding' '')) {
+        # Two different manager/attempt bindings for one exact transcript
+        # failure are ambiguous. Keep that loss sticky and never promote it.
+        Set-RecordValue -Record $existing -Name 'audncode_recovery_binding_invalid' -Value $true
+        Set-RecordValue -Record $existing -Name 'candidate_revision' -Value ([Guid]::NewGuid().ToString('N'))
+        Write-JsonAtomic -Path $Path -Value $existing
+        return $true
+      } elseif ($existingRecoveryManaged -and $incomingRecoveryManaged) {
+        $existingObservedRevision = [int](Get-ObjectValue $existing 'audncode_recovery_observed_revision' 0)
+        $incomingObservedRevision = [int](Get-ObjectValue $IncomingRecord 'audncode_recovery_observed_revision' 0)
+        $existingTerminalHash = [string](Get-ObjectValue $existing 'audncode_recovery_terminal_hash' '')
+        $incomingTerminalHash = [string](Get-ObjectValue $IncomingRecord 'audncode_recovery_terminal_hash' '')
+        $existingObservationValid =
+          ($existingObservedRevision -eq 1 -and $existingTerminalHash.Length -eq 0) -or
+          ($existingObservedRevision -eq 2 -and $existingTerminalHash -match '^[a-f0-9]{64}$')
+        $incomingObservationValid =
+          ($incomingObservedRevision -eq 1 -and $incomingTerminalHash.Length -eq 0) -or
+          ($incomingObservedRevision -eq 2 -and $incomingTerminalHash -match '^[a-f0-9]{64}$')
+        if (-not $existingObservationValid -or -not $incomingObservationValid) {
+          Set-RecordValue -Record $existing -Name 'audncode_recovery_binding_invalid' -Value $true
+          Set-RecordValue -Record $existing -Name 'candidate_revision' -Value ([Guid]::NewGuid().ToString('N'))
+          Write-JsonAtomic -Path $Path -Value $existing
+          return $true
+        }
+        if ($existingObservedRevision -eq 2) {
+          # The first terminal content hash observed for this exact recovery
+          # binding is immutable. A duplicate asynchronous StopFailure may read
+          # a later rewrite, but it can never replace the durable observation.
+          if ($incomingObservedRevision -eq 2 -and
+              -not [string]::Equals($existingTerminalHash, $incomingTerminalHash, [StringComparison]::Ordinal)) {
+            Write-RuntimeLog "kept first AudnCode managed recovery terminal observation key=$($IncomingRecord.key.Substring(0, 12))"
+          }
+          return $true
+        }
+        if ($incomingObservedRevision -eq 2) {
+          # Add-PendingEvent already owns the per-key mutation lock here. Commit
+          # the first rev2/hash directly to the canonical record so concurrent
+          # workers and duplicate hooks share one linearization point.
+          Set-RecordValue -Record $existing -Name 'audncode_recovery_observed_revision' -Value 2
+          Set-RecordValue -Record $existing -Name 'audncode_recovery_terminal_hash' -Value $incomingTerminalHash
+          Write-JsonAtomic -Path $Path -Value $existing
+        }
         return $true
       }
     }
@@ -1371,9 +1519,43 @@ function Upgrade-PendingRecordFromStop {
     Set-RecordValue -Record $IncomingRecord -Name 'next_attempt_unix_ms' -Value ([int64](Get-ObjectValue $existing 'next_attempt_unix_ms' 0))
     Set-RecordValue -Record $IncomingRecord -Name 'last_error' -Value (Get-ObjectValue $existing 'last_error')
   }
+  if ($null -ne $recoveredFailureToJournal) {
+    # The failure tombstone doubles as a write-ahead journal for this normal
+    # Stop. Refresh it on every Stop observed while the old failure is still
+    # canonical, then replace pending. A crash in that gap can therefore
+    # restore the newest linearized completion instead of losing or staling it.
+    $receiptCommit = Write-AudnCodeManagedRecoverySucceededReceiptCore `
+      -Path $Path `
+      -Record $recoveredFailureToJournal `
+      -SuccessorRecord $IncomingRecord
+    if ([string](Get-ObjectValue $receiptCommit 'status' '') -notin @(
+        'recovery-suppressed', 'already-recovery-suppressed'
+      )) {
+      Write-RuntimeLog "kept AudnCode provider failure because recovery successor could not be journaled key=$($IncomingRecord.key.Substring(0, 12))"
+      return $true
+    }
+    if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+        $env:CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_JOURNAL -eq '1') {
+      # Deterministic test-only crash point for the write-ahead guarantee. The
+      # production path never sets CODEX_NTFY_NO_SPAWN.
+      exit 91
+    }
+  }
   # IncomingRecord was built with the current include_message setting; replacing
   # the whole JSON atomically also removes an older message after privacy opt-out.
   Write-JsonAtomic -Path $Path -Value $IncomingRecord
+  if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+      $env:CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_SUCCESSOR_WRITE -eq '1') {
+    # Deterministic test-only crash point for the second two-file gap. Production
+    # never sets CODEX_NTFY_NO_SPAWN.
+    exit 92
+  }
+  if ($null -ne $recoveredFailureToJournal -and
+      -not (Clear-AudnCodeManagedRecoverySucceededSuccessorJournal `
+        -FailureRecord $recoveredFailureToJournal `
+        -ExpectedSuccessor $IncomingRecord)) {
+    Write-RuntimeLog "retained AudnCode recovery journal after durable Stop because it could not be cleared key=$($IncomingRecord.key.Substring(0, 12))"
+  }
   Write-RuntimeLog "upgraded pending candidate with Stop evidence key=$($IncomingRecord.key.Substring(0, 12))"
   return $true
 }
@@ -1389,12 +1571,787 @@ function Remove-TechnicalSuppressionForStopCore {
   try {
     $receipt = Read-JsonFile -Path $Path
     if ([string](Get-ObjectValue $receipt 'reason' '') -notin @('technical-turn', 'unverifiable')) { return $false }
+    $receiptSchemaProperty = $receipt.PSObject.Properties['schema']
+    $receiptSchema = if ($null -ne $receiptSchemaProperty -and
+        ($receiptSchemaProperty.Value -is [int] -or $receiptSchemaProperty.Value -is [long])) {
+      [int64]$receiptSchemaProperty.Value
+    } else {
+      [int64]0
+    }
+    $receiptRevisionProperty = $receipt.PSObject.Properties['candidate_revision']
+    $receiptRevision = [string](Get-ObjectValue $receipt 'candidate_revision' '')
+    $recordRevision = [string](Get-ObjectValue $Record 'candidate_revision' '')
+    $legacyReceiptRevisionMissingOrEmpty =
+      $null -eq $receiptRevisionProperty -or
+      ($receiptRevisionProperty.Value -is [string] -and
+        ([string]$receiptRevisionProperty.Value).Length -eq 0)
+    $revisionProvesNewStop =
+      ($receiptRevision -match '^[a-f0-9]{32}$' -and
+        $recordRevision -match '^[a-f0-9]{32}$' -and
+        -not [string]::Equals($receiptRevision, $recordRevision, [StringComparison]::Ordinal)) -or
+      ($receiptSchema -eq 1 -and
+        $legacyReceiptRevisionMissingOrEmpty -and
+        $recordRevision -match '^[a-f0-9]{32}$')
+    if (-not $revisionProvesNewStop -or
+        -not [string]::Equals([string](Get-ObjectValue $receipt 'key' ''), [string](Get-ObjectValue $Record 'key' ''), [StringComparison]::Ordinal) -or
+        -not [string]::Equals([string](Get-ObjectValue $receipt 'thread_id' ''), [string](Get-ObjectValue $Record 'thread_id' ''), [StringComparison]::Ordinal) -or
+        -not [string]::Equals([string](Get-ObjectValue $receipt 'turn_id' ''), [string](Get-ObjectValue $Record 'turn_id' ''), [StringComparison]::Ordinal)) {
+      return $false
+    }
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $Path) { return $false }
     Write-RuntimeLog "revived provisional suppression with Stop evidence key=$($Record.key.Substring(0, 12))"
     return $true
   } catch {
     return $false
+  }
+}
+
+function Get-AudnCodeManagedRecoverySucceededReceiptPath {
+  param([object]$Record)
+
+  if ($null -eq $Record -or
+      [string](Get-ObjectValue $Record 'candidate_kind' '') -ne 'audncode_stop_failure') {
+    return ''
+  }
+  $key = [string](Get-ObjectValue $Record 'key' '')
+  $candidateIdentity = [string](Get-ObjectValue $Record 'candidate_identity' '')
+  $failureUuid = Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $Record 'audncode_stop_failure_uuid')
+  if ($key -notmatch '^[a-f0-9]{64}$' -or
+      $candidateIdentity -notmatch '^[a-f0-9]{64}$' -or
+      [string]::IsNullOrWhiteSpace($failureUuid)) {
+    return ''
+  }
+  # Keep the filename below MAX_PATH even when StateRoot is long. Binding is
+  # validated inside the receipt, but is deliberately not part of this lookup
+  # key: a replay that lost the inherited launcher environment must still find
+  # the original proof tombstone and fail closed instead of looking distinct.
+  $receiptKey = Get-Sha256Hex (
+    'audncode-managed-recovery-succeeded-receipt/v1|' + $key + '|' +
+    $candidateIdentity + '|' + $failureUuid
+  )
+  return Join-Path $SuppressedDir ('r-' + $receiptKey + '.json')
+}
+
+function Get-AudnCodeManagedRecoverySucceededSuccessorSnapshot {
+  param(
+    [object]$Successor,
+    [string]$ExpectedKey,
+    [string]$ExpectedThreadId,
+    [string]$ExpectedTurnId
+  )
+
+  if ($null -eq $Successor) {
+    return [pscustomobject]@{ ok = $true; present = $false; hash = ''; record = $null; serialized = '' }
+  }
+  if ($ExpectedKey -notmatch '^[a-f0-9]{64}$' -or
+      [string]::IsNullOrWhiteSpace($ExpectedThreadId) -or
+      [string]::IsNullOrWhiteSpace($ExpectedTurnId)) {
+    return [pscustomobject]@{ ok = $false; present = $true; hash = ''; record = $null; serialized = '' }
+  }
+  try {
+    # Preserve the producer's exact serialized journal text. Windows PowerShell
+    # 5.1 and PowerShell Core do not emit byte-identical JSON (for example, PS5
+    # HTML-escapes angle brackets), but both recover the same nested JSON string.
+    # Hashing that exact string therefore survives a cross-engine restart without
+    # trusting a second serializer or retaining the content after restoration.
+    $normalizedJson = if ($Successor -is [string]) {
+      [string]$Successor
+    } else {
+      ConvertTo-CompactJson -Value $Successor
+    }
+    Assert-SafeUnicodeScalarText -Value $normalizedJson -Context 'managed recovery successor journal'
+    $normalizedSuccessor = ConvertFrom-StrictJsonText -Text $normalizedJson
+    Assert-QueuedRecord -Record $normalizedSuccessor -ExpectedKey $ExpectedKey
+    $schemaProperty = $normalizedSuccessor.PSObject.Properties['schema']
+    $weakProperty = $normalizedSuccessor.PSObject.Properties['weak_identity']
+    $managedProperty = $normalizedSuccessor.PSObject.Properties['audncode_recovery_managed']
+    $bindingInvalidProperty = $normalizedSuccessor.PSObject.Properties['audncode_recovery_binding_invalid']
+    $ambiguousProperty = $normalizedSuccessor.PSObject.Properties['audncode_stop_failure_ambiguous']
+    $event = Get-ObjectValue $normalizedSuccessor 'event'
+    $eventTypeProperty = if ($null -eq $event) { $null } else { $event.PSObject.Properties['type'] }
+    $eventCwdProperty = if ($null -eq $event) { $null } else { $event.PSObject.Properties['cwd'] }
+    $eventMessageProperty = if ($null -eq $event) { $null } else { $event.PSObject.Properties['last-assistant-message'] }
+    $valid =
+      $null -ne $schemaProperty -and
+      ($schemaProperty.Value -is [int] -or $schemaProperty.Value -is [long]) -and
+      [int64]$schemaProperty.Value -eq 1 -and
+      $null -ne $weakProperty -and $weakProperty.Value -is [bool] -and -not [bool]$weakProperty.Value -and
+      $null -ne $managedProperty -and $managedProperty.Value -is [bool] -and
+      $null -ne $bindingInvalidProperty -and $bindingInvalidProperty.Value -is [bool] -and -not [bool]$bindingInvalidProperty.Value -and
+      $null -ne $ambiguousProperty -and $ambiguousProperty.Value -is [bool] -and -not [bool]$ambiguousProperty.Value -and
+      [string](Get-ObjectValue $normalizedSuccessor 'provider' '') -eq 'claude' -and
+      [string](Get-ObjectValue $normalizedSuccessor 'candidate_kind' '') -eq 'audncode_stop' -and
+      [string](Get-ObjectValue $normalizedSuccessor 'source_event' '') -eq 'Stop' -and
+      [string](Get-ObjectValue $normalizedSuccessor 'completion_event_type' '') -eq 'task_complete' -and
+      [string](Get-ObjectValue $normalizedSuccessor 'key' '') -eq $ExpectedKey -and
+      [string](Get-ObjectValue $normalizedSuccessor 'sequence_id' '') -eq ('claude-' + $ExpectedKey.Substring(0, 32)) -and
+      [string](Get-ObjectValue $normalizedSuccessor 'thread_id' '') -eq $ExpectedThreadId -and
+      [string](Get-ObjectValue $normalizedSuccessor 'turn_id' '') -eq $ExpectedTurnId -and
+      [string](Get-ObjectValue $normalizedSuccessor 'candidate_revision' '') -match '^[a-f0-9]{32}$' -and
+      [string](Get-ObjectValue $normalizedSuccessor 'candidate_identity' '').Length -eq 0 -and
+      [string](Get-ObjectValue $normalizedSuccessor 'audncode_stop_failure_uuid' '').Length -eq 0 -and
+      [int64](Get-ObjectValue $normalizedSuccessor 'created_unix_ms' 0) -gt 0 -and
+      [int64](Get-ObjectValue $normalizedSuccessor 'next_attempt_unix_ms' 0) -ge 0 -and
+      $null -ne $eventTypeProperty -and $eventTypeProperty.Value -is [string] -and
+      [string]$eventTypeProperty.Value -eq 'agent-turn-complete' -and
+      $null -ne $eventCwdProperty -and $eventCwdProperty.Value -is [string] -and
+      $null -ne $eventMessageProperty -and $eventMessageProperty.Value -is [string]
+    if (-not $valid) {
+      $invalidKey = [string](Get-ObjectValue $normalizedSuccessor 'key' '')
+      $invalidPrefix = $invalidKey.Substring(0, [Math]::Min(12, $invalidKey.Length))
+      Write-RuntimeLog "rejected managed recovery successor snapshot key=$invalidPrefix"
+      return [pscustomobject]@{ ok = $false; present = $true; hash = ''; record = $null; serialized = '' }
+    }
+    $hash = Get-Sha256Hex ('audncode-managed-recovery-successor/v1|' + $normalizedJson)
+    return [pscustomobject]@{
+      ok = $true
+      present = $true
+      hash = $hash
+      record = $normalizedSuccessor
+      serialized = $normalizedJson
+    }
+  } catch {
+    return [pscustomobject]@{ ok = $false; present = $true; hash = ''; record = $null; serialized = '' }
+  }
+}
+
+function Test-AudnCodeManagedRecoverySucceededSuccessorIdentityMatch {
+  param(
+    [object]$Left,
+    [object]$Right
+  )
+
+  if ($null -eq $Left -or $null -eq $Right) { return $false }
+  $key = [string](Get-ObjectValue $Left 'key' '')
+  $threadId = [string](Get-ObjectValue $Left 'thread_id' '')
+  $turnId = [string](Get-ObjectValue $Left 'turn_id' '')
+  $leftSnapshot = Get-AudnCodeManagedRecoverySucceededSuccessorSnapshot `
+    -Successor $Left `
+    -ExpectedKey $key `
+    -ExpectedThreadId $threadId `
+    -ExpectedTurnId $turnId
+  $rightSnapshot = Get-AudnCodeManagedRecoverySucceededSuccessorSnapshot `
+    -Successor $Right `
+    -ExpectedKey $key `
+    -ExpectedThreadId $threadId `
+    -ExpectedTurnId $turnId
+  if (-not [bool]$leftSnapshot.ok -or -not [bool]$leftSnapshot.present -or
+      -not [bool]$rightSnapshot.ok -or -not [bool]$rightSnapshot.present) {
+    return $false
+  }
+
+  # The raw serialized journal and its hash authenticate restoration. Cleanup is
+  # deliberately bound to the logical Stop identity instead: queue gating,
+  # delivery retries, privacy changes, and a newer duplicate Stop can mutate the
+  # record without changing which root prompt completed.
+  $leftRecord = Get-ObjectValue $leftSnapshot 'record'
+  $rightRecord = Get-ObjectValue $rightSnapshot 'record'
+  foreach ($name in @(
+      'provider', 'origin', 'key', 'sequence_id', 'thread_id', 'turn_id',
+      'candidate_kind', 'source_event', 'completion_event_type'
+    )) {
+    if (-not [string]::Equals(
+        [string](Get-ObjectValue $leftRecord $name ''),
+        [string](Get-ObjectValue $rightRecord $name ''),
+        [StringComparison]::Ordinal
+      )) {
+      return $false
+    }
+  }
+  return (
+    [bool](Get-ObjectValue $leftRecord 'weak_identity' $true) -eq $false -and
+    [bool](Get-ObjectValue $rightRecord 'weak_identity' $true) -eq $false
+  )
+}
+
+function Test-AudnCodeManagedRecoverySuppressionReceiptMatchesSuccessor {
+  param(
+    [object]$Receipt,
+    [object]$Successor
+  )
+
+  if ($null -eq $Receipt -or $null -eq $Successor) { return $false }
+  $key = [string](Get-ObjectValue $Successor 'key' '')
+  $threadId = [string](Get-ObjectValue $Successor 'thread_id' '')
+  $turnId = [string](Get-ObjectValue $Successor 'turn_id' '')
+  $successorSnapshot = Get-AudnCodeManagedRecoverySucceededSuccessorSnapshot `
+    -Successor $Successor `
+    -ExpectedKey $key `
+    -ExpectedThreadId $threadId `
+    -ExpectedTurnId $turnId
+  $schemaProperty = $Receipt.PSObject.Properties['schema']
+  $weakProperty = $Receipt.PSObject.Properties['weak_identity']
+  if (-not [bool]$successorSnapshot.ok -or -not [bool]$successorSnapshot.present -or
+      $null -eq $schemaProperty -or
+      ($schemaProperty.Value -isnot [int] -and $schemaProperty.Value -isnot [long]) -or
+      [int64]$schemaProperty.Value -ne 2 -or
+      $null -eq $weakProperty -or $weakProperty.Value -isnot [bool] -or [bool]$weakProperty.Value -or
+      [string](Get-ObjectValue $Receipt 'candidate_revision' '') -notmatch '^[a-f0-9]{32}$') {
+    return $false
+  }
+  $successorRecord = Get-ObjectValue $successorSnapshot 'record'
+  foreach ($name in @(
+      'provider', 'origin', 'key', 'sequence_id', 'thread_id', 'turn_id',
+      'candidate_kind', 'source_event', 'completion_event_type'
+    )) {
+    if (-not [string]::Equals(
+        [string](Get-ObjectValue $Receipt $name ''),
+        [string](Get-ObjectValue $successorRecord $name ''),
+        [StringComparison]::Ordinal
+      )) {
+      return $false
+    }
+  }
+  return $true
+}
+
+function Get-AudnCodeManagedRecoverySucceededReceiptDisposition {
+  param([object]$Record)
+
+  if ($null -eq $Record -or
+      [string](Get-ObjectValue $Record 'candidate_kind' '') -ne 'audncode_stop_failure') {
+    return [pscustomobject]@{ state = 'not-applicable'; path = ''; receipt = $null }
+  }
+  $receiptPath = Get-AudnCodeManagedRecoverySucceededReceiptPath -Record $Record
+  if ([string]::IsNullOrWhiteSpace($receiptPath)) {
+    return [pscustomobject]@{ state = 'unverifiable'; path = ''; receipt = $null }
+  }
+  if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+    return [pscustomobject]@{ state = 'absent'; path = $receiptPath; receipt = $null }
+  }
+
+  try {
+    $receipt = Read-JsonFile -Path $receiptPath
+    $schemaProperty = $receipt.PSObject.Properties['schema']
+    $receiptKey = [string](Get-ObjectValue $receipt 'key' '')
+    $receiptThread = [string](Get-ObjectValue $receipt 'thread_id' '')
+    $receiptTurn = [string](Get-ObjectValue $receipt 'turn_id' '')
+    $receiptRevision = [string](Get-ObjectValue $receipt 'candidate_revision' '')
+    $receiptIdentity = [string](Get-ObjectValue $receipt 'candidate_identity' '')
+    $receiptFailureText = [string](Get-ObjectValue $receipt 'audncode_stop_failure_uuid' '')
+    $receiptFailure = Get-AudnCodeManagedRecoveryGuid -Value $receiptFailureText
+    $receiptBinding = [string](Get-ObjectValue $receipt 'audncode_recovery_binding' '')
+    $receiptTerminalHash = [string](Get-ObjectValue $receipt 'audncode_recovery_terminal_hash' '')
+    $successorProperty = $receipt.PSObject.Properties['successor']
+    $successorHashProperty = $receipt.PSObject.Properties['successor_hash']
+    $validReceipt =
+      $null -ne $schemaProperty -and
+      ($schemaProperty.Value -is [int] -or $schemaProperty.Value -is [long]) -and
+      [int64]$schemaProperty.Value -eq 1 -and
+      [string](Get-ObjectValue $receipt 'reason' '') -eq 'audncode-managed-recovery-succeeded' -and
+      $receiptKey -match '^[a-f0-9]{64}$' -and
+      -not [string]::IsNullOrWhiteSpace((Get-AudnCodeManagedRecoveryGuid -Value $receiptThread)) -and
+      -not [string]::IsNullOrWhiteSpace($receiptTurn) -and
+      $receiptRevision -match '^[a-f0-9]{32}$' -and
+      $receiptIdentity -match '^[a-f0-9]{64}$' -and
+      -not [string]::IsNullOrWhiteSpace($receiptFailure) -and
+      [string]::Equals($receiptFailure, $receiptFailureText, [StringComparison]::Ordinal) -and
+      $receiptBinding -match '^[a-f0-9]{64}$' -and
+      $receiptTerminalHash -match '^[a-f0-9]{64}$' -and
+      $null -ne $successorProperty -and
+      $null -ne $successorHashProperty -and $successorHashProperty.Value -is [string]
+    if (-not $validReceipt) {
+      return [pscustomobject]@{ state = 'unverifiable'; path = $receiptPath; receipt = $receipt; successor = $null }
+    }
+    $successorSnapshot = Get-AudnCodeManagedRecoverySucceededSuccessorSnapshot `
+      -Successor $successorProperty.Value `
+      -ExpectedKey $receiptKey `
+      -ExpectedThreadId $receiptThread `
+      -ExpectedTurnId $receiptTurn
+    $successorHash = [string]$successorHashProperty.Value
+    $successorValid = [bool]$successorSnapshot.ok -and (
+      ($successorSnapshot.present -and $successorHash -match '^[a-f0-9]{64}$' -and
+        [string]::Equals($successorHash, [string]$successorSnapshot.hash, [StringComparison]::Ordinal)) -or
+      (-not $successorSnapshot.present -and $successorHash.Length -eq 0)
+    )
+    if (-not $successorValid -or
+        -not [string]::Equals($receiptKey, [string](Get-ObjectValue $Record 'key' ''), [StringComparison]::Ordinal) -or
+        -not [string]::Equals($receiptThread, [string](Get-ObjectValue $Record 'thread_id' ''), [StringComparison]::Ordinal) -or
+        -not [string]::Equals($receiptTurn, [string](Get-ObjectValue $Record 'turn_id' ''), [StringComparison]::Ordinal) -or
+        -not [string]::Equals($receiptIdentity, [string](Get-ObjectValue $Record 'candidate_identity' ''), [StringComparison]::Ordinal) -or
+        -not [string]::Equals($receiptFailure, (Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $Record 'audncode_stop_failure_uuid')), [StringComparison]::Ordinal) -or
+        -not [string]::Equals(
+          $receiptBinding,
+          [string](Get-ObjectValue $Record 'audncode_recovery_binding' ''),
+          [StringComparison]::Ordinal
+        )) {
+      # The compact filename selected this exact transcript failure proof. Any
+      # malformed receipt or binding disagreement is therefore corruption or a
+      # downgraded replay, never a new candidate. Leave queued canonical state
+      # untouched and fail closed.
+      return [pscustomobject]@{ state = 'unverifiable'; path = $receiptPath; receipt = $receipt; successor = $null }
+    }
+    return [pscustomobject]@{
+      state = 'exact-duplicate'
+      path = $receiptPath
+      receipt = $receipt
+      successor = $successorSnapshot.record
+    }
+  } catch {
+    return [pscustomobject]@{ state = 'unverifiable'; path = $receiptPath; receipt = $null; successor = $null }
+  }
+}
+
+function Get-AudnCodeManagedRecoverySuccessorJournalIndexPath {
+  param([string]$ReceiptPath)
+
+  if ([string]::IsNullOrWhiteSpace($ReceiptPath)) { return '' }
+  $receiptName = [IO.Path]::GetFileName($ReceiptPath)
+  if ($receiptName -notmatch '^r-[a-f0-9]{64}\.json$') { return '' }
+  return Join-Path $RecoveryJournalsDir $receiptName
+}
+
+function Write-AudnCodeManagedRecoverySuccessorJournalIndex {
+  param(
+    [string]$ReceiptPath,
+    [object]$FailureRecord
+  )
+
+  $indexPath = Get-AudnCodeManagedRecoverySuccessorJournalIndexPath -ReceiptPath $ReceiptPath
+  $key = [string](Get-ObjectValue $FailureRecord 'key' '')
+  if ([string]::IsNullOrWhiteSpace($indexPath) -or $key -notmatch '^[a-f0-9]{64}$') {
+    throw 'managed recovery successor journal index identity is invalid'
+  }
+  Write-JsonAtomic -Path $indexPath -Value ([ordered]@{
+      schema = 1
+      key = $key
+      receipt_name = [IO.Path]::GetFileName($ReceiptPath)
+      created_at = [DateTimeOffset]::UtcNow.ToString('o')
+    })
+  return $indexPath
+}
+
+function Remove-AudnCodeManagedRecoverySuccessorJournalIndex {
+  param([string]$ReceiptPath)
+
+  $indexPath = Get-AudnCodeManagedRecoverySuccessorJournalIndexPath -ReceiptPath $ReceiptPath
+  if (-not [string]::IsNullOrWhiteSpace($indexPath) -and (Test-Path -LiteralPath $indexPath -PathType Leaf)) {
+    Remove-Item -LiteralPath $indexPath -Force -ErrorAction Stop
+  }
+}
+
+function Write-AudnCodeManagedRecoverySucceededReceiptCore {
+  param(
+    [string]$Path,
+    [object]$Record,
+    [object]$SuccessorRecord = $null,
+    [switch]$RemoveRecord
+  )
+
+  $receiptPath = Get-AudnCodeManagedRecoverySucceededReceiptPath -Record $Record
+  $candidateRevision = [string](Get-ObjectValue $Record 'candidate_revision' '')
+  $candidateIdentity = [string](Get-ObjectValue $Record 'candidate_identity' '')
+  $failureUuid = Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $Record 'audncode_stop_failure_uuid')
+  $binding = [string](Get-ObjectValue $Record 'audncode_recovery_binding' '')
+  $terminalHash = [string](Get-ObjectValue $Record 'audncode_recovery_terminal_hash' '')
+  if ([string]::IsNullOrWhiteSpace($receiptPath) -or
+      [string](Get-ObjectValue $Record 'provider' '') -ne 'claude' -or
+      [string](Get-ObjectValue $Record 'candidate_kind' '') -ne 'audncode_stop_failure' -or
+      -not [bool](Get-ObjectValue $Record 'audncode_recovery_managed' $false) -or
+      [bool](Get-ObjectValue $Record 'audncode_recovery_binding_invalid' $false) -or
+      [int](Get-ObjectValue $Record 'audncode_recovery_observed_revision' 0) -ne 2 -or
+      $candidateRevision -notmatch '^[a-f0-9]{32}$' -or
+      $candidateIdentity -notmatch '^[a-f0-9]{64}$' -or
+      [string]::IsNullOrWhiteSpace($failureUuid) -or
+      $binding -notmatch '^[a-f0-9]{64}$' -or
+      $terminalHash -notmatch '^[a-f0-9]{64}$') {
+    return [pscustomobject]@{ status = 'unverifiable' }
+  }
+  $successorSnapshot = Get-AudnCodeManagedRecoverySucceededSuccessorSnapshot `
+    -Successor $SuccessorRecord `
+    -ExpectedKey ([string](Get-ObjectValue $Record 'key' '')) `
+    -ExpectedThreadId ([string](Get-ObjectValue $Record 'thread_id' '')) `
+    -ExpectedTurnId ([string](Get-ObjectValue $Record 'turn_id' ''))
+  if (-not [bool]$successorSnapshot.ok) {
+    return [pscustomobject]@{ status = 'unverifiable' }
+  }
+
+  $existingDisposition = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $Record
+  $existingState = [string](Get-ObjectValue $existingDisposition 'state' 'unverifiable')
+  if ($existingState -eq 'exact-duplicate') {
+    if ($successorSnapshot.present) {
+      $existingReceipt = Get-ObjectValue $existingDisposition 'receipt'
+      $existingReceiptPath = [string](Get-ObjectValue $existingDisposition 'path' '')
+      [void](Write-AudnCodeManagedRecoverySuccessorJournalIndex `
+          -ReceiptPath $existingReceiptPath `
+          -FailureRecord $Record)
+      Set-RecordValue -Record $existingReceipt -Name 'successor' -Value ([string]$successorSnapshot.serialized)
+      Set-RecordValue -Record $existingReceipt -Name 'successor_hash' -Value ([string]$successorSnapshot.hash)
+      Write-JsonAtomic -Path $existingReceiptPath -Value $existingReceipt
+    }
+    if ($RemoveRecord -and (Test-Path -LiteralPath $Path -PathType Leaf)) {
+      Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    return [pscustomobject]@{ status = 'already-recovery-suppressed' }
+  }
+  if ($existingState -notin @('absent')) {
+    return [pscustomobject]@{ status = 'unverifiable' }
+  }
+
+  # Publish the stable identity-specific decision before removing or replacing
+  # the queue record. The optional successor is a write-ahead journal: a crash
+  # between these operations leaves enough authenticated state to restore the
+  # normal Stop without ever reviving the exact old failure.
+  $receipt = [ordered]@{
+    schema = 1
+    key = [string](Get-ObjectValue $Record 'key' '')
+    thread_id = [string](Get-ObjectValue $Record 'thread_id' '')
+    turn_id = [string](Get-ObjectValue $Record 'turn_id' '')
+    origin = [string](Get-ObjectValue $Record 'origin' '')
+    candidate_revision = $candidateRevision
+    suppressed_at = [DateTimeOffset]::UtcNow.ToString('o')
+    reason = 'audncode-managed-recovery-succeeded'
+    candidate_identity = $candidateIdentity
+    audncode_stop_failure_uuid = $failureUuid
+    audncode_recovery_binding = $binding
+    audncode_recovery_terminal_hash = $terminalHash
+    successor = if ($successorSnapshot.present) { [string]$successorSnapshot.serialized } else { $null }
+    successor_hash = [string]$successorSnapshot.hash
+  }
+  if ($successorSnapshot.present) {
+    [void](Write-AudnCodeManagedRecoverySuccessorJournalIndex `
+        -ReceiptPath $receiptPath `
+        -FailureRecord $Record)
+  }
+  Write-JsonAtomic -Path $receiptPath -Value $receipt
+  if ($RemoveRecord) {
+    Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+  }
+  return [pscustomobject]@{ status = 'recovery-suppressed' }
+}
+
+function Clear-AudnCodeManagedRecoverySucceededSuccessorJournal {
+  param(
+    [object]$FailureRecord,
+    [object]$ExpectedSuccessor
+  )
+
+  $disposition = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $FailureRecord
+  if ([string](Get-ObjectValue $disposition 'state' '') -ne 'exact-duplicate') {
+    Write-RuntimeLog 'could not clear managed recovery successor journal because its receipt was not exact'
+    return $false
+  }
+  $storedSuccessor = Get-ObjectValue $disposition 'successor'
+  $receipt = Get-ObjectValue $disposition 'receipt'
+  $receiptPath = [string](Get-ObjectValue $disposition 'path' '')
+  if ($null -eq $storedSuccessor) {
+    try {
+      Remove-AudnCodeManagedRecoverySuccessorJournalIndex -ReceiptPath $receiptPath
+    } catch {
+      Write-RuntimeLog 'retained stale managed recovery successor journal index after empty receipt verification'
+    }
+    return $true
+  }
+  if (-not (Test-AudnCodeManagedRecoverySucceededSuccessorIdentityMatch `
+        -Left $storedSuccessor `
+        -Right $ExpectedSuccessor) -or
+      [string]::IsNullOrWhiteSpace($receiptPath) -or $null -eq $receipt) {
+    Write-RuntimeLog 'could not clear managed recovery successor journal because its logical Stop identity disagreed'
+    return $false
+  }
+
+  # The identity decision remains permanent, but the full Stop snapshot is only
+  # a write-ahead journal. Once that Stop is durable, erase its optional message,
+  # cwd, home, and transcript data so receipt retention cannot become indefinite
+  # content retention.
+  Set-RecordValue -Record $receipt -Name 'successor' -Value $null
+  Set-RecordValue -Record $receipt -Name 'successor_hash' -Value ''
+  Write-JsonAtomic -Path $receiptPath -Value $receipt
+  $verified = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $FailureRecord
+  $cleared = [string](Get-ObjectValue $verified 'state' '') -eq 'exact-duplicate' -and
+    $null -eq (Get-ObjectValue $verified 'successor')
+  if (-not $cleared) {
+    Write-RuntimeLog 'could not clear managed recovery successor journal because its empty receipt did not verify'
+  } else {
+    if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+        $env:CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_JOURNAL_CLEAR -eq '1') {
+      # Deterministic test-only crash point after content erasure and before
+      # deleting the content-free active index.
+      exit 93
+    }
+    try {
+      Remove-AudnCodeManagedRecoverySuccessorJournalIndex -ReceiptPath $receiptPath
+    } catch {
+      Write-RuntimeLog 'retained stale managed recovery successor journal index after content erasure'
+    }
+  }
+  return $cleared
+}
+
+function Clear-AudnCodeManagedRecoverySuccessorJournalBeforeDurableRecordRemoval {
+  param([object]$Record)
+
+  if ($null -eq $Record -or
+      [string](Get-ObjectValue $Record 'provider' '') -ne 'claude' -or
+      [string](Get-ObjectValue $Record 'candidate_kind' '') -ne 'audncode_stop') {
+    return $true
+  }
+  $key = [string](Get-ObjectValue $Record 'key' '')
+  if ($key -notmatch '^[a-f0-9]{64}$') { return $false }
+
+  try {
+    $activeIndexes = @(
+      Get-ChildItem -LiteralPath $RecoveryJournalsDir -Filter 'r-*.json' -File -ErrorAction Stop
+    )
+  } catch {
+    return $false
+  }
+  foreach ($indexFile in $activeIndexes) {
+    try {
+      $index = Read-JsonFile -Path $indexFile.FullName
+      $schemaProperty = $index.PSObject.Properties['schema']
+      $indexKey = [string](Get-ObjectValue $index 'key' '')
+      $receiptName = [string](Get-ObjectValue $index 'receipt_name' '')
+      if ($null -eq $schemaProperty -or
+          ($schemaProperty.Value -isnot [int] -and $schemaProperty.Value -isnot [long]) -or
+          [int64]$schemaProperty.Value -ne 1 -or
+          $indexKey -notmatch '^[a-f0-9]{64}$' -or
+          $receiptName -notmatch '^r-[a-f0-9]{64}\.json$' -or
+          -not [string]::Equals($indexFile.Name, $receiptName, [StringComparison]::Ordinal)) {
+        return $false
+      }
+      $receiptPath = Join-Path $SuppressedDir $receiptName
+      if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { return $false }
+      $receipt = Read-JsonFile -Path $receiptPath
+      $expectedFailure = [pscustomobject]@{
+        candidate_kind = 'audncode_stop_failure'
+        key = [string](Get-ObjectValue $receipt 'key' '')
+        thread_id = [string](Get-ObjectValue $receipt 'thread_id' '')
+        turn_id = [string](Get-ObjectValue $receipt 'turn_id' '')
+        candidate_identity = [string](Get-ObjectValue $receipt 'candidate_identity' '')
+        audncode_stop_failure_uuid = [string](Get-ObjectValue $receipt 'audncode_stop_failure_uuid' '')
+        audncode_recovery_binding = [string](Get-ObjectValue $receipt 'audncode_recovery_binding' '')
+      }
+      $disposition = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $expectedFailure
+      if ([string](Get-ObjectValue $disposition 'state' '') -ne 'exact-duplicate' -or
+          -not [string]::Equals(
+            [string](Get-ObjectValue $receipt 'key' ''),
+            $indexKey,
+            [StringComparison]::Ordinal
+          ) -or
+          -not [string]::Equals(
+            [IO.Path]::GetFullPath([string](Get-ObjectValue $disposition 'path' '')),
+            [IO.Path]::GetFullPath($receiptPath),
+            [StringComparison]::OrdinalIgnoreCase
+          )) {
+        return $false
+      }
+      # A different index can be excluded only after proving its immutable
+      # receipt binds the same key. A malformed or unreadable index blocks the
+      # delete: otherwise a corrupted target index could be mistaken for an
+      # unrelated one and strand content after removing its sole durable Stop.
+      if (-not [string]::Equals($indexKey, $key, [StringComparison]::Ordinal)) { continue }
+      $journaledSuccessor = Get-ObjectValue $disposition 'successor'
+      if ($null -eq $journaledSuccessor) {
+        Remove-AudnCodeManagedRecoverySuccessorJournalIndex -ReceiptPath $receiptPath
+        continue
+      }
+      if (-not (Test-AudnCodeManagedRecoverySucceededSuccessorIdentityMatch `
+          -Left $journaledSuccessor `
+          -Right $Record)) {
+        return $false
+      }
+      if (-not (Clear-AudnCodeManagedRecoverySucceededSuccessorJournal `
+          -FailureRecord $expectedFailure `
+          -ExpectedSuccessor $Record)) {
+        return $false
+      }
+    } catch {
+      return $false
+    }
+  }
+  return $true
+}
+
+function Repair-DurableAudnCodeManagedRecoverySuccessorJournals {
+  # A process can be terminated after the recovered Stop becomes durable but
+  # before its content-bearing write-ahead journal is erased. Reconcile that
+  # narrow two-file crash gap on restart (and periodically in a continuous
+  # worker). The permanent identity tombstone remains; only the temporary Stop
+  # snapshot is removed after the exact pending record proves durability.
+  Ensure-RuntimeDirectories
+  $journalIndexes = @(
+    Get-ChildItem -LiteralPath $RecoveryJournalsDir -Filter 'r-*.json' -File -ErrorAction SilentlyContinue |
+      Sort-Object Name
+  )
+  foreach ($journalIndexFile in $journalIndexes) {
+    try {
+      $journalIndex = Read-JsonFile -Path $journalIndexFile.FullName
+      $schemaProperty = $journalIndex.PSObject.Properties['schema']
+      $key = [string](Get-ObjectValue $journalIndex 'key' '')
+      $receiptName = [string](Get-ObjectValue $journalIndex 'receipt_name' '')
+      if ($null -eq $schemaProperty -or
+          ($schemaProperty.Value -isnot [int] -and $schemaProperty.Value -isnot [long]) -or
+          [int64]$schemaProperty.Value -ne 1 -or
+          $key -notmatch '^[a-f0-9]{64}$' -or
+          $receiptName -notmatch '^r-[a-f0-9]{64}\.json$' -or
+          -not [string]::Equals($journalIndexFile.Name, $receiptName, [StringComparison]::Ordinal)) {
+        Write-RuntimeLog "kept unverifiable AudnCode recovery journal index file=$($journalIndexFile.Name)"
+        continue
+      }
+      Invoke-WithRecordMutationLock -Key $key -Action {
+        param($expectedIndexPath, $expectedReceiptName, $expectedKey)
+        $currentIndex = Read-JsonFile -Path $expectedIndexPath
+        if ([string](Get-ObjectValue $currentIndex 'key' '') -ne $expectedKey -or
+            [string](Get-ObjectValue $currentIndex 'receipt_name' '') -ne $expectedReceiptName) {
+          return
+        }
+        $expectedReceiptPath = Join-Path $SuppressedDir $expectedReceiptName
+        if (-not (Test-Path -LiteralPath $expectedReceiptPath -PathType Leaf)) {
+          Remove-Item -LiteralPath $expectedIndexPath -Force -ErrorAction SilentlyContinue
+          return
+        }
+        $receipt = Read-JsonFile -Path $expectedReceiptPath
+        $expectedFailure = [pscustomobject]@{
+          candidate_kind = 'audncode_stop_failure'
+          key = [string](Get-ObjectValue $receipt 'key' '')
+          thread_id = [string](Get-ObjectValue $receipt 'thread_id' '')
+          turn_id = [string](Get-ObjectValue $receipt 'turn_id' '')
+          candidate_identity = [string](Get-ObjectValue $receipt 'candidate_identity' '')
+          audncode_stop_failure_uuid = [string](Get-ObjectValue $receipt 'audncode_stop_failure_uuid' '')
+          audncode_recovery_binding = [string](Get-ObjectValue $receipt 'audncode_recovery_binding' '')
+        }
+        $disposition = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $expectedFailure
+        if ([string](Get-ObjectValue $disposition 'state' '') -ne 'exact-duplicate' -or
+            -not [string]::Equals(
+              [IO.Path]::GetFullPath([string](Get-ObjectValue $disposition 'path' '')),
+              [IO.Path]::GetFullPath($expectedReceiptPath),
+              [StringComparison]::OrdinalIgnoreCase
+            )) {
+          return
+        }
+        $journaledSuccessor = Get-ObjectValue $disposition 'successor'
+        if ($null -eq $journaledSuccessor) {
+          Remove-Item -LiteralPath $expectedIndexPath -Force -ErrorAction SilentlyContinue
+          return
+        }
+        $journaledSnapshot = Get-AudnCodeManagedRecoverySucceededSuccessorSnapshot `
+          -Successor $journaledSuccessor `
+          -ExpectedKey $expectedKey `
+          -ExpectedThreadId ([string](Get-ObjectValue $expectedFailure 'thread_id' '')) `
+          -ExpectedTurnId ([string](Get-ObjectValue $expectedFailure 'turn_id' ''))
+        if (-not [bool]$journaledSnapshot.ok -or -not [bool]$journaledSnapshot.present) { return }
+
+        # A terminal suppression is the durable disposition of either the
+        # original failure or its recovered Stop. Inspect it before restoring a
+        # still-pending failure: Move-ToSuppressed writes the receipt first, so
+        # a crash may leave both files present. Letting the pending failure win
+        # would revive a Stop that the same committed receipt suppresses when
+        # no crash occurs.
+        $suppressedCandidatePath = Join-Path $SuppressedDir ($expectedKey + '.json')
+        if (Test-Path -LiteralPath $suppressedCandidatePath -PathType Leaf) {
+          $suppressedCandidate = Read-JsonFile -Path $suppressedCandidatePath
+          $suppressedSchemaProperty = $suppressedCandidate.PSObject.Properties['schema']
+          $suppressedSchema = if ($null -ne $suppressedSchemaProperty -and
+              ($suppressedSchemaProperty.Value -is [int] -or $suppressedSchemaProperty.Value -is [long])) {
+            [int64]$suppressedSchemaProperty.Value
+          } else {
+            [int64]0
+          }
+          $suppressedRevision = [string](Get-ObjectValue $suppressedCandidate 'candidate_revision' '')
+          $failureRevision = [string](Get-ObjectValue $receipt 'candidate_revision' '')
+          $successorRevision = [string](Get-ObjectValue $journaledSuccessor 'candidate_revision' '')
+          $suppressionReason = [string](Get-ObjectValue $suppressedCandidate 'reason' '')
+          $terminalSuppressionReasons = @(
+            'subagent',
+            'technical-turn',
+            'superseded',
+            'unverifiable',
+            'claude-session-unverifiable',
+            'stale-session',
+            'goal-cancelled'
+          )
+          $baseSuppressionIdentityValid =
+            [string](Get-ObjectValue $suppressedCandidate 'key' '') -eq $expectedKey -and
+            [string](Get-ObjectValue $suppressedCandidate 'thread_id' '') -eq [string](Get-ObjectValue $receipt 'thread_id' '') -and
+            [string](Get-ObjectValue $suppressedCandidate 'turn_id' '') -eq [string](Get-ObjectValue $receipt 'turn_id' '') -and
+            [string](Get-ObjectValue $suppressedCandidate 'origin' '') -eq [string](Get-ObjectValue $receipt 'origin' '')
+          $legacyExactSuccessor =
+            $suppressedSchema -eq 1 -and
+            $suppressedRevision -eq $successorRevision
+          $terminallyDisposedExactFailure =
+            $suppressedRevision -eq $failureRevision -and (
+              ($suppressedSchema -eq 1 -and $suppressionReason -eq 'superseded') -or
+              ($suppressedSchema -eq 2 -and
+                [string](Get-ObjectValue $suppressedCandidate 'provider' '') -eq 'claude' -and
+                [bool](Get-ObjectValue $suppressedCandidate 'weak_identity' $true) -eq $false -and
+                [string](Get-ObjectValue $suppressedCandidate 'candidate_kind' '') -eq 'audncode_stop_failure')
+            )
+          $suppressionValid =
+            $suppressionReason -in $terminalSuppressionReasons -and
+            $baseSuppressionIdentityValid -and (
+              $legacyExactSuccessor -or
+              $terminallyDisposedExactFailure -or
+              (Test-AudnCodeManagedRecoverySuppressionReceiptMatchesSuccessor `
+                -Receipt $suppressedCandidate `
+                -Successor $journaledSuccessor)
+            )
+          if ($suppressionValid) {
+            $suppressionCleared = Clear-AudnCodeManagedRecoverySucceededSuccessorJournal `
+                -FailureRecord $expectedFailure `
+                -ExpectedSuccessor $journaledSuccessor
+            if ($suppressionCleared) {
+              Write-RuntimeLog "cleared terminally suppressed AudnCode recovery journal key=$($expectedKey.Substring(0, 12)) reason=$suppressionReason"
+              return
+            }
+          }
+        }
+
+        $pendingPath = Join-Path $PendingDir ($expectedKey + '.json')
+        foreach ($durablePath in @(
+            $pendingPath,
+            (Join-Path $OutboxDir ($expectedKey + '.json')),
+            (Join-Path $DeadDir ($expectedKey + '.json'))
+          )) {
+          if (-not (Test-Path -LiteralPath $durablePath -PathType Leaf)) { continue }
+          $durableRecord = Read-JsonFile -Path $durablePath
+          if ([string]::Equals($durablePath, $pendingPath, [StringComparison]::OrdinalIgnoreCase) -and
+              [string](Get-ObjectValue $durableRecord 'candidate_kind' '') -eq 'audncode_stop_failure') {
+            $failureDisposition = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $durableRecord
+            $restoredSuccessor = Get-ObjectValue $failureDisposition 'successor'
+            if ([string](Get-ObjectValue $failureDisposition 'state' '') -eq 'exact-duplicate' -and
+                $null -ne $restoredSuccessor) {
+              Write-JsonAtomic -Path $pendingPath -Value $restoredSuccessor
+              if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+                  $env:CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_SUCCESSOR_WRITE -eq '1') {
+                exit 92
+              }
+              [void](Clear-AudnCodeManagedRecoverySucceededSuccessorJournal `
+                  -FailureRecord $durableRecord `
+                  -ExpectedSuccessor $restoredSuccessor)
+              Write-RuntimeLog "restored AudnCode Stop from active recovery journal key=$($expectedKey.Substring(0, 12))"
+              return
+            }
+            continue
+          }
+          if (Test-AudnCodeManagedRecoverySucceededSuccessorIdentityMatch `
+              -Left $journaledSuccessor `
+              -Right $durableRecord) {
+            [void](Clear-AudnCodeManagedRecoverySucceededSuccessorJournal `
+                -FailureRecord $expectedFailure `
+                -ExpectedSuccessor $durableRecord)
+            return
+          }
+        }
+
+        $sentPath = Join-Path $SentDir ($expectedKey + '.json')
+        if (Test-Path -LiteralPath $sentPath -PathType Leaf) {
+          $sentReceipt = Read-JsonFile -Path $sentPath
+          if ([string](Get-ObjectValue $sentReceipt 'key' '') -eq $expectedKey -and
+              [string](Get-ObjectValue $sentReceipt 'thread_id' '') -eq [string](Get-ObjectValue $receipt 'thread_id' '') -and
+              [string](Get-ObjectValue $sentReceipt 'turn_id' '') -eq [string](Get-ObjectValue $receipt 'turn_id' '')) {
+            [void](Clear-AudnCodeManagedRecoverySucceededSuccessorJournal `
+                -FailureRecord $expectedFailure `
+                -ExpectedSuccessor $journaledSuccessor)
+          }
+        }
+      } -Arguments @($journalIndexFile.FullName, $receiptName, $key) | Out-Null
+    } catch {
+      # A malformed or racing receipt is fail-closed and remains available for
+      # diagnosis. Never let cleanup prevent ordinary notification delivery.
+      Write-RuntimeLog "kept unverifiable AudnCode recovery journal index file=$($journalIndexFile.Name)"
+    }
   }
 }
 
@@ -1414,6 +2371,16 @@ function Add-OutboxEventCore {
   if (Test-Path -LiteralPath $deadPath) {
     Write-RuntimeLog "deduplicated dead event key=$($Record.key.Substring(0, 12))"
     return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'dead' }
+  }
+  $recoveryReceipt = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $Record
+  $recoveryReceiptState = [string](Get-ObjectValue $recoveryReceipt 'state' 'unverifiable')
+  if ($recoveryReceiptState -eq 'exact-duplicate') {
+    Write-RuntimeLog "deduplicated recovered AudnCode provider failure key=$($Record.key.Substring(0, 12))"
+    return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'suppressed' }
+  }
+  if ($recoveryReceiptState -eq 'unverifiable') {
+    Write-RuntimeLog "ignored AudnCode provider failure with unverifiable recovery receipt key=$($Record.key.Substring(0, 12))"
+    return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'suppressed' }
   }
   if (Test-Path -LiteralPath $suppressedPath) {
     $revived = Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $Record
@@ -1466,9 +2433,53 @@ function Add-PendingEventCore {
       return [pscustomobject]@{ queued = $false; key = $Record.key; status = $terminal[1] }
     }
   }
+  $recoveryReceipt = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $Record
+  $recoveryReceiptState = [string](Get-ObjectValue $recoveryReceipt 'state' 'unverifiable')
+  if ($recoveryReceiptState -eq 'exact-duplicate') {
+    Write-RuntimeLog "deduplicated recovered AudnCode provider failure key=$($Record.key.Substring(0, 12))"
+    return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'suppressed' }
+  }
+  if ($recoveryReceiptState -eq 'unverifiable') {
+    Write-RuntimeLog "ignored AudnCode provider failure with unverifiable recovery receipt key=$($Record.key.Substring(0, 12))"
+    return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'suppressed' }
+  }
+  $revivableSuppression = $false
   if (Test-Path -LiteralPath $suppressedPath) {
-    $revived = Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $Record
-    if (-not $revived) {
+    if (Test-IsStopEvidence -Record $Record) {
+      try {
+        $suppressionReceipt = Read-JsonFile -Path $suppressedPath
+        $suppressionSchemaProperty = $suppressionReceipt.PSObject.Properties['schema']
+        $suppressionSchema = if ($null -ne $suppressionSchemaProperty -and
+            ($suppressionSchemaProperty.Value -is [int] -or $suppressionSchemaProperty.Value -is [long])) {
+          [int64]$suppressionSchemaProperty.Value
+        } else {
+          [int64]0
+        }
+        $suppressionRevisionProperty = $suppressionReceipt.PSObject.Properties['candidate_revision']
+        $suppressionRevision = [string](Get-ObjectValue $suppressionReceipt 'candidate_revision' '')
+        $recordRevision = [string](Get-ObjectValue $Record 'candidate_revision' '')
+        $legacySuppressionRevisionMissingOrEmpty =
+          $null -eq $suppressionRevisionProperty -or
+          ($suppressionRevisionProperty.Value -is [string] -and
+            ([string]$suppressionRevisionProperty.Value).Length -eq 0)
+        $revisionProvesNewStop =
+          ($suppressionRevision -match '^[a-f0-9]{32}$' -and
+            $recordRevision -match '^[a-f0-9]{32}$' -and
+            -not [string]::Equals($suppressionRevision, $recordRevision, [StringComparison]::Ordinal)) -or
+          ($suppressionSchema -eq 1 -and
+            $legacySuppressionRevisionMissingOrEmpty -and
+            $recordRevision -match '^[a-f0-9]{32}$')
+        $revivableSuppression =
+          [string](Get-ObjectValue $suppressionReceipt 'reason' '') -in @('technical-turn', 'unverifiable') -and
+          $revisionProvesNewStop -and
+          [string]::Equals([string](Get-ObjectValue $suppressionReceipt 'key' ''), [string](Get-ObjectValue $Record 'key' ''), [StringComparison]::Ordinal) -and
+          [string]::Equals([string](Get-ObjectValue $suppressionReceipt 'thread_id' ''), [string](Get-ObjectValue $Record 'thread_id' ''), [StringComparison]::Ordinal) -and
+          [string]::Equals([string](Get-ObjectValue $suppressionReceipt 'turn_id' ''), [string](Get-ObjectValue $Record 'turn_id' ''), [StringComparison]::Ordinal)
+      } catch {
+        $revivableSuppression = $false
+      }
+    }
+    if (-not $revivableSuppression) {
       Write-RuntimeLog "deduplicated suppressed event key=$($Record.key.Substring(0, 12))"
       return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'suppressed' }
     }
@@ -1476,29 +2487,49 @@ function Add-PendingEventCore {
   if (Test-Path -LiteralPath $outboxPath) {
     $existing = Read-JsonFile -Path $outboxPath
     Assert-QueuedRecord -Record $existing -ExpectedKey $Record.key
+    if ($revivableSuppression -and (Test-IsStopEvidence -Record $existing)) {
+      [void](Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $existing)
+    }
     Write-RuntimeLog "deduplicated queued event key=$($Record.key.Substring(0, 12))"
     return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'queued' }
   }
   if (Test-Path -LiteralPath $pendingPath) {
     if (Upgrade-PendingRecordFromStop -Path $pendingPath -IncomingRecord $Record) {
+      if ($revivableSuppression) {
+        $durablePending = Read-JsonFile -Path $pendingPath
+        [void](Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $durablePending)
+      }
       return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'pending' }
     }
     $existing = Read-JsonFile -Path $pendingPath
     Assert-QueuedRecord -Record $existing -ExpectedKey $Record.key
+    if ($revivableSuppression -and (Test-IsStopEvidence -Record $existing)) {
+      [void](Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $existing)
+    }
     Write-RuntimeLog "deduplicated pending event key=$($Record.key.Substring(0, 12))"
     return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'pending' }
   }
   try {
     Write-JsonAtomic -Path $pendingPath -Value $Record -NoOverwrite
+    if ($revivableSuppression) {
+      [void](Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $Record)
+    }
     Write-RuntimeLog "pending idle candidate key=$($Record.key.Substring(0, 12)) origin=$($Record.origin)"
     return [pscustomobject]@{ queued = $true; key = $Record.key; status = 'pending' }
   } catch [System.IO.IOException] {
     if (Test-Path -LiteralPath $pendingPath) {
       if (Upgrade-PendingRecordFromStop -Path $pendingPath -IncomingRecord $Record) {
+        if ($revivableSuppression) {
+          $durablePending = Read-JsonFile -Path $pendingPath
+          [void](Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $durablePending)
+        }
         return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'pending' }
       }
       $existing = Read-JsonFile -Path $pendingPath
       Assert-QueuedRecord -Record $existing -ExpectedKey $Record.key
+      if ($revivableSuppression -and (Test-IsStopEvidence -Record $existing)) {
+        [void](Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $existing)
+      }
       return [pscustomobject]@{ queued = $false; key = $Record.key; status = 'pending' }
     }
     throw
@@ -1551,8 +2582,12 @@ function Remove-ClaudePendingCandidate {
       try {
         $record = Read-JsonFile -Path $path
         if ([string](Get-ObjectValue $record 'provider' '') -eq 'claude') {
-          Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-          Write-RuntimeLog "cancelled Claude candidate with active work key=$($lockedKey.Substring(0, 12))"
+          if (Clear-AudnCodeManagedRecoverySuccessorJournalBeforeDurableRecordRemoval -Record $record) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            Write-RuntimeLog "cancelled Claude candidate with active work key=$($lockedKey.Substring(0, 12))"
+          } else {
+            Write-RuntimeLog "kept Claude candidate with active work because its managed recovery journal could not be cleared key=$($lockedKey.Substring(0, 12))"
+          }
         }
       } catch {
         Write-RuntimeLog "could not cancel Claude candidate key=$($lockedKey.Substring(0, 12))"
@@ -2571,6 +3606,509 @@ function Get-AudnCodeAncestorProcessIds {
     $cursor = $parentPid
   }
   return @($ids)
+}
+
+function Get-AudnCodeManagedRecoveryGuid {
+  param([object]$Value)
+
+  if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Value)) { return '' }
+  $text = [string]$Value
+  # TryParse accepts N, B, P, X, whitespace, and upper-case spellings. The
+  # launcher contract deliberately emits one byte-stable identity spelling so
+  # none of those aliases may bind a recovery marker to a failure record.
+  if ($text -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { return '' }
+  $parsed = [Guid]::Empty
+  if (-not [Guid]::TryParseExact($text, 'D', [ref]$parsed) -or
+      -not [string]::Equals($parsed.ToString('D'), $text, [StringComparison]::Ordinal)) { return '' }
+  return $text
+}
+
+function Get-AudnCodeManagedRecoveryBinding {
+  param(
+    [string]$MarkerPath,
+    [string]$SessionId,
+    [string]$ManagerInstanceId,
+    [string]$OperationId,
+    [string]$AttemptId,
+    [int]$ManagerPid,
+    [int64]$ManagerProcessStartUtcTicks,
+    [int64]$CreatedUnixMs
+  )
+
+  try { $canonicalPath = [IO.Path]::GetFullPath($MarkerPath).ToLowerInvariant() } catch { return '' }
+  $session = Get-AudnCodeManagedRecoveryGuid -Value $SessionId
+  $manager = Get-AudnCodeManagedRecoveryGuid -Value $ManagerInstanceId
+  $operation = Get-AudnCodeManagedRecoveryGuid -Value $OperationId
+  $attempt = Get-AudnCodeManagedRecoveryGuid -Value $AttemptId
+  if ([string]::IsNullOrWhiteSpace($canonicalPath) -or
+      [string]::IsNullOrWhiteSpace($session) -or
+      [string]::IsNullOrWhiteSpace($manager) -or
+      [string]::IsNullOrWhiteSpace($operation) -or
+      [string]::IsNullOrWhiteSpace($attempt) -or
+      $ManagerPid -le 0 -or $ManagerProcessStartUtcTicks -le 0 -or $CreatedUnixMs -le 0) {
+    return ''
+  }
+  return Get-Sha256Hex (
+    'audncode-managed-recovery/v1|' + $canonicalPath + '|' + $session + '|' +
+    $manager + '|' + $operation + '|' + $attempt + '|' + [string]$ManagerPid + '|' +
+    [string]$ManagerProcessStartUtcTicks + '|' + [string]$CreatedUnixMs
+  )
+}
+
+function Test-AudnCodeManagedRecoveryPrivateAcl {
+  param(
+    [string]$RecoveryRoot,
+    [string]$ManagerDirectory,
+    [string]$MarkerPath
+  )
+
+  if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return $true }
+  try {
+    $required = @(
+      [Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+      'S-1-5-18',
+      'S-1-5-32-544'
+    )
+    foreach ($path in @($RecoveryRoot, $ManagerDirectory, $MarkerPath)) {
+      $isDirectory = [IO.Directory]::Exists($path)
+      if (-not $isDirectory -and -not [IO.File]::Exists($path)) { return $false }
+      if ($PSVersionTable.PSEdition -eq 'Core') {
+        $fileSystemInfo = if ($isDirectory) {
+          [IO.DirectoryInfo]::new($path)
+        } else {
+          [IO.FileInfo]::new($path)
+        }
+        $acl = [IO.FileSystemAclExtensions]::GetAccessControl(
+          $fileSystemInfo,
+          [Security.AccessControl.AccessControlSections]::Access
+        )
+      } elseif ($isDirectory) {
+        $acl = [IO.Directory]::GetAccessControl(
+          $path,
+          [Security.AccessControl.AccessControlSections]::Access
+        )
+      } else {
+        $acl = [IO.File]::GetAccessControl(
+          $path,
+          [Security.AccessControl.AccessControlSections]::Access
+        )
+      }
+      $rules = @($acl.GetAccessRules(
+          $true,
+          $true,
+          [Security.Principal.SecurityIdentifier]
+        ))
+      if (-not $acl.AreAccessRulesProtected -or
+          @($rules | Where-Object { $_.IsInherited }).Count -ne 0) { return $false }
+      $present = @{}
+      foreach ($rule in $rules) {
+        $sid = $rule.IdentityReference.Value
+        if ($sid -notin $required -or
+            $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+          return $false
+        }
+        $present[$sid] = $true
+      }
+      foreach ($sid in $required) {
+        if (-not $present.ContainsKey($sid)) { return $false }
+      }
+    }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Read-AudnCodeManagedRecoveryMarker {
+  param(
+    [string]$MarkerPath,
+    [string]$HomePath,
+    [string]$ExpectedSessionId
+  )
+
+  $invalid = [pscustomobject]@{
+    ok = $false
+    transient = $false
+    reason = 'audncode-managed-recovery-unverifiable'
+  }
+  try {
+    if ([string]::IsNullOrWhiteSpace($MarkerPath) -or
+        [string]::IsNullOrWhiteSpace($HomePath) -or
+        [string]::IsNullOrWhiteSpace($ExpectedSessionId) -or
+        -not [IO.Path]::IsPathRooted($MarkerPath)) { return $invalid }
+    $canonicalHome = [IO.Path]::GetFullPath($HomePath)
+    $recoveryRoot = [IO.Path]::GetFullPath((Join-Path $canonicalHome $AudnCodeManagedRecoveryRootName))
+    $canonicalPath = [IO.Path]::GetFullPath($MarkerPath)
+    $markerDirectory = [IO.Path]::GetFullPath((Split-Path -Parent $canonicalPath))
+    if (-not (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHome -TargetPath $canonicalPath) -or
+        -not (Test-Path -LiteralPath $canonicalPath -PathType Leaf) -or
+        -not (Test-AudnCodeManagedRecoveryPrivateAcl `
+          -RecoveryRoot $recoveryRoot `
+          -ManagerDirectory $markerDirectory `
+          -MarkerPath $canonicalPath)) { return $invalid }
+
+    $before = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [int64]$before.Length -le 0 -or [int64]$before.Length -gt $AudnCodeManagedRecoveryMaxBytes) {
+      return $invalid
+    }
+    $firstText = Read-StrictUtf8Text -Path $canonicalPath -MaxBytes $AudnCodeManagedRecoveryMaxBytes
+    $middle = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    $secondText = Read-StrictUtf8Text -Path $canonicalPath -MaxBytes $AudnCodeManagedRecoveryMaxBytes
+    $after = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    $stable = [string]::Equals($firstText, $secondText, [StringComparison]::Ordinal) -and
+      [int64]$before.Length -eq [int64]$middle.Length -and
+      [int64]$middle.Length -eq [int64]$after.Length -and
+      [int64]$before.CreationTimeUtc.Ticks -eq [int64]$middle.CreationTimeUtc.Ticks -and
+      [int64]$middle.CreationTimeUtc.Ticks -eq [int64]$after.CreationTimeUtc.Ticks -and
+      [int64]$before.LastWriteTimeUtc.Ticks -eq [int64]$middle.LastWriteTimeUtc.Ticks -and
+      [int64]$middle.LastWriteTimeUtc.Ticks -eq [int64]$after.LastWriteTimeUtc.Ticks -and
+      (Test-AudnCodePathHasNoReparseComponents -RootPath $canonicalHome -TargetPath $canonicalPath) -and
+      (Test-AudnCodeManagedRecoveryPrivateAcl `
+        -RecoveryRoot $recoveryRoot `
+        -ManagerDirectory $markerDirectory `
+        -MarkerPath $canonicalPath)
+    if (-not $stable) {
+      return [pscustomobject]@{
+        ok = $false
+        transient = $true
+        reason = 'audncode-managed-recovery-changing'
+      }
+    }
+
+    $marker = ConvertFrom-StrictJsonText -Text $secondText
+    $expectedPropertyNames = @(
+      'schema', 'kind', 'manager_instance_id', 'operation_id', 'attempt_id', 'session_id',
+      'manager_pid', 'manager_process_start_utc_ticks', 'state', 'revision', 'reason',
+      'failure_record_uuid', 'created_unix_ms', 'updated_unix_ms'
+    )
+    $actualPropertyNames = @(
+      $marker.PSObject.Properties |
+        Where-Object { $_.MemberType -in @('NoteProperty', 'Property') } |
+        ForEach-Object { [string]$_.Name }
+    )
+    if ($actualPropertyNames.Count -ne $expectedPropertyNames.Count) { return $invalid }
+    foreach ($expectedPropertyName in $expectedPropertyNames) {
+      if ($actualPropertyNames -cnotcontains $expectedPropertyName) { return $invalid }
+    }
+    foreach ($actualPropertyName in $actualPropertyNames) {
+      if ($expectedPropertyNames -cnotcontains $actualPropertyName) { return $invalid }
+    }
+    $schemaProperty = $marker.PSObject.Properties['schema']
+    $kindProperty = $marker.PSObject.Properties['kind']
+    $stateProperty = $marker.PSObject.Properties['state']
+    $reasonProperty = $marker.PSObject.Properties['reason']
+    $failureUuidProperty = $marker.PSObject.Properties['failure_record_uuid']
+    $revisionProperty = $marker.PSObject.Properties['revision']
+    $managerPidProperty = $marker.PSObject.Properties['manager_pid']
+    $managerStartProperty = $marker.PSObject.Properties['manager_process_start_utc_ticks']
+    $createdProperty = $marker.PSObject.Properties['created_unix_ms']
+    $updatedProperty = $marker.PSObject.Properties['updated_unix_ms']
+    if ($null -eq $schemaProperty -or
+        ($schemaProperty.Value -isnot [int] -and $schemaProperty.Value -isnot [long]) -or
+        [int64]$schemaProperty.Value -ne 1 -or
+        $null -eq $kindProperty -or $kindProperty.Value -isnot [string] -or
+        -not [string]::Equals([string]$kindProperty.Value, $AudnCodeManagedRecoveryKind, [StringComparison]::Ordinal) -or
+        $null -eq $stateProperty -or $stateProperty.Value -isnot [string] -or
+        [string]$stateProperty.Value -notin @('recovering', 'recovered', 'exhausted') -or
+        $null -eq $reasonProperty -or $reasonProperty.Value -isnot [string] -or
+        $null -eq $failureUuidProperty -or $failureUuidProperty.Value -isnot [string] -or
+        $null -eq $revisionProperty -or
+        ($revisionProperty.Value -isnot [int] -and $revisionProperty.Value -isnot [long]) -or
+        [int64]$revisionProperty.Value -notin @(1, 2) -or
+        $null -eq $managerPidProperty -or
+        ($managerPidProperty.Value -isnot [int] -and $managerPidProperty.Value -isnot [long]) -or
+        [int64]$managerPidProperty.Value -le 0 -or
+        $null -eq $managerStartProperty -or $managerStartProperty.Value -isnot [long] -or [int64]$managerStartProperty.Value -le 0 -or
+        $null -eq $createdProperty -or $createdProperty.Value -isnot [long] -or [int64]$createdProperty.Value -le 0 -or
+        $null -eq $updatedProperty -or $updatedProperty.Value -isnot [long] -or
+        [int64]$updatedProperty.Value -lt [int64]$createdProperty.Value) { return $invalid }
+    $session = Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $marker 'session_id')
+    $expectedSession = Get-AudnCodeManagedRecoveryGuid -Value $ExpectedSessionId
+    $manager = Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $marker 'manager_instance_id')
+    $operation = Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $marker 'operation_id')
+    $attempt = Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $marker 'attempt_id')
+    if ([string]::IsNullOrWhiteSpace($session) -or $session -ne $expectedSession -or
+        [string]::IsNullOrWhiteSpace($manager) -or
+        [string]::IsNullOrWhiteSpace($operation) -or
+        [string]::IsNullOrWhiteSpace($attempt)) { return $invalid }
+    $actualParent = [IO.Path]::GetFullPath((Split-Path -Parent $canonicalPath))
+    $actualGrandparent = [IO.Path]::GetFullPath((Split-Path -Parent $actualParent))
+    $actualParentName = [IO.Path]::GetFileName($actualParent)
+    $expectedLeaf = $operation + '-' + $attempt + '.json'
+    if (-not [string]::Equals($actualGrandparent, $recoveryRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($actualParentName, $manager, [StringComparison]::Ordinal) -or
+        -not [string]::Equals([IO.Path]::GetFileName($canonicalPath), $expectedLeaf, [StringComparison]::Ordinal)) {
+      return $invalid
+    }
+    $revision = [int]$revisionProperty.Value
+    $state = [string]$stateProperty.Value
+    $reason = [string]$reasonProperty.Value
+    $failureUuidText = [string]$failureUuidProperty.Value
+    $failureUuid = Get-AudnCodeManagedRecoveryGuid -Value $failureUuidText
+    $validRecoveredReasons = @(
+      'runtime-completed', 'same-session-retry-scheduled', 'rollover-committed', 'user-interrupt'
+    )
+    $validExhaustedReasons = @(
+      'launcher-unrecoverable', 'rollover-budget-exhausted', 'seed-budget-exhausted',
+      'rollover-unrecoverable', 'manager-unrecoverable-exit'
+    )
+    $validRevisionShape = if ($revision -eq 1) {
+      $state -eq 'recovering' -and $reason -eq 'runtime-attempt-active' -and
+        $failureUuidText.Length -eq 0
+    } else {
+      -not [string]::IsNullOrWhiteSpace($failureUuid) -and
+        (($state -eq 'recovered' -and $reason -in $validRecoveredReasons) -or
+         ($state -eq 'exhausted' -and $reason -in $validExhaustedReasons))
+    }
+    if (-not $validRevisionShape) { return $invalid }
+    $binding = Get-AudnCodeManagedRecoveryBinding `
+      -MarkerPath $canonicalPath `
+      -SessionId $session `
+      -ManagerInstanceId $manager `
+      -OperationId $operation `
+      -AttemptId $attempt `
+      -ManagerPid ([int]$managerPidProperty.Value) `
+      -ManagerProcessStartUtcTicks ([int64]$managerStartProperty.Value) `
+      -CreatedUnixMs ([int64]$createdProperty.Value)
+    if ($binding -notmatch '^[a-f0-9]{64}$') { return $invalid }
+    return [pscustomobject]@{
+      ok = $true
+      transient = $false
+      reason = 'audncode-managed-recovery-marker-valid'
+      path = $canonicalPath
+      home = $canonicalHome
+      session_id = $session
+      manager_instance_id = $manager
+      operation_id = $operation
+      attempt_id = $attempt
+      manager_pid = [int]$managerPidProperty.Value
+      manager_process_start_utc_ticks = [int64]$managerStartProperty.Value
+      created_unix_ms = [int64]$createdProperty.Value
+      updated_unix_ms = [int64]$updatedProperty.Value
+      state = $state
+      reason_code = $reason
+      failure_record_uuid = $failureUuid
+      revision = $revision
+      binding = $binding
+      content_hash = Get-Sha256Hex ('audncode-managed-recovery-marker/v1|' + $secondText)
+    }
+  } catch {
+    return $invalid
+  }
+}
+
+function Test-AudnCodeManagedRecoveryManagerLifetime {
+  param(
+    [int]$ManagerPid,
+    [int64]$ManagerProcessStartUtcTicks,
+    [switch]$RequireAncestor
+  )
+
+  if ($ManagerPid -le 0 -or $ManagerProcessStartUtcTicks -le 0) { return $false }
+  if ($RequireAncestor -and $ManagerPid -notin @(Get-AudnCodeAncestorProcessIds)) { return $false }
+  $managerProcess = Get-Process -Id $ManagerPid -ErrorAction SilentlyContinue
+  if ($null -eq $managerProcess) { return $false }
+  try {
+    return [int64]$managerProcess.StartTime.ToUniversalTime().Ticks -eq $ManagerProcessStartUtcTicks
+  } catch {
+    return $false
+  } finally {
+    if ($null -ne $managerProcess) { $managerProcess.Dispose() }
+  }
+}
+
+function Test-AudnCodeManagedRecoveryTerminalManagerIdentity {
+  param(
+    [int]$ManagerPid,
+    [int64]$ManagerProcessStartUtcTicks
+  )
+
+  if ($ManagerPid -le 0 -or $ManagerProcessStartUtcTicks -le 0) { return $false }
+  $managerProcess = Get-Process -Id $ManagerPid -ErrorAction SilentlyContinue
+  if ($null -eq $managerProcess) {
+    # An asynchronous StopFailure can start after the manager exited. At that
+    # point process history no longer exists; authority comes from the exact
+    # inherited path under the private, no-reparse root, stable immutable rev2,
+    # full structural binding, and the transcript-exact failure UUID.
+    return $true
+  }
+  try {
+    return [int64]$managerProcess.StartTime.ToUniversalTime().Ticks -eq $ManagerProcessStartUtcTicks
+  } catch {
+    return $false
+  } finally {
+    $managerProcess.Dispose()
+  }
+}
+
+function Get-AudnCodeManagedRecoveryHookAttestation {
+  param(
+    [string]$SessionId,
+    [string]$HomePath
+  )
+
+  $declaredPath = [Environment]::GetEnvironmentVariable(
+    'CODEX_NTFY_AUDNCODE_RECOVERY_MARKER',
+    [EnvironmentVariableTarget]::Process
+  )
+  if ($null -eq $declaredPath) {
+    return [pscustomobject]@{ declared = $false; ok = $true; reason = 'audncode-managed-recovery-not-declared' }
+  }
+  for ($attempt = 0; $attempt -lt 8; $attempt++) {
+    $marker = Read-AudnCodeManagedRecoveryMarker `
+      -MarkerPath ([string]$declaredPath) `
+      -HomePath $HomePath `
+      -ExpectedSessionId $SessionId
+    if ($attempt -eq 0 -and $env:CODEX_NTFY_NO_SPAWN -eq '1') {
+      $testIngressMarker = [string]$env:CODEX_NTFY_TEST_RECOVERY_INGRESS_MARKER
+      if (-not [string]::IsNullOrWhiteSpace($testIngressMarker)) {
+        [IO.File]::WriteAllText($testIngressMarker, 'observed', $Utf8NoBom)
+        $testIngressRelease = [string]$env:CODEX_NTFY_TEST_RECOVERY_INGRESS_RELEASE
+        $testIngressDeadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
+        while (-not [string]::IsNullOrWhiteSpace($testIngressRelease) -and
+            -not (Test-Path -LiteralPath $testIngressRelease) -and
+            [DateTimeOffset]::UtcNow -lt $testIngressDeadline) {
+          Start-Sleep -Milliseconds 10
+        }
+        # Force a new stable snapshot so tests exercise the real rev1 -> rev2
+        # asynchronous hook race instead of relying on scheduler timing.
+        continue
+      }
+    }
+    if ([bool](Get-ObjectValue $marker 'ok' $false)) {
+      $markerState = [string](Get-ObjectValue $marker 'state' '')
+      if ($markerState -in @('recovered', 'exhausted')) {
+        # StopFailure is launched asynchronously. The owner may atomically
+        # resolve rev1 or exit before this hook starts; a stable rev2 marker is
+        # still declaration evidence, but its failure UUID is correlated only
+        # after the transcript proof below.
+        if (Test-AudnCodeManagedRecoveryTerminalManagerIdentity `
+            -ManagerPid ([int](Get-ObjectValue $marker 'manager_pid' 0)) `
+            -ManagerProcessStartUtcTicks ([int64](Get-ObjectValue $marker 'manager_process_start_utc_ticks' 0))) {
+          Set-RecordValue -Record $marker -Name 'declared' -Value $true
+          return $marker
+        }
+      }
+      if ($markerState -eq 'recovering' -and
+          (Test-AudnCodeManagedRecoveryManagerLifetime `
+            -ManagerPid ([int](Get-ObjectValue $marker 'manager_pid' 0)) `
+            -ManagerProcessStartUtcTicks ([int64](Get-ObjectValue $marker 'manager_process_start_utc_ticks' 0)) `
+            -RequireAncestor)) {
+        Set-RecordValue -Record $marker -Name 'declared' -Value $true
+        return $marker
+      }
+    }
+    if ($attempt -lt 7 -and
+        ([bool](Get-ObjectValue $marker 'transient' $false) -or
+         [string](Get-ObjectValue $marker 'state' '') -eq 'recovering')) {
+      Start-Sleep -Milliseconds 25
+      continue
+    }
+    break
+  }
+  return [pscustomobject]@{ declared = $true; ok = $false; reason = 'audncode-managed-recovery-attestation-failed' }
+}
+
+function Get-AudnCodeManagedRecoveryRecordGate {
+  param([object]$Record)
+
+  $ordinary = [pscustomobject]@{ state = 'ordinary'; reason = 'audncode-managed-recovery-not-declared' }
+  $managedProperty = if ($null -eq $Record) { $null } else { $Record.PSObject.Properties['audncode_recovery_managed'] }
+  if ($null -eq $managedProperty) { return $ordinary }
+  if ($managedProperty.Value -isnot [bool]) {
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-binding-unverifiable' }
+  }
+  if (-not [bool]$managedProperty.Value) { return $ordinary }
+  if ([bool](Get-ObjectValue $Record 'audncode_recovery_binding_invalid' $false)) {
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-binding-unverifiable' }
+  }
+
+  $markerPath = [string](Get-ObjectValue $Record 'audncode_recovery_marker_path' '')
+  $homePath = [string](Get-ObjectValue $Record 'audncode_recovery_home' '')
+  $sessionId = [string](Get-ObjectValue $Record 'thread_id' '')
+  $initialState = [string](Get-ObjectValue $Record 'audncode_recovery_initial_state' '')
+  $initialRevision = [int](Get-ObjectValue $Record 'audncode_recovery_initial_revision' 0)
+  $observedRevision = [int](Get-ObjectValue $Record 'audncode_recovery_observed_revision' $initialRevision)
+  $validInitialShape = ($initialRevision -eq 1 -and $initialState -eq 'recovering') -or
+    ($initialRevision -eq 2 -and $initialState -in @('recovered', 'exhausted') -and
+     [string](Get-ObjectValue $Record 'audncode_recovery_terminal_hash' '') -match '^[a-f0-9]{64}$')
+  if (-not $validInitialShape -or $observedRevision -lt $initialRevision -or $observedRevision -gt 2) {
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-revision-unverifiable' }
+  }
+  $marker = Read-AudnCodeManagedRecoveryMarker `
+    -MarkerPath $markerPath `
+    -HomePath $homePath `
+    -ExpectedSessionId $sessionId
+  if (-not [bool](Get-ObjectValue $marker 'ok' $false)) {
+    if ([bool](Get-ObjectValue $marker 'transient' $false)) {
+      return [pscustomobject]@{ state = 'busy'; reason = 'audncode-managed-recovery-changing' }
+    }
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-marker-unverifiable' }
+  }
+
+  $bindingMatches =
+    [string](Get-ObjectValue $marker 'binding' '') -eq [string](Get-ObjectValue $Record 'audncode_recovery_binding' '') -and
+    [string](Get-ObjectValue $marker 'session_id' '') -eq (Get-AudnCodeManagedRecoveryGuid -Value $sessionId) -and
+    [string](Get-ObjectValue $marker 'manager_instance_id' '') -eq [string](Get-ObjectValue $Record 'audncode_recovery_manager_instance_id' '') -and
+    [string](Get-ObjectValue $marker 'operation_id' '') -eq [string](Get-ObjectValue $Record 'audncode_recovery_operation_id' '') -and
+    [string](Get-ObjectValue $marker 'attempt_id' '') -eq [string](Get-ObjectValue $Record 'audncode_recovery_attempt_id' '') -and
+    [int](Get-ObjectValue $marker 'manager_pid' 0) -eq [int](Get-ObjectValue $Record 'audncode_recovery_manager_pid' 0) -and
+    [int64](Get-ObjectValue $marker 'manager_process_start_utc_ticks' 0) -eq [int64](Get-ObjectValue $Record 'audncode_recovery_manager_process_start_utc_ticks' 0) -and
+    [int64](Get-ObjectValue $marker 'created_unix_ms' 0) -eq [int64](Get-ObjectValue $Record 'audncode_recovery_created_unix_ms' 0)
+  if (-not $bindingMatches) {
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-identity-drift' }
+  }
+
+  $revision = [int](Get-ObjectValue $marker 'revision' 0)
+  if ($revision -lt $observedRevision -or $revision -lt $initialRevision) {
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-revision-rollback' }
+  }
+  $state = [string](Get-ObjectValue $marker 'state' '')
+  if ($state -eq 'recovering') {
+    if ($initialRevision -ne 1 -or $revision -ne 1) {
+      return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-recovering-revision-unverifiable' }
+    }
+    if (-not (Test-AudnCodeManagedRecoveryManagerLifetime `
+        -ManagerPid ([int](Get-ObjectValue $marker 'manager_pid' 0)) `
+        -ManagerProcessStartUtcTicks ([int64](Get-ObjectValue $marker 'manager_process_start_utc_ticks' 0)))) {
+      return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-manager-unverifiable' }
+    }
+    return [pscustomobject]@{ state = 'busy'; reason = 'audncode-managed-recovery-active' }
+  }
+  if ($revision -ne 2 -or ($initialRevision -eq 2 -and $state -ne $initialState)) {
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-terminal-revision-unverifiable' }
+  }
+  if (-not (Test-AudnCodeManagedRecoveryTerminalManagerIdentity `
+      -ManagerPid ([int](Get-ObjectValue $marker 'manager_pid' 0)) `
+      -ManagerProcessStartUtcTicks ([int64](Get-ObjectValue $marker 'manager_process_start_utc_ticks' 0)))) {
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-manager-reused' }
+  }
+  $expectedFailureUuid = Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $Record 'audncode_stop_failure_uuid')
+  if ([string]::IsNullOrWhiteSpace($expectedFailureUuid) -or
+      [string](Get-ObjectValue $marker 'failure_record_uuid' '') -ne $expectedFailureUuid) {
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-failure-identity-unverifiable' }
+  }
+  $terminalHash = [string](Get-ObjectValue $marker 'content_hash' '')
+  $observedTerminalHash = [string](Get-ObjectValue $Record 'audncode_recovery_terminal_hash' '')
+  if ($terminalHash -notmatch '^[a-f0-9]{64}$' -or
+      (-not [string]::IsNullOrWhiteSpace($observedTerminalHash) -and $observedTerminalHash -ne $terminalHash)) {
+    return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-terminal-drift' }
+  }
+  if ([string]::IsNullOrWhiteSpace($observedTerminalHash)) {
+    Set-RecordValue -Record $Record -Name 'audncode_recovery_terminal_hash' -Value $terminalHash
+  }
+  # Mutate the worker snapshot only after the complete terminal shape and the
+  # transcript-proven failure UUID agree. Test-RecordIdleGate durably records
+  # these two values before it can retry or perform another marker read.
+  Set-RecordValue -Record $Record -Name 'audncode_recovery_observed_revision' -Value $revision
+  if ($state -eq 'recovered') {
+    return [pscustomobject]@{ state = 'cancelled'; reason = 'audncode-managed-recovery-succeeded' }
+  }
+  if ($state -eq 'exhausted') {
+    return [pscustomobject]@{ state = 'ready'; reason = 'audncode-managed-recovery-exhausted' }
+  }
+  return [pscustomobject]@{ state = 'unverifiable'; reason = 'audncode-managed-recovery-state-unverifiable' }
 }
 
 function Get-AudnCodeHostSession {
@@ -4361,6 +5899,460 @@ function Get-AudnCodeRootUserKind {
   $content = Get-AudnCodeAcceptedQueuedContent -Entry $Entry -SessionId $SessionId
   if ([string]::IsNullOrWhiteSpace($content)) { return 'invalid' }
   return 'task-notification'
+}
+
+function Get-AudnCodeAskInputBinding {
+  param([object]$InputValue)
+
+  $invalid = [pscustomobject]@{ ok = $false; input_hash = ''; question = ''; reason = 'audncode-question-input-unverifiable' }
+  if ($null -eq $InputValue -or $InputValue -isnot [System.Management.Automation.PSCustomObject]) {
+    return $invalid
+  }
+  foreach ($property in @($InputValue.PSObject.Properties)) {
+    if ([string]$property.Name -ne 'questions') { return $invalid }
+  }
+  $questionsProperty = $InputValue.PSObject.Properties['questions']
+  if ($null -eq $questionsProperty -or $questionsProperty.Value -isnot [System.Array]) { return $invalid }
+  $questions = @($questionsProperty.Value)
+  if ($questions.Count -lt 1 -or $questions.Count -gt 4) { return $invalid }
+  $normalizedQuestions = New-Object 'System.Collections.Generic.List[object]'
+  $firstQuestion = ''
+  foreach ($question in $questions) {
+    if ($question -isnot [System.Management.Automation.PSCustomObject]) { return $invalid }
+    foreach ($property in @($question.PSObject.Properties)) {
+      if ([string]$property.Name -notin @('question', 'header', 'options', 'multiSelect')) { return $invalid }
+    }
+    $questionProperty = $question.PSObject.Properties['question']
+    $headerProperty = $question.PSObject.Properties['header']
+    $optionsProperty = $question.PSObject.Properties['options']
+    $multiSelectProperty = $question.PSObject.Properties['multiSelect']
+    if ($null -eq $questionProperty -or $questionProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$questionProperty.Value) -or
+        ([string]$questionProperty.Value).Length -gt 4096 -or
+        -not (Test-SafeUnicodeScalarText -Value ([string]$questionProperty.Value)) -or
+        $null -eq $headerProperty -or $headerProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$headerProperty.Value) -or
+        ([string]$headerProperty.Value).Length -gt 64 -or
+        -not (Test-SafeUnicodeScalarText -Value ([string]$headerProperty.Value)) -or
+        $null -eq $optionsProperty -or $optionsProperty.Value -isnot [System.Array] -or
+        ($null -ne $multiSelectProperty -and $multiSelectProperty.Value -isnot [bool])) {
+      return $invalid
+    }
+    $options = @($optionsProperty.Value)
+    if ($options.Count -lt 2 -or $options.Count -gt 4) { return $invalid }
+    $normalizedOptions = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($option in $options) {
+      if ($option -isnot [System.Management.Automation.PSCustomObject]) { return $invalid }
+      foreach ($property in @($option.PSObject.Properties)) {
+        if ([string]$property.Name -notin @('label', 'description')) { return $invalid }
+      }
+      $labelProperty = $option.PSObject.Properties['label']
+      $descriptionProperty = $option.PSObject.Properties['description']
+      if ($null -eq $labelProperty -or $labelProperty.Value -isnot [string] -or
+          [string]::IsNullOrWhiteSpace([string]$labelProperty.Value) -or
+          ([string]$labelProperty.Value).Length -gt 128 -or
+          -not (Test-SafeUnicodeScalarText -Value ([string]$labelProperty.Value)) -or
+          $null -eq $descriptionProperty -or $descriptionProperty.Value -isnot [string] -or
+          ([string]$descriptionProperty.Value).Length -gt 1024 -or
+          -not (Test-SafeUnicodeScalarText -Value ([string]$descriptionProperty.Value))) {
+        return $invalid
+      }
+      $normalizedOptions.Add([ordered]@{
+          label = [string]$labelProperty.Value
+          description = [string]$descriptionProperty.Value
+        })
+    }
+    if ([string]::IsNullOrWhiteSpace($firstQuestion)) {
+      $firstQuestion = [string]$questionProperty.Value
+    }
+    $normalizedQuestions.Add([ordered]@{
+        question = [string]$questionProperty.Value
+        header = [string]$headerProperty.Value
+        options = @($normalizedOptions.ToArray())
+        multiSelect = if ($null -eq $multiSelectProperty) { $false } else { [bool]$multiSelectProperty.Value }
+      })
+  }
+  $canonical = ConvertTo-CompactJson ([ordered]@{ questions = @($normalizedQuestions.ToArray()) })
+  return [pscustomobject]@{
+    ok = $true
+    input_hash = Get-Sha256Hex ('audncode-question-input/v1|' + $canonical)
+    question = $firstQuestion
+    reason = 'audncode-question-input-bound'
+  }
+}
+
+function Read-AudnCodeQuestionTranscriptTail {
+  param(
+    [object]$SessionState,
+    [string]$SessionId,
+    [int64]$SessionEpoch,
+    [string]$TranscriptPath,
+    [switch]$IncludePreCursor
+  )
+
+  $invalid = [pscustomobject]@{ ok = $false; lines = @(); reason = 'audncode-question-transcript-unverifiable' }
+  if ($null -eq $SessionState -or $SessionState -isnot [System.Management.Automation.PSCustomObject] -or
+      [string]::IsNullOrWhiteSpace($SessionId) -or $SessionEpoch -le 0 -or
+      [string](Get-ObjectValue $SessionState 'session_id' '') -ne $SessionId -or
+      [int64](Get-ObjectValue $SessionState 'epoch' 0) -ne $SessionEpoch -or
+      [string](Get-ObjectValue $SessionState 'state' '') -ne 'busy' -or
+      [bool](Get-ObjectValue $SessionState 'audncode_prompt_prearm_pending' $true) -or
+      -not [string]::Equals(
+        [string](Get-ObjectValue $SessionState 'transcript_path' ''),
+        $TranscriptPath,
+        [StringComparison]::OrdinalIgnoreCase
+      )) { return $invalid }
+  $homePath = [string](Get-ObjectValue $SessionState 'audncode_home' '')
+  if ([string]::IsNullOrWhiteSpace($homePath)) { return $invalid }
+
+  $stream = $null
+  try {
+    $canonicalPath = [IO.Path]::GetFullPath($TranscriptPath)
+    if (-not (Test-AudnCodeTranscriptPath -SessionId $SessionId -TranscriptPath $canonicalPath -HomePath $homePath)) {
+      return $invalid
+    }
+    $before = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    if (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$before.Length -le 0) {
+      return $invalid
+    }
+    $startOffset = [int64]0
+    $cursor = [int64]0
+    $anchorOffset = [int64]0
+    $anchorHash = ''
+    $cursorFileExisted = $false
+    $cursorCreationTicks = [int64]0
+    if ($IncludePreCursor) {
+      $startOffset = [Math]::Max([int64]0, [int64]$before.Length - $AudnCodeStopFailureMaxTailBytes)
+    } else {
+      $cursorValidProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_valid']
+      $cursorProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor']
+      $boundaryProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_at_boundary']
+      $existedProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_file_existed']
+      $creationProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_creation_ticks']
+      $anchorOffsetProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_anchor_offset']
+      $anchorHashProperty = $SessionState.PSObject.Properties['audncode_stop_failure_cursor_anchor_hash']
+      if ($null -eq $cursorValidProperty -or $cursorValidProperty.Value -isnot [bool] -or
+          -not [bool]$cursorValidProperty.Value -or
+          $null -eq $boundaryProperty -or $boundaryProperty.Value -isnot [bool] -or
+          -not [bool]$boundaryProperty.Value -or
+          $null -eq $existedProperty -or $existedProperty.Value -isnot [bool] -or
+          $null -eq $cursorProperty -or ($cursorProperty.Value -isnot [int] -and $cursorProperty.Value -isnot [long]) -or
+          $null -eq $creationProperty -or ($creationProperty.Value -isnot [int] -and $creationProperty.Value -isnot [long]) -or
+          $null -eq $anchorOffsetProperty -or ($anchorOffsetProperty.Value -isnot [int] -and $anchorOffsetProperty.Value -isnot [long]) -or
+          $null -eq $anchorHashProperty -or $anchorHashProperty.Value -isnot [string] -or
+          [string]$anchorHashProperty.Value -notmatch '^[a-f0-9]{64}$') { return $invalid }
+      $cursor = [int64]$cursorProperty.Value
+      $anchorOffset = [int64]$anchorOffsetProperty.Value
+      $anchorHash = [string]$anchorHashProperty.Value
+      $cursorFileExisted = [bool]$existedProperty.Value
+      $cursorCreationTicks = [int64]$creationProperty.Value
+      if ($cursor -lt 0 -or $anchorOffset -lt 0 -or $anchorOffset -gt $cursor -or
+          ($cursor - $anchorOffset) -gt $AudnCodeStopFailureAnchorBytes -or
+          [int64]$before.Length -lt $cursor -or
+          ($cursorFileExisted -and $before.CreationTimeUtc.Ticks -ne $cursorCreationTicks) -or
+          (-not $cursorFileExisted -and ($cursor -ne 0 -or $cursorCreationTicks -ne 0 -or $anchorOffset -ne 0))) {
+        return $invalid
+      }
+      $startOffset = $cursor
+    }
+    $tailLength = [int64]$before.Length - $startOffset
+    if ($tailLength -le 0 -or $tailLength -gt $AudnCodeStopFailureMaxTailBytes) { return $invalid }
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($canonicalPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    if ([int64]$stream.Length -ne [int64]$before.Length) { return $invalid }
+    if (-not $IncludePreCursor) {
+      $anchorLength = [int]($cursor - $anchorOffset)
+      [byte[]]$anchorBytes = New-Object byte[] $anchorLength
+      if ($anchorLength -gt 0) {
+        [void]$stream.Seek($anchorOffset, [IO.SeekOrigin]::Begin)
+        $anchorRead = 0
+        while ($anchorRead -lt $anchorLength) {
+          $count = $stream.Read($anchorBytes, $anchorRead, $anchorLength - $anchorRead)
+          if ($count -le 0) { return $invalid }
+          $anchorRead += $count
+        }
+      }
+      if ((Get-Sha256HexBytes $anchorBytes) -ne $anchorHash) { return $invalid }
+    }
+    [byte[]]$tailBytes = New-Object byte[] ([int]$tailLength)
+    [void]$stream.Seek($startOffset, [IO.SeekOrigin]::Begin)
+    $tailRead = 0
+    while ($tailRead -lt $tailBytes.Length) {
+      $count = $stream.Read($tailBytes, $tailRead, $tailBytes.Length - $tailRead)
+      if ($count -le 0) { return $invalid }
+      $tailRead += $count
+    }
+    if ($tailBytes[$tailBytes.Length - 1] -ne 10 -or [int64]$stream.Length -ne [int64]$before.Length) {
+      return $invalid
+    }
+    $stream.Dispose()
+    $stream = $null
+    $after = Get-Item -LiteralPath $canonicalPath -Force -ErrorAction Stop
+    if ([int64]$after.Length -ne [int64]$before.Length -or
+        $after.CreationTimeUtc.Ticks -ne $before.CreationTimeUtc.Ticks -or
+        $after.LastWriteTimeUtc.Ticks -ne $before.LastWriteTimeUtc.Ticks -or
+        -not (Test-AudnCodeTranscriptPath -SessionId $SessionId -TranscriptPath $canonicalPath -HomePath $homePath)) {
+      return $invalid
+    }
+    if ($IncludePreCursor -and $startOffset -gt 0) {
+      $firstNewline = [Array]::IndexOf($tailBytes, [byte]10)
+      if ($firstNewline -lt 0 -or $firstNewline -ge $tailBytes.Length - 1) { return $invalid }
+      [byte[]]$completeTail = New-Object byte[] ($tailBytes.Length - $firstNewline - 1)
+      [Array]::Copy($tailBytes, $firstNewline + 1, $completeTail, 0, $completeTail.Length)
+      $tailBytes = $completeTail
+    }
+    try { $tailText = $Utf8StrictNoBom.GetString($tailBytes) } catch { return $invalid }
+    $lines = [regex]::Split($tailText, "`n")
+    if ($lines.Count -le 1 -or ($lines.Count - 1) -gt $AudnCodeStopFailureMaxRecords -or
+        -not [string]::IsNullOrEmpty($lines[$lines.Count - 1])) { return $invalid }
+    return [pscustomobject]@{ ok = $true; lines = @($lines); reason = 'audncode-question-transcript-stable' }
+  } catch {
+    return $invalid
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
+function Get-AudnCodeQuestionTranscriptProof {
+  param(
+    [object]$SessionState,
+    [string]$SessionId,
+    [int64]$SessionEpoch,
+    [string]$TranscriptPath,
+    [ValidateSet('Permission', 'Answer')]
+    [string]$Mode,
+    [string]$ExpectedToolUseId = '',
+    [string]$ExpectedToolInputHash = ''
+  )
+
+  $unknown = [pscustomobject]@{ ok = $false; reason = 'audncode-question-proof-unverifiable' }
+  $ambiguous = [pscustomobject]@{ ok = $false; reason = 'audncode-question-proof-ambiguous' }
+  if ($Mode -eq 'Answer' -and
+      ([string]::IsNullOrWhiteSpace($ExpectedToolUseId) -or $ExpectedToolUseId.Length -gt 512 -or
+        $ExpectedToolUseId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$' -or
+        $ExpectedToolInputHash -notmatch '^[a-f0-9]{64}$')) {
+    return [pscustomobject]@{ ok = $false; reason = 'audncode-question-answer-expectation-unverifiable' }
+  }
+  $tail = Read-AudnCodeQuestionTranscriptTail `
+    -SessionState $SessionState `
+    -SessionId $SessionId `
+    -SessionEpoch $SessionEpoch `
+    -TranscriptPath $TranscriptPath `
+    -IncludePreCursor:($Mode -eq 'Answer')
+  if (-not [bool](Get-ObjectValue $tail 'ok' $false)) {
+    return [pscustomobject]@{ ok = $false; reason = [string](Get-ObjectValue $tail 'reason' 'audncode-question-transcript-unverifiable') }
+  }
+
+  $entriesByUuid = @{}
+  $parsedEntries = New-Object 'System.Collections.Generic.List[object]'
+  $seenUuids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+  $asks = New-Object 'System.Collections.Generic.List[object]'
+  $lines = @((Get-ObjectValue $tail 'lines' @()))
+  for ($index = 0; $index -lt $lines.Count - 1; $index++) {
+    $line = [string]$lines[$index]
+    if ($line.EndsWith("`r", [StringComparison]::Ordinal)) { $line = $line.Substring(0, $line.Length - 1) }
+    if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -gt $AudnCodeStopFailureMaxLineChars) {
+      return [pscustomobject]@{ ok = $false; reason = 'audncode-question-line-bounds-unverifiable' }
+    }
+    try { $entry = ConvertFrom-StrictJsonText -Text $line } catch {
+      return [pscustomobject]@{ ok = $false; reason = 'audncode-question-line-json-unverifiable' }
+    }
+    if ($null -eq $entry -or $entry -isnot [System.Management.Automation.PSCustomObject]) {
+      return [pscustomobject]@{ ok = $false; reason = 'audncode-question-row-shape-unverifiable' }
+    }
+    $entryType = [string](Get-ObjectValue $entry 'type' '')
+    if ($entryType -notin @('user', 'assistant')) { continue }
+    $uuidProperty = $entry.PSObject.Properties['uuid']
+    $sessionProperty = $entry.PSObject.Properties['sessionId']
+    $sidechainProperty = $entry.PSObject.Properties['isSidechain']
+    $parsedUuid = [Guid]::Empty
+    if ($null -eq $uuidProperty -or $uuidProperty.Value -isnot [string] -or
+        -not [Guid]::TryParseExact([string]$uuidProperty.Value, 'D', [ref]$parsedUuid) -or
+        $null -eq $sessionProperty -or $sessionProperty.Value -isnot [string] -or
+        [string]$sessionProperty.Value -ne $SessionId -or
+        $null -eq $sidechainProperty -or $sidechainProperty.Value -isnot [bool]) {
+      return [pscustomobject]@{ ok = $false; reason = 'audncode-question-row-identity-unverifiable' }
+    }
+    $canonicalUuid = $parsedUuid.ToString('D')
+    if (-not $seenUuids.Add($canonicalUuid)) { return $ambiguous }
+    $agentProperty = $entry.PSObject.Properties['agentId']
+    if ($null -ne $agentProperty -and
+        ($agentProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$agentProperty.Value) -or
+          ([string]$agentProperty.Value).Length -gt 256)) {
+      return [pscustomobject]@{ ok = $false; reason = 'audncode-question-agent-identity-unverifiable' }
+    }
+    $isRoot = -not [bool]$sidechainProperty.Value -and $null -eq $agentProperty
+    $parentUuid = ''
+    $parentProperty = $entry.PSObject.Properties['parentUuid']
+    if ($null -ne $parentProperty -and $null -ne $parentProperty.Value) {
+      $parsedParent = [Guid]::Empty
+      if ($parentProperty.Value -isnot [string] -or
+          -not [Guid]::TryParseExact([string]$parentProperty.Value, 'D', [ref]$parsedParent)) {
+        return [pscustomobject]@{ ok = $false; reason = 'audncode-question-parent-identity-unverifiable' }
+      }
+      $parentUuid = $parsedParent.ToString('D')
+    }
+    $parsed = [pscustomobject]@{
+      index = $index
+      entry = $entry
+      type = $entryType
+      uuid = $canonicalUuid
+      parent_uuid = $parentUuid
+      is_root = [bool]$isRoot
+      root_user_kind = ''
+    }
+    if ($entryType -eq 'user' -and $isRoot) {
+      $rootKind = Get-AudnCodeRootUserKind -Entry $entry -SessionId $SessionId
+      if ($rootKind -eq 'invalid') {
+        return [pscustomobject]@{ ok = $false; reason = 'audncode-question-root-user-row-unverifiable' }
+      }
+      $parsed.root_user_kind = $rootKind
+    }
+    $parsedEntries.Add($parsed)
+    $entriesByUuid[$canonicalUuid] = $parsed
+    if ($entryType -ne 'assistant' -or -not $isRoot) { continue }
+    $messageProperty = $entry.PSObject.Properties['message']
+    if ($null -eq $messageProperty -or $messageProperty.Value -isnot [System.Management.Automation.PSCustomObject]) {
+      return $unknown
+    }
+    $roleProperty = $messageProperty.Value.PSObject.Properties['role']
+    $contentProperty = $messageProperty.Value.PSObject.Properties['content']
+    if ($null -eq $roleProperty -or $roleProperty.Value -isnot [string] -or
+        [string]$roleProperty.Value -ne 'assistant' -or
+        $null -eq $contentProperty -or $contentProperty.Value -isnot [System.Array]) { return $unknown }
+    $blocks = @($contentProperty.Value)
+    if ($blocks.Count -lt 1 -or $blocks.Count -gt 64) { return $unknown }
+    $askBlocks = @($blocks | Where-Object {
+        $_ -is [System.Management.Automation.PSCustomObject] -and
+        [string](Get-ObjectValue $_ 'type' '') -eq 'tool_use' -and
+        [string](Get-ObjectValue $_ 'name' '') -eq 'AskUserQuestion'
+      })
+    if ($askBlocks.Count -eq 0) { continue }
+    $stopReasonProperty = $messageProperty.Value.PSObject.Properties['stop_reason']
+    if ($askBlocks.Count -ne 1 -or $null -eq $stopReasonProperty -or
+        $stopReasonProperty.Value -isnot [string] -or [string]$stopReasonProperty.Value -ne 'tool_use') {
+      return $ambiguous
+    }
+    $toolUseCount = 0
+    foreach ($block in $blocks) {
+      if ($block -isnot [System.Management.Automation.PSCustomObject]) { return $unknown }
+      $blockType = [string](Get-ObjectValue $block 'type' '')
+      if ($blockType -eq 'thinking') {
+        $thinkingProperty = $block.PSObject.Properties['thinking']
+        if ($null -eq $thinkingProperty -or $thinkingProperty.Value -isnot [string] -or
+            ([string]$thinkingProperty.Value).Length -gt $AudnCodeStopFailureMaxLineChars) { return $unknown }
+        continue
+      }
+      if ($blockType -ne 'tool_use') { return $ambiguous }
+      $toolUseCount++
+      if ([string](Get-ObjectValue $block 'name' '') -ne 'AskUserQuestion') { return $ambiguous }
+    }
+    if ($toolUseCount -ne 1) { return $ambiguous }
+    $askBlock = $askBlocks[0]
+    $toolUseIdProperty = $askBlock.PSObject.Properties['id']
+    if ($null -eq $toolUseIdProperty -or $toolUseIdProperty.Value -isnot [string]) { return $unknown }
+    $toolUseId = [string]$toolUseIdProperty.Value
+    if ([string]::IsNullOrWhiteSpace($toolUseId) -or $toolUseId.Length -gt 512 -or
+        $toolUseId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$') { return $unknown }
+    $inputBinding = Get-AudnCodeAskInputBinding -InputValue (Get-ObjectValue $askBlock 'input')
+    if (-not [bool](Get-ObjectValue $inputBinding 'ok' $false)) { return $unknown }
+    $asks.Add([pscustomobject]@{
+        index = $index
+        assistant_uuid = $canonicalUuid
+        parent_uuid = $parentUuid
+        tool_use_id = $toolUseId
+        input_hash = [string]$inputBinding.input_hash
+        question = [string]$inputBinding.question
+        line_hash = Get-Sha256Hex ('audncode-question-line/v1|' + $line)
+      })
+  }
+
+  $matchingAsks = @(if ($Mode -eq 'Permission') {
+    $asks.ToArray()
+  } else {
+    $asks.ToArray() | Where-Object {
+        [string]$_.tool_use_id -eq $ExpectedToolUseId -and [string]$_.input_hash -eq $ExpectedToolInputHash
+      }
+  })
+  if ($matchingAsks.Count -gt 1 -or ($Mode -eq 'Permission' -and $asks.Count -gt 1)) { return $ambiguous }
+  if ($matchingAsks.Count -ne 1) {
+    return [pscustomobject]@{ ok = $false; reason = 'audncode-question-ask-mismatch' }
+  }
+  $ask = $matchingAsks[0]
+  $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+  $nextParent = [string]$ask.parent_uuid
+  $rootPromptUuid = ''
+  while (-not [string]::IsNullOrWhiteSpace($nextParent) -and $entriesByUuid.ContainsKey($nextParent)) {
+    if (-not $visited.Add($nextParent)) { return $unknown }
+    $ancestor = $entriesByUuid[$nextParent]
+    if ([string]$ancestor.type -eq 'user' -and [bool]$ancestor.is_root -and
+        [string]$ancestor.root_user_kind -eq 'ordinary') {
+      $rootPromptUuid = [string]$ancestor.uuid
+      break
+    }
+    $nextParent = [string]$ancestor.parent_uuid
+  }
+  if ([string]::IsNullOrWhiteSpace($rootPromptUuid)) {
+    return [pscustomobject]@{ ok = $false; reason = 'audncode-question-root-prompt-unverifiable' }
+  }
+
+  $matchingResults = New-Object 'System.Collections.Generic.List[object]'
+  $stale = $false
+  foreach ($parsed in @($parsedEntries.ToArray())) {
+    if ([int]$parsed.index -le [int]$ask.index -or -not [bool]$parsed.is_root) { continue }
+    if ([string]$parsed.type -eq 'assistant') {
+      $stale = $true
+      continue
+    }
+    if ([string]$parsed.root_user_kind -ne 'non-prompt') {
+      $stale = $true
+      continue
+    }
+    $message = Get-ObjectValue $parsed.entry 'message'
+    $resultContentProperty = if ($null -ne $message) { $message.PSObject.Properties['content'] } else { $null }
+    if ($null -eq $resultContentProperty -or $resultContentProperty.Value -isnot [System.Array]) { return $unknown }
+    foreach ($block in @($resultContentProperty.Value)) {
+      if ($block -isnot [System.Management.Automation.PSCustomObject] -or
+          [string](Get-ObjectValue $block 'type' '') -ne 'tool_result') { continue }
+      $resultToolId = [string](Get-ObjectValue $block 'tool_use_id' '')
+      if ($resultToolId.Length -gt 512 -or $resultToolId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$') { return $unknown }
+      if ([string]::Equals($resultToolId, [string]$ask.tool_use_id, [StringComparison]::Ordinal)) {
+        $matchingResults.Add([pscustomobject]@{ uuid = [string]$parsed.uuid; index = [int]$parsed.index })
+      }
+    }
+  }
+  if ($matchingResults.Count -gt 1) { return $ambiguous }
+  if ($Mode -eq 'Permission') {
+    if ($matchingResults.Count -ne 0) {
+      return [pscustomobject]@{ ok = $false; reason = 'audncode-question-already-resolved' }
+    }
+    if ($stale) { return [pscustomobject]@{ ok = $false; reason = 'audncode-question-stale' } }
+  } else {
+    if ($matchingResults.Count -ne 1 -or $stale) {
+      return [pscustomobject]@{ ok = $false; reason = 'audncode-question-answer-result-unverifiable' }
+    }
+  }
+  $answerUuid = if ($matchingResults.Count -eq 1) { [string]$matchingResults[0].uuid } else { '' }
+  $proofHash = Get-Sha256Hex (
+    'audncode-question-proof/v1|' + $SessionId + '|' + $rootPromptUuid + '|' +
+    [string]$ask.assistant_uuid + '|' + [string]$ask.tool_use_id + '|' +
+    [string]$ask.input_hash + '|' + [string]$ask.line_hash
+  )
+  return [pscustomobject]@{
+    ok = $true
+    reason = if ($Mode -eq 'Permission') { 'audncode-question-unresolved' } else { 'audncode-question-answer-correlated' }
+    root_prompt_uuid = $rootPromptUuid
+    assistant_uuid = [string]$ask.assistant_uuid
+    tool_use_id = [string]$ask.tool_use_id
+    tool_input_hash = [string]$ask.input_hash
+    answer_uuid = $answerUuid
+    question = [string]$ask.question
+    proof_hash = $proofHash
+    candidate_identity = Get-Sha256Hex (
+      'audncode-question-candidate/v1|' + $SessionId + '|' + [string]$SessionEpoch + '|' +
+      $rootPromptUuid + '|' + [string]$ask.tool_use_id
+    )
+  }
 }
 
 function Register-AudnCodeStopFailureIdentity {
@@ -9979,6 +11971,16 @@ function Set-ClaudeSessionBusy {
             })
         }
       }
+      $carryQuestionAnswer = [int]$lockedEventRank -eq $AudnCodeSessionStartBusyEventRank
+      $previousQuestionRootUuid = if ($carryQuestionAnswer) {
+        [string](Get-ObjectValue $previous 'audncode_question_answer_root_uuid' '')
+      } else { '' }
+      $previousQuestionToolUseId = if ($carryQuestionAnswer) {
+        [string](Get-ObjectValue $previous 'audncode_question_answer_tool_use_id' '')
+      } else { '' }
+      $previousQuestionAnswerUuid = if ($carryQuestionAnswer) {
+        [string](Get-ObjectValue $previous 'audncode_question_answer_uuid' '')
+      } else { '' }
       # This is the first durable action for an AudnCode prompt. Correlation of
       # the owning PID and its marker is deliberately later and may block. If
       # the hook is killed in that window, the new epoch remains busy and all
@@ -10050,6 +12052,9 @@ function Set-ClaudeSessionBusy {
           audncode_stop_failure_cursor_creation_ticks = [int64](Get-ObjectValue $lockedStopFailureCursor 'creation_ticks' 0)
           audncode_stop_failure_cursor_anchor_offset = [int64](Get-ObjectValue $lockedStopFailureCursor 'anchor_offset' 0)
           audncode_stop_failure_cursor_anchor_hash = [string](Get-ObjectValue $lockedStopFailureCursor 'anchor_hash' '')
+          audncode_question_answer_root_uuid = $previousQuestionRootUuid
+          audncode_question_answer_tool_use_id = $previousQuestionToolUseId
+          audncode_question_answer_uuid = $previousQuestionAnswerUuid
         }
       $prearmWritten = $false
       if ($null -ne $idleHostRetirementCandidate) {
@@ -10395,6 +12400,9 @@ function Set-ClaudeSessionBusy {
         audncode_stop_failure_cursor_creation_ticks = [int64](Get-ObjectValue $previous 'audncode_stop_failure_cursor_creation_ticks' 0)
         audncode_stop_failure_cursor_anchor_offset = [int64](Get-ObjectValue $previous 'audncode_stop_failure_cursor_anchor_offset' 0)
         audncode_stop_failure_cursor_anchor_hash = [string](Get-ObjectValue $previous 'audncode_stop_failure_cursor_anchor_hash' '')
+        audncode_question_answer_root_uuid = [string](Get-ObjectValue $previous 'audncode_question_answer_root_uuid' '')
+        audncode_question_answer_tool_use_id = [string](Get-ObjectValue $previous 'audncode_question_answer_tool_use_id' '')
+        audncode_question_answer_uuid = [string](Get-ObjectValue $previous 'audncode_question_answer_uuid' '')
       })
     return $nextEpoch
   } -Arguments @($info.path, $SessionId, $PromptId, $TranscriptPath, $ClaudePromptBaselineMaxBytes, $HookStartTicks, $AudnCodeBusyEventRank, $audnCodeHostPid, $audnCodeHostStartedUnixMs, $audnCodeHostProcessStartedUnixMs, $audnCodeRuntimeKey, $audnCodeBackgroundRegistryValid, $audnCodeBackgroundIds, $audnCodeCronRuntimeKey, $audnCodeCronRegistryValid, $audnCodeProjectRoot, $audnCodeCronHookGeneration, $audnCodeCronHookInstalledUnixMs, $terminalClaimEnvelope, $audnCodeTerminalClaimsValid, $audnCodeTerminalClaimCursor, $audnCodeTerminalClaimAtBoundary, $AudnCodeHomePath, $audnCodeTaskListSafe, $audnCodeTaskListValid, $audnCodeTeamNameSafe, $audnCodeTeamNameValid, $audnCodeHostLifetimeEnvelope, $audnCodeMultiHostConflict, $promptPrearmEpoch, $promptPrearmToken)
@@ -10435,13 +12443,280 @@ function Set-ClaudeSessionBusy {
             $removeForRuntime = [string](Get-ObjectValue $currentSessionState 'audncode_runtime_key' '') -eq $lockedRuntimeKey
           }
           if ([string](Get-ObjectValue $current 'provider' '') -eq 'claude' -and ($removeForSession -or $removeForRuntime)) {
-            Remove-Item -LiteralPath $lockedPath -Force -ErrorAction SilentlyContinue
+            if (Clear-AudnCodeManagedRecoverySuccessorJournalBeforeDurableRecordRemoval -Record $current) {
+              Remove-Item -LiteralPath $lockedPath -Force -ErrorAction SilentlyContinue
+            } else {
+              Write-RuntimeLog "kept Claude candidate because its managed recovery journal could not be cleared key=$(([string]$current.key).Substring(0, 12))"
+            }
           }
         } catch { }
       } -Arguments @($file.FullName, $SessionId, $audnCodeRuntimeKey))
   }
   Write-RuntimeLog "Claude session marked busy; cancelled stale candidates session=$($SessionId.Substring(0, [Math]::Min(8, $SessionId.Length)))"
   return [int64]$epoch
+}
+
+function Set-AudnCodeQuestionAnsweredBusy {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [int64]$HookStartTicks,
+    [int]$IngressHostPid,
+    [int64]$IngressHostStartedUnixMs,
+    [object]$HookInput
+  )
+
+  $invalid = [pscustomobject]@{ ok = $false; epoch = [int64]0; duplicate = $false; reason = 'audncode-question-answer-unverifiable' }
+  if ([string](Get-ObjectValue $HookInput 'tool_name' '') -ne 'AskUserQuestion' -or
+      [string]::IsNullOrWhiteSpace($SessionId) -or [string]::IsNullOrWhiteSpace($TranscriptPath) -or
+      [string]::IsNullOrWhiteSpace($HomePath) -or $HookStartTicks -le 0 -or
+      $IngressHostPid -le 0 -or $IngressHostStartedUnixMs -le 0) { return $invalid }
+  $toolUseIdProperty = $HookInput.PSObject.Properties['tool_use_id']
+  if ($null -eq $toolUseIdProperty -or $toolUseIdProperty.Value -isnot [string]) { return $invalid }
+  $toolUseId = [string]$toolUseIdProperty.Value
+  if ([string]::IsNullOrWhiteSpace($toolUseId) -or $toolUseId.Length -gt 512 -or
+      $toolUseId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$') { return $invalid }
+  $inputBinding = Get-AudnCodeAskInputBinding -InputValue (Get-ObjectValue $HookInput 'tool_input')
+  if (-not [bool](Get-ObjectValue $inputBinding 'ok' $false)) { return $invalid }
+  try {
+    $canonicalHome = [IO.Path]::GetFullPath($HomePath)
+    $canonicalTranscript = [IO.Path]::GetFullPath($TranscriptPath)
+  } catch {
+    return $invalid
+  }
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return $invalid }
+  $mutation = Invoke-WithClaudeSessionLock -Info $info -Action {
+    param($lockedPath, $lockedSessionId, $lockedTranscript, $lockedHome, $lockedHookTicks, $lockedHostPid, $lockedHostStarted, $lockedToolUseId, $lockedInputHash)
+    $state = $null
+    try { $state = Read-JsonFile -Path $lockedPath } catch { return $null }
+    $epoch = [int64](Get-ObjectValue $state 'epoch' 0)
+    if ([string](Get-ObjectValue $state 'session_id' '') -ne $lockedSessionId -or $epoch -le 0 -or
+        [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+        [bool](Get-ObjectValue $state 'audncode_prompt_prearm_pending' $true) -or
+        -not [string]::Equals([string](Get-ObjectValue $state 'transcript_path' ''), $lockedTranscript, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([string](Get-ObjectValue $state 'audncode_home' ''), $lockedHome, [StringComparison]::OrdinalIgnoreCase) -or
+        [int](Get-ObjectValue $state 'audncode_host_pid' 0) -ne [int]$lockedHostPid -or
+        [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0) -ne [int64]$lockedHostStarted) {
+      return $null
+    }
+    $observedHost = Get-AudnCodeHostSession `
+      -SessionId $lockedSessionId `
+      -HomePath $lockedHome `
+      -ExpectedHostPid ([int]$lockedHostPid) `
+      -ExpectedHostStartedUnixMs ([int64]$lockedHostStarted)
+    if (-not [bool](Get-ObjectValue $observedHost 'ok' $false) -or
+        [int](Get-ObjectValue $observedHost 'pid' 0) -ne [int]$lockedHostPid -or
+        [int64](Get-ObjectValue $observedHost 'started_unix_ms' 0) -ne [int64]$lockedHostStarted) {
+      return $null
+    }
+    $proof = Get-AudnCodeQuestionTranscriptProof `
+      -SessionState $state `
+      -SessionId $lockedSessionId `
+      -SessionEpoch $epoch `
+      -TranscriptPath $lockedTranscript `
+      -Mode Answer `
+      -ExpectedToolUseId $lockedToolUseId `
+      -ExpectedToolInputHash $lockedInputHash
+    if (-not [bool](Get-ObjectValue $proof 'ok' $false)) {
+      Write-RuntimeLog "ignored AudnCode question answer proof reason=$(Sanitize-NotificationText -Text ([string](Get-ObjectValue $proof 'reason' 'unverifiable')) -MaxLength 80)"
+      return $null
+    }
+    $rootUuid = [string](Get-ObjectValue $proof 'root_prompt_uuid' '')
+    $answerUuid = [string](Get-ObjectValue $proof 'answer_uuid' '')
+    $previousToolUseId = [string](Get-ObjectValue $state 'audncode_question_answer_tool_use_id' '')
+    $previousRootUuid = [string](Get-ObjectValue $state 'audncode_question_answer_root_uuid' '')
+    $previousAnswerUuid = [string](Get-ObjectValue $state 'audncode_question_answer_uuid' '')
+    if ([string]::Equals($previousToolUseId, $lockedToolUseId, [StringComparison]::Ordinal)) {
+      if ([string]::Equals($previousRootUuid, $rootUuid, [StringComparison]::OrdinalIgnoreCase) -and
+          [string]::Equals($previousAnswerUuid, $answerUuid, [StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ ok = $true; epoch = $epoch; duplicate = $true; root_uuid = $rootUuid; answer_uuid = $answerUuid }
+      }
+      return $null
+    }
+    if ([int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0) -ge [int64]$lockedHookTicks) {
+      return $null
+    }
+    $cursor = Get-AudnCodeTranscriptCursorSnapshot `
+      -TranscriptPath $lockedTranscript `
+      -SessionId $lockedSessionId `
+      -HomePath $lockedHome
+    if (-not [bool](Get-ObjectValue $cursor 'ok' $false)) { return $null }
+    $nextEpoch = $epoch + 1
+    Set-RecordValue -Record $state -Name 'epoch' -Value ([int64]$nextEpoch)
+    Set-RecordValue -Record $state -Name 'state' -Value 'busy'
+    Set-RecordValue -Record $state -Name 'prompt_id' -Value $answerUuid
+    Set-RecordValue -Record $state -Name 'busy_unix_ms' -Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+    Set-RecordValue -Record $state -Name 'idle_unix_ms' -Value ([int64]0)
+    Set-RecordValue -Record $state -Name 'notification_type' -Value ''
+    Set-RecordValue -Record $state -Name 'busy_hook_start_ticks' -Value ([int64]$lockedHookTicks)
+    Set-RecordValue -Record $state -Name 'audncode_busy_event_rank' -Value ([int]$AudnCodeUserPromptBusyEventRank)
+    Set-RecordValue -Record $state -Name 'idle_hook_start_ticks' -Value ([int64]0)
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_identity' -Value ''
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_ambiguous' -Value $false
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_cursor_valid' -Value ([bool](Get-ObjectValue $cursor 'ok' $false))
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_cursor_file_existed' -Value ([bool](Get-ObjectValue $cursor 'file_existed' $false))
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_cursor' -Value ([int64](Get-ObjectValue $cursor 'cursor' 0))
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_cursor_at_boundary' -Value ([bool](Get-ObjectValue $cursor 'at_boundary' $false))
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_cursor_creation_ticks' -Value ([int64](Get-ObjectValue $cursor 'creation_ticks' 0))
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_cursor_anchor_offset' -Value ([int64](Get-ObjectValue $cursor 'anchor_offset' 0))
+    Set-RecordValue -Record $state -Name 'audncode_stop_failure_cursor_anchor_hash' -Value ([string](Get-ObjectValue $cursor 'anchor_hash' ''))
+    Set-RecordValue -Record $state -Name 'audncode_question_answer_root_uuid' -Value $rootUuid
+    Set-RecordValue -Record $state -Name 'audncode_question_answer_tool_use_id' -Value $lockedToolUseId
+    Set-RecordValue -Record $state -Name 'audncode_question_answer_uuid' -Value $answerUuid
+    Write-JsonAtomic -Path $lockedPath -Value $state
+    return [pscustomobject]@{ ok = $true; epoch = [int64]$nextEpoch; duplicate = $false; root_uuid = $rootUuid; answer_uuid = $answerUuid }
+  } -Arguments @($info.path, $SessionId, $canonicalTranscript, $canonicalHome, $HookStartTicks, $IngressHostPid, $IngressHostStartedUnixMs, $toolUseId, [string]$inputBinding.input_hash)
+  if ($null -eq $mutation -or -not [bool](Get-ObjectValue $mutation 'ok' $false)) { return $invalid }
+
+  if (-not [bool](Get-ObjectValue $mutation 'duplicate' $false)) {
+    # A question answer is a new prompt epoch. Retire only still-pending
+    # completion candidates; the already-durable intervention lives in outbox
+    # or sent and remains the exact-once receipt for the question itself.
+    foreach ($file in @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+      $candidate = $null
+      try { $candidate = Read-JsonFile -Path $file.FullName } catch { continue }
+      if ([string](Get-ObjectValue $candidate 'provider' '') -ne 'claude' -or
+          [string](Get-ObjectValue $candidate 'thread_id' '') -ne $SessionId) { continue }
+      [void](Invoke-WithRecordMutationLock -Key ([string]$candidate.key) -Action {
+          param($lockedCandidatePath, $lockedSessionId)
+          if (-not (Test-Path -LiteralPath $lockedCandidatePath -PathType Leaf)) { return }
+          try {
+            $lockedCandidate = Read-JsonFile -Path $lockedCandidatePath
+            if ([string](Get-ObjectValue $lockedCandidate 'provider' '') -eq 'claude' -and
+                [string](Get-ObjectValue $lockedCandidate 'thread_id' '') -eq $lockedSessionId) {
+              if (Clear-AudnCodeManagedRecoverySuccessorJournalBeforeDurableRecordRemoval -Record $lockedCandidate) {
+                Remove-Item -LiteralPath $lockedCandidatePath -Force -ErrorAction SilentlyContinue
+              } else {
+                Write-RuntimeLog "kept answered-question predecessor because its managed recovery journal could not be cleared key=$(([string]$lockedCandidate.key).Substring(0, 12))"
+              }
+            }
+          } catch { }
+        } -Arguments @($file.FullName, $SessionId))
+    }
+  }
+  return $mutation
+}
+
+function Add-AudnCodeQuestionIntervention {
+  param(
+    [string]$SessionId,
+    [string]$TranscriptPath,
+    [string]$HomePath,
+    [string]$Cwd,
+    [int64]$HookStartTicks
+  )
+
+  $ignored = [pscustomobject]@{ queued = $false; status = 'ignored'; key = '' }
+  if ([string]::IsNullOrWhiteSpace($SessionId) -or [string]::IsNullOrWhiteSpace($TranscriptPath) -or
+      [string]::IsNullOrWhiteSpace($HomePath) -or $HookStartTicks -le 0) { return $ignored }
+  $state = Read-ClaudeSessionState -SessionId $SessionId
+  $epoch = [int64](Get-ObjectValue $state 'epoch' 0)
+  if ($null -eq $state -or $epoch -le 0 -or
+      [string](Get-ObjectValue $state 'state' '') -ne 'busy' -or
+      [int64](Get-ObjectValue $state 'busy_hook_start_ticks' 0) -ge $HookStartTicks -or
+      -not [string]::Equals([string](Get-ObjectValue $state 'audncode_home' ''), $HomePath, [StringComparison]::OrdinalIgnoreCase)) {
+    return $ignored
+  }
+  $hostPid = [int](Get-ObjectValue $state 'audncode_host_pid' 0)
+  $hostStarted = [int64](Get-ObjectValue $state 'audncode_host_started_unix_ms' 0)
+  $observedHost = Get-AudnCodeHostSession `
+    -SessionId $SessionId `
+    -HomePath $HomePath `
+    -ExpectedHostPid $hostPid `
+    -ExpectedHostStartedUnixMs $hostStarted
+  if (-not [bool](Get-ObjectValue $observedHost 'ok' $false) -or [int](Get-ObjectValue $observedHost 'pid' 0) -ne $hostPid -or
+      [int64](Get-ObjectValue $observedHost 'started_unix_ms' 0) -ne $hostStarted) { return $ignored }
+  $proof = Get-AudnCodeQuestionTranscriptProof `
+    -SessionState $state `
+    -SessionId $SessionId `
+    -SessionEpoch $epoch `
+    -TranscriptPath $TranscriptPath `
+    -Mode Permission
+  if (-not [bool](Get-ObjectValue $proof 'ok' $false)) { return $ignored }
+  $rootUuid = [string](Get-ObjectValue $proof 'root_prompt_uuid' '')
+  $toolUseId = [string](Get-ObjectValue $proof 'tool_use_id' '')
+  $proofHash = [string](Get-ObjectValue $proof 'proof_hash' '')
+  $candidateIdentity = [string](Get-ObjectValue $proof 'candidate_identity' '')
+  $question = Sanitize-NotificationText -Text ([string](Get-ObjectValue $proof 'question' '')) -MaxLength 4000
+  if ([string]::IsNullOrWhiteSpace($question)) { return $ignored }
+  $config = Get-Config
+  $event = [pscustomobject][ordered]@{
+    type = 'agent-turn-complete'
+    'thread-id' = $SessionId
+    'turn-id' = $rootUuid
+    cwd = $Cwd
+    'last-assistant-message' = $question
+    transcript_path = $TranscriptPath
+    'candidate-identity' = $candidateIdentity
+    'claude-session-epoch' = [int64]$epoch
+    'completion-event-type' = 'input_required'
+    'audncode-intervention-root-uuid' = $rootUuid
+    'audncode-intervention-tool-use-id' = $toolUseId
+    'audncode-intervention-proof-hash' = $proofHash
+  }
+  $record = New-EventRecord `
+    -Event $event `
+    -EventOrigin (Get-DefaultOrigin) `
+    -EventSessionHome '' `
+    -EventSqliteHome '' `
+    -EventClassification 'root' `
+    -EventIncludeMessage ([bool]$config.includeMessage) `
+    -CandidateKind 'audncode_intervention' `
+    -SourceEvent 'permission_prompt' `
+    -Provider 'claude'
+  $info = Get-ClaudeSessionStateInfo -SessionId $SessionId
+  if ($null -eq $info) { return [pscustomobject]@{ queued = $false; status = 'ignored'; key = [string]$record.key } }
+  $commit = Invoke-WithClaudeSessionLock -Info $info -Action {
+    param($lockedPath, $innerRecord, $innerSessionId, $innerTranscript, $innerHome, $innerEpoch, $innerHookTicks, $innerRootUuid, $innerToolUseId, $innerProofHash, $innerCandidateIdentity)
+    $fresh = $null
+    try { $fresh = Read-JsonFile -Path $lockedPath } catch { return $null }
+    if ([string](Get-ObjectValue $fresh 'session_id' '') -ne $innerSessionId -or
+        [int64](Get-ObjectValue $fresh 'epoch' 0) -ne [int64]$innerEpoch -or
+        [string](Get-ObjectValue $fresh 'state' '') -ne 'busy' -or
+        [bool](Get-ObjectValue $fresh 'audncode_prompt_prearm_pending' $true) -or
+        [int64](Get-ObjectValue $fresh 'busy_hook_start_ticks' 0) -ge [int64]$innerHookTicks -or
+        -not [string]::Equals([string](Get-ObjectValue $fresh 'transcript_path' ''), $innerTranscript, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([string](Get-ObjectValue $fresh 'audncode_home' ''), $innerHome, [StringComparison]::OrdinalIgnoreCase)) {
+      return $null
+    }
+    $freshHostPid = [int](Get-ObjectValue $fresh 'audncode_host_pid' 0)
+    $freshHostStarted = [int64](Get-ObjectValue $fresh 'audncode_host_started_unix_ms' 0)
+    $freshHost = Get-AudnCodeHostSession `
+      -SessionId $innerSessionId `
+      -HomePath $innerHome `
+      -ExpectedHostPid $freshHostPid `
+      -ExpectedHostStartedUnixMs $freshHostStarted
+    if (-not [bool](Get-ObjectValue $freshHost 'ok' $false) -or
+        [int](Get-ObjectValue $freshHost 'pid' 0) -ne $freshHostPid -or
+        [int64](Get-ObjectValue $freshHost 'started_unix_ms' 0) -ne $freshHostStarted) { return $null }
+    $freshProof = Get-AudnCodeQuestionTranscriptProof `
+      -SessionState $fresh `
+      -SessionId $innerSessionId `
+      -SessionEpoch ([int64]$innerEpoch) `
+      -TranscriptPath $innerTranscript `
+      -Mode Permission
+    if (-not [bool](Get-ObjectValue $freshProof 'ok' $false) -or
+        [string](Get-ObjectValue $freshProof 'root_prompt_uuid' '') -ne $innerRootUuid -or
+        [string](Get-ObjectValue $freshProof 'tool_use_id' '') -ne $innerToolUseId -or
+        [string](Get-ObjectValue $freshProof 'proof_hash' '') -ne $innerProofHash -or
+        [string](Get-ObjectValue $freshProof 'candidate_identity' '') -ne $innerCandidateIdentity) {
+      return $null
+    }
+    # Global order is session -> record. Keeping the session lock through the
+    # record commit prevents the worker from changing the prompt epoch between
+    # proof validation and durable intervention, without inverting the worker's
+    # own lock order.
+    return Invoke-WithRecordMutationLock -Key ([string]$innerRecord.key) -Action {
+      param($recordToCommit)
+      return Add-OutboxEventCore -Record $recordToCommit
+    } -Arguments @($innerRecord)
+  } -Arguments @($info.path, $record, $SessionId, $TranscriptPath, $HomePath, $epoch, $HookStartTicks, $rootUuid, $toolUseId, $proofHash, $candidateIdentity)
+  if ($null -eq $commit) {
+    return [pscustomobject]@{ queued = $false; status = 'ignored'; key = [string]$record.key }
+  }
+  return $commit
 }
 
 function Complete-AudnCodeBusyIngressHandoff {
@@ -11253,6 +13528,7 @@ function New-NtfyPayload {
   $displayName = $project
   $providerProperty = $Record.PSObject.Properties['provider']
   $provider = if ($null -eq $providerProperty) { 'codex' } else { ([string]$providerProperty.Value).Trim().ToLowerInvariant() }
+  $isIntervention = [string](Get-ObjectValue $Record 'candidate_kind' '') -eq 'audncode_intervention'
   $hasDistinctThreadTitle = $false
   if ($Config.includeThreadTitle) {
     $threadTitleValue = if ($provider -eq 'claude') {
@@ -11268,19 +13544,21 @@ function New-NtfyPayload {
   }
 
   $metadata = @()
-  if ($Config.includeFullPath -and -not [string]::IsNullOrWhiteSpace($cwd)) {
-    $metadata += Sanitize-NotificationText -Text $cwd -MaxLength 120
-  } elseif ($hasDistinctThreadTitle) {
-    $metadata += $project
-  }
-  $sanitizedOrigin = Sanitize-NotificationText -Text ([string](Get-ObjectValue $Record 'origin' '')) -MaxLength 40
-  if (-not [string]::IsNullOrWhiteSpace($sanitizedOrigin)) {
-    $metadata += $sanitizedOrigin
-  }
-  if (-not [string]::IsNullOrWhiteSpace($Record.thread_id)) {
-    $rawThread = [string]$Record.thread_id
-    $shortThread = Sanitize-NotificationText -Text $rawThread.Substring(0, [Math]::Min(8, $rawThread.Length)) -MaxLength 8
-    if (-not [string]::IsNullOrWhiteSpace($shortThread)) { $metadata += '#' + $shortThread }
+  if (-not $isIntervention) {
+    if ($Config.includeFullPath -and -not [string]::IsNullOrWhiteSpace($cwd)) {
+      $metadata += Sanitize-NotificationText -Text $cwd -MaxLength 120
+    } elseif ($hasDistinctThreadTitle) {
+      $metadata += $project
+    }
+    $sanitizedOrigin = Sanitize-NotificationText -Text ([string](Get-ObjectValue $Record 'origin' '')) -MaxLength 40
+    if (-not [string]::IsNullOrWhiteSpace($sanitizedOrigin)) {
+      $metadata += $sanitizedOrigin
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Record.thread_id)) {
+      $rawThread = [string]$Record.thread_id
+      $shortThread = Sanitize-NotificationText -Text $rawThread.Substring(0, [Math]::Min(8, $rawThread.Length)) -MaxLength 8
+      if (-not [string]::IsNullOrWhiteSpace($shortThread)) { $metadata += '#' + $shortThread }
+    }
   }
   $context = $metadata -join (" $MiddleDot ")
 
@@ -11310,8 +13588,12 @@ function New-NtfyPayload {
     if (-not [string]::IsNullOrWhiteSpace($context)) {
       $body = $context
     } else {
-      $fallbackLabel = Get-CompletionLabel -Record $Record
-      $body = $fallbackLabel.Substring(0, 1).ToUpperInvariant() + $fallbackLabel.Substring(1)
+      if ($isIntervention) {
+        $body = 'Input needed'
+      } else {
+        $fallbackLabel = Get-CompletionLabel -Record $Record
+        $body = $fallbackLabel.Substring(0, 1).ToUpperInvariant() + $fallbackLabel.Substring(1)
+      }
     }
   }
   $body = Limit-Utf8Text -Value $body -MaxBytes $MaxNtfyMessageBytes
@@ -11336,7 +13618,11 @@ function New-NtfyPayload {
       }
     }
   }
-  if (Test-TerminalFailure -Record $Record) {
+  if ($isIntervention) {
+    # ntfy renders exactly one compact question glyph from this tag. Keeping it
+    # out of the title avoids duplicate emoji on Android clients.
+    $payload['tags'] = @('question')
+  } elseif (Test-TerminalFailure -Record $Record) {
     # One compact error glyph keeps failed turns distinguishable even when the
     # user has disabled assistant-message previews for privacy.
     $payload['tags'] = @('warning')
@@ -11573,11 +13859,17 @@ function Move-ToSuppressedCore {
   }
   $suppressedPath = Join-Path $SuppressedDir ($Record.key + '.json')
   $receipt = [ordered]@{
-    schema = 1
+    schema = 2
     key = $Record.key
+    provider = [string](Get-ObjectValue $Record 'provider' '')
+    weak_identity = [bool](Get-ObjectValue $Record 'weak_identity' $true)
+    sequence_id = [string](Get-ObjectValue $Record 'sequence_id' '')
     thread_id = $Record.thread_id
     turn_id = $Record.turn_id
     origin = $Record.origin
+    candidate_kind = [string](Get-ObjectValue $Record 'candidate_kind' '')
+    source_event = [string](Get-ObjectValue $Record 'source_event' '')
+    completion_event_type = [string](Get-ObjectValue $Record 'completion_event_type' '')
     candidate_revision = [string](Get-ObjectValue $Record 'candidate_revision' '')
     suppressed_at = [DateTimeOffset]::UtcNow.ToString('o')
     reason = $Reason
@@ -11592,10 +13884,82 @@ function Move-ToSuppressed {
     [object]$Record,
     [string]$Reason = 'subagent'
   )
-  [void](Invoke-WithRecordMutationLock -Key ([string]$Record.key) -Action {
+  return Invoke-WithRecordMutationLock -Key ([string]$Record.key) -Action {
       param($lockedPath, $lockedRecord, $lockedReason)
-      Move-ToSuppressedCore -Path $lockedPath -Record $lockedRecord -Reason $lockedReason
-    } -Arguments @($Path, $Record, $Reason))
+      if (-not (Test-Path -LiteralPath $lockedPath -PathType Leaf)) {
+        return [pscustomobject]@{ status = 'missing' }
+      }
+      $canonical = Read-JsonFile -Path $lockedPath
+      Assert-QueuedRecord -Record $canonical -ExpectedKey ([string]$lockedRecord.key)
+      $revisionState = Ensure-QueuedRecordCandidateRevisionCore -Path $lockedPath -Record $canonical
+      if ($revisionState -eq 'migrated') { return [pscustomobject]@{ status = 'revision-migrated' } }
+      if ($revisionState -ne 'current') { return [pscustomobject]@{ status = 'stale-snapshot' } }
+      $canonicalRevision = [string](Get-ObjectValue $canonical 'candidate_revision' '')
+      $incomingRevision = [string](Get-ObjectValue $lockedRecord 'candidate_revision' '')
+      if ([string]::IsNullOrWhiteSpace($canonicalRevision) -or
+          [string]::IsNullOrWhiteSpace($incomingRevision) -or
+          -not [string]::Equals($canonicalRevision, $incomingRevision, [StringComparison]::Ordinal)) {
+        return [pscustomobject]@{ status = 'stale-snapshot' }
+      }
+      Move-ToSuppressedCore -Path $lockedPath -Record $canonical -Reason $lockedReason
+      return [pscustomobject]@{ status = 'suppressed' }
+    } -Arguments @($Path, $Record, $Reason)
+}
+
+function Add-UnqueuedSuppressedEvent {
+  param(
+    [object]$Record,
+    [string]$Reason = 'subagent'
+  )
+
+  Ensure-RuntimeDirectories
+  return Invoke-WithRecordMutationLock -Key ([string]$Record.key) -Action {
+    param($lockedRecord, $lockedReason)
+    $key = [string](Get-ObjectValue $lockedRecord 'key' '')
+    $suppressedPath = Join-Path $SuppressedDir ($key + '.json')
+    if (Test-Path -LiteralPath $suppressedPath -PathType Leaf) {
+      try {
+        $existing = Read-JsonFile -Path $suppressedPath
+        if ([int](Get-ObjectValue $existing 'schema' 0) -eq 2 -and
+            [string](Get-ObjectValue $existing 'key' '') -eq $key -and
+            [string](Get-ObjectValue $existing 'reason' '') -eq $lockedReason) {
+          return [pscustomobject]@{ status = 'suppressed'; key = $key }
+        }
+      } catch {}
+      return [pscustomobject]@{ status = 'unverifiable'; key = $key }
+    }
+    foreach ($terminal in @(
+        @((Join-Path $SentDir ($key + '.json')), 'sent'),
+        @((Join-Path $DeadDir ($key + '.json')), 'dead')
+      )) {
+      if (Test-Path -LiteralPath $terminal[0] -PathType Leaf) {
+        return [pscustomobject]@{ status = $terminal[1]; key = $key }
+      }
+    }
+    # Never suppress a queue record that raced this pre-queue classification.
+    # Its own canonical revision and later worker gates decide its disposition.
+    foreach ($queuePath in @(
+        (Join-Path $PendingDir ($key + '.json')),
+        (Join-Path $OutboxDir ($key + '.json'))
+      )) {
+      if (Test-Path -LiteralPath $queuePath -PathType Leaf) {
+        return [pscustomobject]@{ status = 'existing'; key = $key }
+      }
+    }
+    $virtualPath = Join-Path $PendingDir ($key + '.json')
+    Move-ToSuppressedCore -Path $virtualPath -Record $lockedRecord -Reason $lockedReason
+    try {
+      $receipt = Read-JsonFile -Path $suppressedPath
+      if ([int](Get-ObjectValue $receipt 'schema' 0) -eq 2 -and
+          [string](Get-ObjectValue $receipt 'key' '') -eq $key -and
+          [string](Get-ObjectValue $receipt 'candidate_revision' '') -eq
+            [string](Get-ObjectValue $lockedRecord 'candidate_revision' '') -and
+          [string](Get-ObjectValue $receipt 'reason' '') -eq $lockedReason) {
+        return [pscustomobject]@{ status = 'suppressed'; key = $key }
+      }
+    } catch {}
+    return [pscustomobject]@{ status = 'unverifiable'; key = $key }
+  } -Arguments @($Record, $Reason)
 }
 
 function Test-ClaudeSessionHasPendingRecord {
@@ -11657,11 +14021,17 @@ function Clean-RuntimeState {
   )
 
   $cutoff = [DateTime]::UtcNow.AddDays(-[Math]::Max(1, $ReceiptRetentionDays))
-  foreach ($directory in @($SentDir, $SuppressedDir)) {
-    Get-ChildItem -LiteralPath $directory -Filter '*.json' -File -ErrorAction SilentlyContinue |
-      Where-Object { $_.LastWriteTimeUtc -lt $cutoff } |
-      Remove-Item -Force -ErrorAction SilentlyContinue
-  }
+  Get-ChildItem -LiteralPath $SentDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTimeUtc -lt $cutoff } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+  Get-ChildItem -LiteralPath $SuppressedDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+    Where-Object {
+      # Managed-recovery tombstones are permanent fail-closed evidence in v1.
+      # Age can never prove that a delayed StopFailure replay is safe, and a
+      # corrupt tombstone must remain quarantined rather than aging to absent.
+      $_.Name -notmatch '^r-[a-f0-9]{64}\.json$' -and $_.LastWriteTimeUtc -lt $cutoff
+    } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
   $deadCutoff = [DateTime]::UtcNow.AddDays(-[Math]::Max(1, $DeadRetentionDays))
   Get-ChildItem -LiteralPath $DeadDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTimeUtc -lt $deadCutoff } |
@@ -12961,7 +15331,8 @@ function Invoke-SqliteRows {
 function Test-RecordIdleGate {
   param(
     [object]$Record,
-    [object]$Config
+    [object]$Config,
+    [string]$PendingPath = ''
   )
 
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -12975,6 +15346,46 @@ function Test-RecordIdleGate {
     $needsIdleFallback = $recordGoalState -eq 'unknown'
     $sessionState = $null
     if ($isAudnStopFailure) {
+      # Managed provider recovery is authoritative before every ordinary
+      # StopFailure gate. It never uses balanced fallback: transient recovery
+      # stays pending, a successful recovery cancels the error, and only exact
+      # terminal exhaustion may continue toward notification.
+      $previousRecoveryRevision = [int](Get-ObjectValue $Record 'audncode_recovery_observed_revision' 0)
+      $previousRecoveryTerminalHash = [string](Get-ObjectValue $Record 'audncode_recovery_terminal_hash' '')
+      $managedRecoveryGate = Get-AudnCodeManagedRecoveryRecordGate -Record $Record
+      $managedRecoveryState = [string](Get-ObjectValue $managedRecoveryGate 'state' 'unverifiable')
+      $currentRecoveryRevision = [int](Get-ObjectValue $Record 'audncode_recovery_observed_revision' 0)
+      $currentRecoveryTerminalHash = [string](Get-ObjectValue $Record 'audncode_recovery_terminal_hash' '')
+      if ($currentRecoveryRevision -ne $previousRecoveryRevision -or
+          -not [string]::Equals($currentRecoveryTerminalHash, $previousRecoveryTerminalHash, [StringComparison]::Ordinal)) {
+        # This is the linearization point for a valid terminal marker. Persist
+        # revision+hash atomically before this function can return a retry or
+        # the worker can perform its next confirmation read.
+        $observationCommit = try {
+          Persist-AudnCodeManagedRecoveryObservation -Path $PendingPath -Record $Record
+        } catch {
+          [pscustomobject]@{ status = 'retry' }
+        }
+        $observationStatus = [string](Get-ObjectValue $observationCommit 'status' 'unverifiable')
+        if ($observationStatus -in @('missing', 'stale-snapshot', 'retry')) {
+          return New-GateResult -State 'busy' -Reason 'audncode-managed-recovery-observation-persist-retry' -RetryAtUnixMs ($now + 25)
+        }
+        if ($observationStatus -notin @('updated', 'unchanged')) {
+          return New-GateResult -State 'unverifiable' -Reason 'audncode-managed-recovery-observation-unverifiable' -RetryAtUnixMs $now
+        }
+      }
+      if ($managedRecoveryState -eq 'busy') {
+        return New-GateResult -State 'busy' -Reason ([string]$managedRecoveryGate.reason) -RetryAtUnixMs ($now + 250)
+      }
+      if ($managedRecoveryState -eq 'cancelled') {
+        return New-GateResult -State 'cancelled' -Reason ([string]$managedRecoveryGate.reason) -RetryAtUnixMs $now
+      }
+      if ($managedRecoveryState -eq 'unverifiable') {
+        return New-GateResult -State 'unverifiable' -Reason ([string]$managedRecoveryGate.reason) -RetryAtUnixMs $now
+      }
+      if ($managedRecoveryState -notin @('ordinary', 'ready')) {
+        return New-GateResult -State 'unverifiable' -Reason 'audncode-managed-recovery-state-unverifiable' -RetryAtUnixMs $now
+      }
       $sessionState = Read-ClaudeSessionState -SessionId ([string](Get-ObjectValue $Record 'thread_id' ''))
       $failureProof = Test-AudnCodeStopFailureRecordProof `
         -Record $Record `
@@ -14078,7 +16489,7 @@ function Scan-RolloutFile {
   Set-RecordValue -Record $record -Name 'completion_end_offset' -Value ([int64]($stagedStart + $stagedLength))
   if (-not (Test-RolloutScanParentAlive)) { return 0 }
   if ($Config.suppressSubagents -and $classification -eq 'subagent') {
-    Move-ToSuppressed -Path (Join-Path $PendingDir ($record.key + '.json')) -Record $record -Reason 'subagent'
+    [void](Add-UnqueuedSuppressedEvent -Record $record -Reason 'subagent')
   } else {
     [void](Add-CandidateEvent -Record $record -Config $Config)
   }
@@ -14128,6 +16539,13 @@ function Assert-QueuedRecord {
   if ($sequenceId -notmatch '^(?:codex|claude)-[0-9a-f]{32}$') {
     throw 'queue item has an invalid sequence ID'
   }
+  $candidateRevisionProperty = $Record.PSObject.Properties['candidate_revision']
+  if ($null -ne $candidateRevisionProperty -and
+      ($candidateRevisionProperty.Value -isnot [string] -or
+        (([string]$candidateRevisionProperty.Value).Length -gt 0 -and
+          [string]$candidateRevisionProperty.Value -notmatch '^[a-f0-9]{32}$'))) {
+    throw 'queue item has an invalid candidate revision'
+  }
   $event = Get-ObjectValue $Record 'event'
   if ($null -eq $event -or $event -is [string]) {
     throw 'queue item has an invalid event'
@@ -14151,6 +16569,33 @@ function Set-RecordValue {
   } else {
     $property.Value = $Value
   }
+}
+
+function Ensure-QueuedRecordCandidateRevisionCore {
+  param(
+    [string]$Path,
+    [object]$Record
+  )
+
+  $revisionProperty = $Record.PSObject.Properties['candidate_revision']
+  if ($null -ne $revisionProperty -and $revisionProperty.Value -isnot [string]) { return 'invalid' }
+  $revision = if ($null -eq $revisionProperty) { '' } else { [string]$revisionProperty.Value }
+  if ($revision -match '^[a-f0-9]{32}$') { return 'current' }
+  if ($revision.Length -ne 0) { return 'invalid' }
+
+  # Queue schema 1 predates candidate_revision. Migrate it while the caller
+  # holds the per-key mutation lock, but never continue a decision based on the
+  # pre-migration snapshot. The next worker pass rereads this durable token.
+  Set-RecordValue -Record $Record -Name 'candidate_revision' -Value ([Guid]::NewGuid().ToString('N'))
+  Write-JsonAtomic -Path $Path -Value $Record
+  Write-RuntimeLog "migrated legacy queue candidate revision key=$(([string]$Record.key).Substring(0, 12))"
+  if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+      $env:CODEX_NTFY_TEST_EXIT_AFTER_CANDIDATE_REVISION_MIGRATION -eq '1') {
+    # Deterministic test-only crash point proving that migration is durable and
+    # no terminal decision is applied to the pre-migration snapshot.
+    exit 94
+  }
+  return 'migrated'
 }
 
 function Move-QueueRecord {
@@ -14193,6 +16638,49 @@ function Resolve-QueueReceiptConflict {
       Remove-Item -LiteralPath $lockedPath -Force -ErrorAction SilentlyContinue
       return [pscustomobject]@{ keep = $false; reason = 'sent'; record = $null }
     }
+    $recoveryReceipt = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $current
+    $recoveryReceiptState = [string](Get-ObjectValue $recoveryReceipt 'state' 'unverifiable')
+    if ($recoveryReceiptState -eq 'exact-duplicate') {
+      $journaledSuccessor = Get-ObjectValue $recoveryReceipt 'successor'
+      if ($null -ne $journaledSuccessor) {
+        # Upgrade-PendingRecordFromStop writes the recovery tombstone and its
+        # validated successor before replacing the failed pending record. If the
+        # hook process dies in that narrow gap, restore only that exact normal
+        # Stop while still holding the same per-key mutation lock. Never restore
+        # directly into outbox: the normal AudnCode idle/lifecycle gates must run.
+        $expectedPendingPath = [IO.Path]::GetFullPath(
+          (Join-Path $PendingDir ([string](Get-ObjectValue $current 'key' '') + '.json'))
+        )
+        $lockedFullPath = [IO.Path]::GetFullPath($lockedPath)
+        if ([string]::Equals($lockedFullPath, $expectedPendingPath, [StringComparison]::OrdinalIgnoreCase)) {
+          Write-JsonAtomic -Path $lockedPath -Value $journaledSuccessor
+          if ($env:CODEX_NTFY_NO_SPAWN -eq '1' -and
+              $env:CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_SUCCESSOR_WRITE -eq '1') {
+            exit 92
+          }
+          if (-not (Clear-AudnCodeManagedRecoverySucceededSuccessorJournal `
+              -FailureRecord $current `
+              -ExpectedSuccessor $journaledSuccessor)) {
+            Write-RuntimeLog "retained AudnCode recovery journal after restore because it could not be cleared key=$($current.key.Substring(0, 12))"
+          }
+          Write-RuntimeLog "restored AudnCode Stop from managed recovery journal key=$($current.key.Substring(0, 12))"
+          return [pscustomobject]@{
+            keep = $true
+            reason = 'audncode-recovery-successor-restored'
+            record = $journaledSuccessor
+          }
+        }
+      }
+      Remove-Item -LiteralPath $lockedPath -Force -ErrorAction SilentlyContinue
+      return [pscustomobject]@{ keep = $false; reason = 'audncode-recovery-suppressed'; record = $null }
+    }
+    if ($recoveryReceiptState -eq 'unverifiable') {
+      # Do not erase the canonical queue record when the identity-specific
+      # receipt is corrupt or disagrees with it. Skipping this pass is the only
+      # fail-closed outcome that preserves evidence for diagnosis/repair.
+      Write-RuntimeLog "kept AudnCode provider failure with unverifiable recovery receipt key=$($current.key.Substring(0, 12))"
+      return [pscustomobject]@{ keep = $false; reason = 'audncode-recovery-receipt-unverifiable'; record = $null }
+    }
     $suppressedPath = Join-Path $SuppressedDir ($lockedRecord.key + '.json')
     if (Test-Path -LiteralPath $suppressedPath) {
       if ((Test-IsStopEvidence -Record $current) -and
@@ -14219,11 +16707,14 @@ function Invoke-PendingRecordCommit {
     }
     $canonical = Read-JsonFile -Path $lockedPath
     Assert-QueuedRecord -Record $canonical -ExpectedKey $incomingRecord.key
+    $revisionState = Ensure-QueuedRecordCandidateRevisionCore -Path $lockedPath -Record $canonical
+    if ($revisionState -eq 'migrated') { return [pscustomobject]@{ status = 'revision-migrated' } }
+    if ($revisionState -ne 'current') { return [pscustomobject]@{ status = 'stale-snapshot' } }
     $canonicalRevision = [string](Get-ObjectValue $canonical 'candidate_revision' '')
     $incomingRevision = [string](Get-ObjectValue $incomingRecord 'candidate_revision' '')
-    if (-not [string]::IsNullOrWhiteSpace($canonicalRevision) -and
-        -not [string]::IsNullOrWhiteSpace($incomingRevision) -and
-        $canonicalRevision -ne $incomingRevision) {
+    if ([string]::IsNullOrWhiteSpace($canonicalRevision) -or
+        [string]::IsNullOrWhiteSpace($incomingRevision) -or
+        -not [string]::Equals($canonicalRevision, $incomingRevision, [StringComparison]::Ordinal)) {
       return [pscustomobject]@{ status = 'stale-snapshot' }
     }
     $canonicalIsStop = Test-IsStopEvidence -Record $canonical
@@ -14233,7 +16724,7 @@ function Invoke-PendingRecordCommit {
     }
     $writeRecord = if ($canonicalIsStop) { $canonical } else { $incomingRecord }
     if ($canonicalIsStop) {
-      foreach ($name in @('next_attempt_unix_ms', 'gate_reason', 'goal_status', 'completion_event_type', 'active_descendants', 'descendant_unknown_since', 'candidate_rollout_path', 'rollout_sequence', 'claude_goal_state', 'claude_goal_marker', 'audncode_idle_fingerprint', 'audncode_idle_fingerprint_stable_at')) {
+      foreach ($name in @('next_attempt_unix_ms', 'gate_reason', 'goal_status', 'completion_event_type', 'active_descendants', 'descendant_unknown_since', 'candidate_rollout_path', 'rollout_sequence', 'claude_goal_state', 'claude_goal_marker', 'audncode_idle_fingerprint', 'audncode_idle_fingerprint_stable_at', 'audncode_recovery_observed_revision', 'audncode_recovery_terminal_hash')) {
         $property = $incomingRecord.PSObject.Properties[$name]
         if ($null -ne $property) { Set-RecordValue -Record $writeRecord -Name $name -Value $property.Value }
       }
@@ -14252,6 +16743,112 @@ function Invoke-PendingRecordCommit {
     [void](Move-QueueRecord -SourcePath $lockedPath -DestinationDirectory $OutboxDir -Record $writeRecord)
     return [pscustomobject]@{ status = 'promoted' }
   } -Arguments @($Path, $Record, [bool]$Promote)
+}
+
+function Persist-AudnCodeManagedRecoveryObservation {
+  param(
+    [string]$Path,
+    [object]$Record
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Path) -or $null -eq $Record -or
+      [string](Get-ObjectValue $Record 'key' '') -notmatch '^[a-f0-9]{64}$') {
+    return [pscustomobject]@{ status = 'unverifiable' }
+  }
+  return Invoke-WithRecordMutationLock -Key ([string]$Record.key) -Action {
+    param($lockedPath, $incomingRecord)
+    if (-not (Test-Path -LiteralPath $lockedPath -PathType Leaf)) {
+      return [pscustomobject]@{ status = 'missing' }
+    }
+    try {
+      $canonical = Read-JsonFile -Path $lockedPath
+      Assert-QueuedRecord -Record $canonical -ExpectedKey ([string]$incomingRecord.key)
+    } catch {
+      return [pscustomobject]@{ status = 'unverifiable' }
+    }
+    $revisionState = Ensure-QueuedRecordCandidateRevisionCore -Path $lockedPath -Record $canonical
+    if ($revisionState -eq 'migrated') { return [pscustomobject]@{ status = 'revision-migrated' } }
+    if ($revisionState -ne 'current') { return [pscustomobject]@{ status = 'unverifiable' } }
+    $canonicalCandidateRevision = [string](Get-ObjectValue $canonical 'candidate_revision' '')
+    $incomingCandidateRevision = [string](Get-ObjectValue $incomingRecord 'candidate_revision' '')
+    if ([string]::IsNullOrWhiteSpace($canonicalCandidateRevision) -or
+        [string]::IsNullOrWhiteSpace($incomingCandidateRevision) -or
+        -not [string]::Equals($canonicalCandidateRevision, $incomingCandidateRevision, [StringComparison]::Ordinal)) {
+      return [pscustomobject]@{ status = 'stale-snapshot' }
+    }
+
+    $canonicalManagedProperty = $canonical.PSObject.Properties['audncode_recovery_managed']
+    $incomingManagedProperty = $incomingRecord.PSObject.Properties['audncode_recovery_managed']
+    if ($null -eq $canonicalManagedProperty -or $canonicalManagedProperty.Value -isnot [bool] -or
+        -not [bool]$canonicalManagedProperty.Value -or
+        $null -eq $incomingManagedProperty -or $incomingManagedProperty.Value -isnot [bool] -or
+        -not [bool]$incomingManagedProperty.Value -or
+        [bool](Get-ObjectValue $canonical 'audncode_recovery_binding_invalid' $false) -or
+        [bool](Get-ObjectValue $incomingRecord 'audncode_recovery_binding_invalid' $false)) {
+      return [pscustomobject]@{ status = 'unverifiable' }
+    }
+    foreach ($name in @(
+        'provider', 'candidate_kind', 'thread_id', 'audncode_stop_failure_uuid',
+        'audncode_recovery_marker_path', 'audncode_recovery_home', 'audncode_recovery_binding',
+        'audncode_recovery_manager_instance_id', 'audncode_recovery_operation_id',
+        'audncode_recovery_attempt_id', 'audncode_recovery_initial_state'
+      )) {
+      if (-not [string]::Equals(
+          [string](Get-ObjectValue $canonical $name ''),
+          [string](Get-ObjectValue $incomingRecord $name ''),
+          [StringComparison]::Ordinal)) {
+        return [pscustomobject]@{ status = 'unverifiable' }
+      }
+    }
+    foreach ($name in @(
+        'audncode_recovery_manager_pid', 'audncode_recovery_manager_process_start_utc_ticks',
+        'audncode_recovery_created_unix_ms', 'audncode_recovery_initial_revision'
+      )) {
+      if ([int64](Get-ObjectValue $canonical $name 0) -ne
+          [int64](Get-ObjectValue $incomingRecord $name 0)) {
+        return [pscustomobject]@{ status = 'unverifiable' }
+      }
+    }
+    if ([string](Get-ObjectValue $canonical 'provider' '') -ne 'claude' -or
+        [string](Get-ObjectValue $canonical 'candidate_kind' '') -ne 'audncode_stop_failure' -or
+        [string](Get-ObjectValue $canonical 'audncode_recovery_binding' '') -notmatch '^[a-f0-9]{64}$' -or
+        [string]::IsNullOrWhiteSpace((Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $canonical 'thread_id'))) -or
+        [string]::IsNullOrWhiteSpace((Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $canonical 'audncode_stop_failure_uuid')))) {
+      return [pscustomobject]@{ status = 'unverifiable' }
+    }
+
+    $canonicalObservedRevision = [int](Get-ObjectValue $canonical 'audncode_recovery_observed_revision' 0)
+    $incomingObservedRevision = [int](Get-ObjectValue $incomingRecord 'audncode_recovery_observed_revision' 0)
+    $canonicalTerminalHash = [string](Get-ObjectValue $canonical 'audncode_recovery_terminal_hash' '')
+    $incomingTerminalHash = [string](Get-ObjectValue $incomingRecord 'audncode_recovery_terminal_hash' '')
+    $canonicalObservationValid =
+      ($canonicalObservedRevision -eq 1 -and $canonicalTerminalHash.Length -eq 0) -or
+      ($canonicalObservedRevision -eq 2 -and $canonicalTerminalHash -match '^[a-f0-9]{64}$')
+    $incomingObservationValid =
+      ($incomingObservedRevision -eq 1 -and $incomingTerminalHash.Length -eq 0) -or
+      ($incomingObservedRevision -eq 2 -and $incomingTerminalHash -match '^[a-f0-9]{64}$')
+    if (-not $canonicalObservationValid -or -not $incomingObservationValid -or
+        $incomingObservedRevision -lt $canonicalObservedRevision -or
+        ($canonicalObservedRevision -eq 2 -and
+         -not [string]::Equals($canonicalTerminalHash, $incomingTerminalHash, [StringComparison]::Ordinal))) {
+      return [pscustomobject]@{ status = 'unverifiable' }
+    }
+    if ($canonicalObservedRevision -eq $incomingObservedRevision -and
+        [string]::Equals($canonicalTerminalHash, $incomingTerminalHash, [StringComparison]::Ordinal)) {
+      return [pscustomobject]@{ status = 'unchanged' }
+    }
+    # The only permitted mutation is the monotonic rev1 -> rev2 observation.
+    # It is committed under the same per-key lock and atomic JSON replacement
+    # used by the queue, before any later marker read can observe a rewrite.
+    if ($canonicalObservedRevision -ne 1 -or $incomingObservedRevision -ne 2 -or
+        $canonicalTerminalHash.Length -ne 0 -or $incomingTerminalHash -notmatch '^[a-f0-9]{64}$') {
+      return [pscustomobject]@{ status = 'unverifiable' }
+    }
+    Set-RecordValue -Record $canonical -Name 'audncode_recovery_observed_revision' -Value 2
+    Set-RecordValue -Record $canonical -Name 'audncode_recovery_terminal_hash' -Value $incomingTerminalHash
+    Write-JsonAtomic -Path $lockedPath -Value $canonical
+    return [pscustomobject]@{ status = 'updated' }
+  } -Arguments @($Path, $Record)
 }
 
 function Get-ClaudeSessionCommitDisposition {
@@ -14539,6 +17136,24 @@ function Commit-PendingRecord {
   if ([string](Get-ObjectValue $Record 'provider' 'codex') -ne 'claude') {
     return Invoke-PendingRecordCommit -Path $Path -Record $Record -Promote:$Promote
   }
+  if ($Promote -and
+      [string](Get-ObjectValue $Record 'candidate_kind' '') -eq 'audncode_stop_failure' -and
+      [bool](Get-ObjectValue $Record 'audncode_recovery_managed' $false)) {
+    # Normal workers already persisted this observation at the first recovery
+    # gate. Revalidate the durable snapshot here as a fail-closed guard for any
+    # future direct promotion call site.
+    if ([int](Get-ObjectValue $Record 'audncode_recovery_observed_revision' 0) -ne 2 -or
+        [string](Get-ObjectValue $Record 'audncode_recovery_terminal_hash' '') -notmatch '^[a-f0-9]{64}$') {
+      return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $Path -Record $Record
+    }
+    $recoverySnapshotCommit = Persist-AudnCodeManagedRecoveryObservation -Path $Path -Record $Record
+    if ([string](Get-ObjectValue $recoverySnapshotCommit 'status' '') -notin @('updated', 'unchanged')) {
+      if ([string](Get-ObjectValue $recoverySnapshotCommit 'status' '') -in @('missing', 'stale-snapshot')) {
+        return $recoverySnapshotCommit
+      }
+      return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $Path -Record $Record
+    }
+  }
   $sessionInfo = Get-ClaudeSessionStateInfo -SessionId ([string](Get-ObjectValue $Record 'thread_id' ''))
   if ($null -eq $sessionInfo) {
     return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $Path -Record $Record
@@ -14554,7 +17169,7 @@ function Commit-PendingRecord {
       return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $lockedPath -Record $lockedRecord
     }
     if ($disposition -eq 'stale') {
-      $discard = Discard-PendingRecord -Path $lockedPath -Record $lockedRecord
+      $discard = Discard-PendingRecord -Path $lockedPath -Record $lockedRecord -Reason 'stale-session'
       if ($discard.status -in @('discarded', 'missing')) {
         return [pscustomobject]@{ status = 'stale-session' }
       }
@@ -14562,6 +17177,28 @@ function Commit-PendingRecord {
     }
     $lockedCandidateKind = [string](Get-ObjectValue $lockedRecord 'candidate_kind' '')
     if ([bool]$shouldPromote -and $lockedCandidateKind -eq 'audncode_stop_failure') {
+      $recoveryCommitGate = Get-AudnCodeManagedRecoveryRecordGate -Record $lockedRecord
+      $recoveryCommitState = [string](Get-ObjectValue $recoveryCommitGate 'state' 'unverifiable')
+      if ($recoveryCommitState -eq 'unverifiable') {
+        return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $lockedPath -Record $lockedRecord
+      }
+      if ($recoveryCommitState -eq 'cancelled') {
+        $discard = Suppress-AudnCodeManagedRecoverySucceededPendingRecord `
+          -Path $lockedPath `
+          -Record $lockedRecord
+        if ([string](Get-ObjectValue $discard 'status' '') -in @(
+            'recovery-suppressed', 'already-recovery-suppressed', 'missing'
+          )) {
+          return [pscustomobject]@{ status = 'audncode-recovery-cancelled' }
+        }
+        return $discard
+      }
+      if ($recoveryCommitState -eq 'busy') {
+        return [pscustomobject]@{ status = 'audncode-recovery-retry' }
+      }
+      if ($recoveryCommitState -notin @('ordinary', 'ready')) {
+        return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $lockedPath -Record $lockedRecord
+      }
       $failureProof = Test-AudnCodeStopFailureRecordProof -Record $lockedRecord -SessionState $sessionState
       if (-not [bool](Get-ObjectValue $failureProof 'ok' $false)) {
         if ([string](Get-ObjectValue $failureProof 'reason' '') -eq
@@ -14580,7 +17217,7 @@ function Commit-PendingRecord {
         return Suppress-ClaudeSessionUnverifiablePendingRecord -Path $lockedPath -Record $lockedRecord
       }
       if ($goalCommitState -eq 'cancelled') {
-        $discard = Discard-PendingRecord -Path $lockedPath -Record $lockedRecord
+        $discard = Discard-PendingRecord -Path $lockedPath -Record $lockedRecord -Reason 'goal-cancelled'
         if ([string](Get-ObjectValue $discard 'status' '') -in @('discarded', 'missing')) {
           return [pscustomobject]@{ status = 'audncode-goal-cancelled' }
         }
@@ -14680,6 +17317,35 @@ function Commit-PendingRecord {
                 return [pscustomobject]@{ status = 'audncode-lifecycle-retry' }
               }
               if ([string](Get-ObjectValue $lockedRecordFinal 'candidate_kind' '') -eq 'audncode_stop_failure') {
+                # Re-read the exact manager/attempt marker inside the innermost
+                # lifecycle critical section. A recovery that succeeds or
+                # restarts after the earlier gate must win this final TOCTOU.
+                $finalRecoveryGate = Get-AudnCodeManagedRecoveryRecordGate -Record $lockedRecordFinal
+                $finalRecoveryState = [string](Get-ObjectValue $finalRecoveryGate 'state' 'unverifiable')
+                if ($finalRecoveryState -eq 'unverifiable') {
+                  return Suppress-ClaudeSessionUnverifiablePendingRecord `
+                    -Path $lockedPathFinal `
+                    -Record $lockedRecordFinal
+                }
+                if ($finalRecoveryState -eq 'cancelled') {
+                  $discard = Suppress-AudnCodeManagedRecoverySucceededPendingRecord `
+                    -Path $lockedPathFinal `
+                    -Record $lockedRecordFinal
+                  if ([string](Get-ObjectValue $discard 'status' '') -in @(
+                      'recovery-suppressed', 'already-recovery-suppressed', 'missing'
+                    )) {
+                    return [pscustomobject]@{ status = 'audncode-recovery-cancelled' }
+                  }
+                  return $discard
+                }
+                if ($finalRecoveryState -eq 'busy') {
+                  return [pscustomobject]@{ status = 'audncode-recovery-retry' }
+                }
+                if ($finalRecoveryState -notin @('ordinary', 'ready')) {
+                  return Suppress-ClaudeSessionUnverifiablePendingRecord `
+                    -Path $lockedPathFinal `
+                    -Record $lockedRecordFinal
+                }
                 $finalProof = Test-AudnCodeStopFailureRecordProof `
                   -Record $lockedRecordFinal `
                   -SessionState $lockedSessionStateFinal
@@ -14705,7 +17371,7 @@ function Commit-PendingRecord {
                     -Record $lockedRecordFinal
                 }
                 if ($finalGoalState -eq 'cancelled') {
-                  $discard = Discard-PendingRecord -Path $lockedPathFinal -Record $lockedRecordFinal
+                  $discard = Discard-PendingRecord -Path $lockedPathFinal -Record $lockedRecordFinal -Reason 'goal-cancelled'
                   if ([string](Get-ObjectValue $discard 'status' '') -in @('discarded', 'missing')) {
                     return [pscustomobject]@{ status = 'audncode-goal-cancelled' }
                   }
@@ -14748,6 +17414,16 @@ function Suppress-ClaudeSessionUnverifiablePendingRecord {
 
     $canonical = Read-JsonFile -Path $lockedPath
     Assert-QueuedRecord -Record $canonical -ExpectedKey ([string]$incomingRecord.key)
+    $revisionState = Ensure-QueuedRecordCandidateRevisionCore -Path $lockedPath -Record $canonical
+    if ($revisionState -eq 'migrated') { return [pscustomobject]@{ status = 'revision-migrated' } }
+    if ($revisionState -ne 'current') { return [pscustomobject]@{ status = 'stale-snapshot' } }
+    $canonicalRevision = [string](Get-ObjectValue $canonical 'candidate_revision' '')
+    $incomingRevision = [string](Get-ObjectValue $incomingRecord 'candidate_revision' '')
+    if ([string]::IsNullOrWhiteSpace($canonicalRevision) -or
+        [string]::IsNullOrWhiteSpace($incomingRevision) -or
+        -not [string]::Equals($canonicalRevision, $incomingRevision, [StringComparison]::Ordinal)) {
+      return [pscustomobject]@{ status = 'stale-snapshot' }
+    }
     $sameClaudeTurn =
       [string](Get-ObjectValue $canonical 'provider' '') -eq 'claude' -and
       [string](Get-ObjectValue $canonical 'thread_id' '') -eq [string](Get-ObjectValue $incomingRecord 'thread_id' '') -and
@@ -14769,24 +17445,89 @@ function Suppress-ClaudeSessionUnverifiablePendingRecord {
 function Discard-PendingRecord {
   param(
     [string]$Path,
-    [object]$Record
+    [object]$Record,
+    [ValidateSet('stale-session', 'goal-cancelled')]
+    [string]$Reason
   )
   return Invoke-WithRecordMutationLock -Key ([string]$Record.key) -Action {
-    param($lockedPath, $incomingRecord)
+    param($lockedPath, $incomingRecord, $discardReason)
     if (-not (Test-Path -LiteralPath $lockedPath)) {
       return [pscustomobject]@{ status = 'missing' }
     }
     $canonical = Read-JsonFile -Path $lockedPath
     Assert-QueuedRecord -Record $canonical -ExpectedKey $incomingRecord.key
+    $revisionState = Ensure-QueuedRecordCandidateRevisionCore -Path $lockedPath -Record $canonical
+    if ($revisionState -eq 'migrated') { return [pscustomobject]@{ status = 'revision-migrated' } }
+    if ($revisionState -ne 'current') { return [pscustomobject]@{ status = 'stale-snapshot' } }
     $canonicalRevision = [string](Get-ObjectValue $canonical 'candidate_revision' '')
     $incomingRevision = [string](Get-ObjectValue $incomingRecord 'candidate_revision' '')
-    if (-not [string]::IsNullOrWhiteSpace($canonicalRevision) -and
-        -not [string]::IsNullOrWhiteSpace($incomingRevision) -and
-        $canonicalRevision -ne $incomingRevision) {
+    if ([string]::IsNullOrWhiteSpace($canonicalRevision) -or
+        [string]::IsNullOrWhiteSpace($incomingRevision) -or
+        -not [string]::Equals($canonicalRevision, $incomingRevision, [StringComparison]::Ordinal)) {
       return [pscustomobject]@{ status = 'stale-snapshot' }
     }
-    Remove-Item -LiteralPath $lockedPath -Force -ErrorAction Stop
+    # A revision-bound, content-free receipt closes the crash gap between a
+    # terminal discard and erasing an active managed-recovery successor journal.
+    # The public status remains `discarded`; only the durable proof changes.
+    Move-ToSuppressedCore -Path $lockedPath -Record $canonical -Reason $discardReason
     return [pscustomobject]@{ status = 'discarded' }
+  } -Arguments @($Path, $Record, $Reason)
+}
+
+function Suppress-AudnCodeManagedRecoverySucceededPendingRecord {
+  param(
+    [string]$Path,
+    [object]$Record
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Path) -or $null -eq $Record -or
+      [string](Get-ObjectValue $Record 'key' '') -notmatch '^[a-f0-9]{64}$') {
+    return [pscustomobject]@{ status = 'unverifiable' }
+  }
+  return Invoke-WithRecordMutationLock -Key ([string]$Record.key) -Action {
+    param($lockedPath, $incomingRecord)
+    if (-not (Test-Path -LiteralPath $lockedPath -PathType Leaf)) {
+      $existingDisposition = Get-AudnCodeManagedRecoverySucceededReceiptDisposition -Record $incomingRecord
+      if ([string](Get-ObjectValue $existingDisposition 'state' '') -eq 'exact-duplicate') {
+        return [pscustomobject]@{ status = 'already-recovery-suppressed' }
+      }
+      if ([string](Get-ObjectValue $existingDisposition 'state' '') -eq 'unverifiable') {
+        return [pscustomobject]@{ status = 'unverifiable' }
+      }
+      return [pscustomobject]@{ status = 'missing' }
+    }
+
+    try {
+      $canonical = Read-JsonFile -Path $lockedPath
+      Assert-QueuedRecord -Record $canonical -ExpectedKey ([string]$incomingRecord.key)
+    } catch {
+      return [pscustomobject]@{ status = 'unverifiable' }
+    }
+    $revisionState = Ensure-QueuedRecordCandidateRevisionCore -Path $lockedPath -Record $canonical
+    if ($revisionState -eq 'migrated') { return [pscustomobject]@{ status = 'revision-migrated' } }
+    if ($revisionState -ne 'current') { return [pscustomobject]@{ status = 'unverifiable' } }
+    $canonicalRevision = [string](Get-ObjectValue $canonical 'candidate_revision' '')
+    $incomingRevision = [string](Get-ObjectValue $incomingRecord 'candidate_revision' '')
+    if ([string]::IsNullOrWhiteSpace($canonicalRevision) -or
+        [string]::IsNullOrWhiteSpace($incomingRevision) -or
+        -not [string]::Equals($canonicalRevision, $incomingRevision, [StringComparison]::Ordinal)) {
+      return [pscustomobject]@{ status = 'stale-snapshot' }
+    }
+    foreach ($name in @(
+        'provider', 'candidate_kind', 'thread_id', 'turn_id', 'candidate_identity',
+        'audncode_stop_failure_uuid', 'audncode_recovery_binding'
+      )) {
+      if (-not [string]::Equals(
+          [string](Get-ObjectValue $canonical $name ''),
+          [string](Get-ObjectValue $incomingRecord $name ''),
+          [StringComparison]::Ordinal)) {
+        return [pscustomobject]@{ status = 'unverifiable' }
+      }
+    }
+    return Write-AudnCodeManagedRecoverySucceededReceiptCore `
+      -Path $lockedPath `
+      -Record $canonical `
+      -RemoveRecord
   } -Arguments @($Path, $Record)
 }
 
@@ -14827,7 +17568,8 @@ function Compare-CandidateOrder {
 
 function Coalesce-ThreadCandidates {
   param([object]$Config)
-  if ($null -eq $Config -or $Config.idleDetectionMode -eq 'off') { return }
+  if ($null -eq $Config -or $Config.idleDetectionMode -eq 'off') { return $false }
+  $retryRequired = $false
   $newest = @{}
   $files = @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc, Name)
   foreach ($file in $files) {
@@ -14857,14 +17599,27 @@ function Coalesce-ThreadCandidates {
     }
     $comparison = Compare-CandidateOrder -Left $record -Right $current.record
     if ($comparison -gt 0) {
-      Move-ToSuppressed -Path $current.path -Record $current.record -Reason 'superseded'
-      Write-RuntimeLog "superseded idle candidate key=$($current.record.key.Substring(0, 12)) thread=$($thread.Substring(0, [Math]::Min(8, $thread.Length)))"
+      $suppression = Move-ToSuppressed -Path $current.path -Record $current.record -Reason 'superseded'
+      if ([string](Get-ObjectValue $suppression 'status' '') -notin @('suppressed', 'missing')) {
+        $retryRequired = $true
+        break
+      }
+      if ([string](Get-ObjectValue $suppression 'status' '') -eq 'suppressed') {
+        Write-RuntimeLog "superseded idle candidate key=$($current.record.key.Substring(0, 12)) thread=$($thread.Substring(0, [Math]::Min(8, $thread.Length)))"
+      }
       $newest[$thread] = $candidate
     } elseif ($comparison -lt 0) {
-      Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'superseded'
-      Write-RuntimeLog "superseded idle candidate key=$($record.key.Substring(0, 12)) thread=$($thread.Substring(0, [Math]::Min(8, $thread.Length)))"
+      $suppression = Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'superseded'
+      if ([string](Get-ObjectValue $suppression 'status' '') -notin @('suppressed', 'missing')) {
+        $retryRequired = $true
+        break
+      }
+      if ([string](Get-ObjectValue $suppression 'status' '') -eq 'suppressed') {
+        Write-RuntimeLog "superseded idle candidate key=$($record.key.Substring(0, 12)) thread=$($thread.Substring(0, [Math]::Min(8, $thread.Length)))"
+      }
     }
   }
+  return $retryRequired
 }
 
 function Process-PendingCandidates {
@@ -14918,35 +17673,53 @@ function Process-PendingCandidates {
       }
       # The third pass is the final epoch and external-state check. It happens
       # while the record is still pending, immediately before durable promotion.
-      $gate = Test-RecordIdleGate -Record $record -Config $Config
+      $gate = Test-RecordIdleGate -Record $record -Config $Config -PendingPath $file.FullName
       if ($gate.state -eq 'subagent') {
-        Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'subagent'
+        $suppression = Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'subagent'
+        if ([string](Get-ObjectValue $suppression 'status' '') -notin @('suppressed', 'missing')) { $nextDue = $now }
         $promote = $false
         break
       }
       if ($gate.state -eq 'technical') {
-        Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'technical-turn'
-        Write-RuntimeLog "suppressed technical turn key=$($record.key.Substring(0, 12))"
+        $suppression = Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'technical-turn'
+        if ([string](Get-ObjectValue $suppression 'status' '') -eq 'suppressed') {
+          Write-RuntimeLog "suppressed technical turn key=$($record.key.Substring(0, 12))"
+        } elseif ([string](Get-ObjectValue $suppression 'status' '') -ne 'missing') { $nextDue = $now }
         $promote = $false
         break
       }
       if ($gate.state -eq 'superseded') {
-        Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'superseded'
-        Write-RuntimeLog "suppressed recovered predecessor key=$($record.key.Substring(0, 12))"
+        $suppression = Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'superseded'
+        if ([string](Get-ObjectValue $suppression 'status' '') -eq 'suppressed') {
+          Write-RuntimeLog "suppressed recovered predecessor key=$($record.key.Substring(0, 12))"
+        } elseif ([string](Get-ObjectValue $suppression 'status' '') -ne 'missing') { $nextDue = $now }
         $promote = $false
         break
       }
       if ($gate.state -eq 'unverifiable') {
-        Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'unverifiable'
-        Write-RuntimeLog "suppressed unverifiable candidate key=$($record.key.Substring(0, 12)) reason=$($gate.reason)"
+        $suppression = Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'unverifiable'
+        if ([string](Get-ObjectValue $suppression 'status' '') -eq 'suppressed') {
+          Write-RuntimeLog "suppressed unverifiable candidate key=$($record.key.Substring(0, 12)) reason=$($gate.reason)"
+        } elseif ([string](Get-ObjectValue $suppression 'status' '') -ne 'missing') { $nextDue = $now }
         $promote = $false
         break
       }
       if ($gate.state -eq 'cancelled') {
-        $discard = Discard-PendingRecord -Path $file.FullName -Record $record
-        if ($discard.status -eq 'discarded') {
+        $isRecoveredAudnFailure =
+          [string](Get-ObjectValue $record 'candidate_kind' '') -eq 'audncode_stop_failure' -and
+          [string](Get-ObjectValue $gate 'reason' '') -eq 'audncode-managed-recovery-succeeded'
+        $discard = if ($isRecoveredAudnFailure) {
+          Suppress-AudnCodeManagedRecoverySucceededPendingRecord -Path $file.FullName -Record $record
+        } else {
+          Discard-PendingRecord -Path $file.FullName -Record $record -Reason 'goal-cancelled'
+        }
+        if ([string](Get-ObjectValue $discard 'status' '') -in @(
+            'recovery-suppressed', 'already-recovery-suppressed'
+          )) {
+          Write-RuntimeLog "suppressed AudnCode provider failure after managed recovery key=$($record.key.Substring(0, 12))"
+        } elseif ($discard.status -eq 'discarded') {
           Write-RuntimeLog "discarded cancelled Claude goal key=$($record.key.Substring(0, 12))"
-        } elseif ($discard.status -eq 'stale-snapshot') {
+        } elseif ($discard.status -in @('stale-snapshot', 'revision-migrated')) {
           $nextDue = $now
         }
         $promote = $false
@@ -14958,7 +17731,7 @@ function Process-PendingCandidates {
         $commit = Commit-PendingRecord -Path $file.FullName -Record $record
         if ($commit.status -eq 'updated') {
           if ($null -eq $nextDue -or [int64]$gate.retryAtUnixMs -lt $nextDue) { $nextDue = [int64]$gate.retryAtUnixMs }
-        } elseif ($commit.status -in @('stop-won', 'stale-snapshot')) {
+        } elseif ($commit.status -in @('stop-won', 'stale-snapshot', 'revision-migrated')) {
           $nextDue = $now
         } elseif ($commit.status -eq 'stale-session') {
           Write-RuntimeLog "discarded stale Claude candidate after prompt epoch changed key=$($record.key.Substring(0, 12))"
@@ -14995,16 +17768,18 @@ function Process-PendingCandidates {
     $commit = Commit-PendingRecord -Path $file.FullName -Record $record -Promote
     if ($commit.status -in @('promoted', 'already-promoted')) {
       Write-RuntimeLog "idle candidate promoted key=$($record.key.Substring(0, 12)) reason=$($gate.reason)"
-    } elseif ($commit.status -in @('stop-won', 'stale-snapshot')) {
+    } elseif ($commit.status -in @('stop-won', 'stale-snapshot', 'revision-migrated')) {
       if ($null -eq $nextDue -or $now -lt $nextDue) { $nextDue = $now }
     } elseif ($commit.status -in @('session-unverifiable-suppressed', 'already-session-suppressed')) {
       Write-RuntimeLog "suppressed Claude candidate with unverifiable session state key=$($record.key.Substring(0, 12))"
     } elseif ($commit.status -eq 'stale-session') {
       Write-RuntimeLog "discarded stale Claude candidate before promotion key=$($record.key.Substring(0, 12))"
-    } elseif ($commit.status -eq 'audncode-lifecycle-retry') {
+    } elseif ($commit.status -eq 'audncode-recovery-cancelled') {
+      Write-RuntimeLog "discarded AudnCode provider failure after managed recovery key=$($record.key.Substring(0, 12))"
+    } elseif ($commit.status -in @('audncode-lifecycle-retry', 'audncode-recovery-retry')) {
       $lifecycleRetryAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 250
       if ($null -eq $nextDue -or $lifecycleRetryAt -lt $nextDue) { $nextDue = $lifecycleRetryAt }
-      Write-RuntimeLog "deferred AudnCode candidate because lifecycle changed before promotion key=$($record.key.Substring(0, 12))"
+      Write-RuntimeLog "deferred AudnCode candidate because lifecycle or recovery changed before promotion key=$($record.key.Substring(0, 12))"
     }
   }
   return [pscustomobject]@{ nextDueUnixMs = $nextDue }
@@ -15260,6 +18035,9 @@ function Invoke-OutboxWorker {
           ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' ''))).StartsWith('\\')
         }).Count -gt 0
       $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+      if (-not $DeliveryOnly) {
+        Repair-DurableAudnCodeManagedRecoverySuccessorJournals
+      }
       if (-not $DeliveryOnly -and $Continuous -and $null -ne $deliveryProcess -and $deliveryProcess.HasExited) {
         Write-RuntimeLog "delivery worker exited code=$($deliveryProcess.ExitCode)"
         $deliveryProcess.Dispose()
@@ -15414,8 +18192,12 @@ function Invoke-OutboxWorker {
         $maintenanceProcess = $null
       }
       if (-not $DeliveryOnly) {
-        Coalesce-ThreadCandidates -Config $config
-        $pendingResult = Process-PendingCandidates -Config $config
+        $coalesceRetryRequired = Coalesce-ThreadCandidates -Config $config
+        if ($coalesceRetryRequired) {
+          $pendingResult = [pscustomobject]@{ nextDueUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+        } else {
+          $pendingResult = Process-PendingCandidates -Config $config
+        }
       } else {
         $pendingResult = [pscustomobject]@{ nextDueUnixMs = $null }
       }
@@ -15467,8 +18249,12 @@ function Invoke-OutboxWorker {
             $classification = Get-EventClassification -Event $record.event -ThreadId ([string]$record.thread_id) -SessionHome $sessionHome -SqliteHome $sqliteHome
           }
           if ($classification -eq 'subagent') {
-            Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'subagent'
-            Write-RuntimeLog "suppressed subagent event key=$($record.key.Substring(0, 12)) thread=$(([string]$record.thread_id).Substring(0, [Math]::Min(8, ([string]$record.thread_id).Length)))"
+            $suppression = Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'subagent'
+            if ([string](Get-ObjectValue $suppression 'status' '') -eq 'suppressed') {
+              Write-RuntimeLog "suppressed subagent event key=$($record.key.Substring(0, 12)) thread=$(([string]$record.thread_id).Substring(0, [Math]::Min(8, ([string]$record.thread_id).Length)))"
+            } elseif ([string](Get-ObjectValue $suppression 'status' '') -ne 'missing') {
+              $nextDueMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            }
             continue
           }
           if ($classification -eq 'unknown') {
@@ -15751,6 +18537,21 @@ try {
   }
 
   if ($AudnCodeHook) {
+    try {
+      if ([string]::IsNullOrWhiteSpace($AudnCodeHome) -or
+          -not [IO.Path]::IsPathRooted($AudnCodeHome)) {
+        throw 'AudnCode home is not an absolute path'
+      }
+      # Normalize aliases such as RUNNER~1 before any durable ingress state is
+      # keyed. Windows can otherwise expose the same existing path once in its
+      # 8.3 form and once in its long form, splitting one host lifetime into two
+      # unrelated runtime records.
+      $AudnCodeHome = [IO.Path]::GetFullPath($AudnCodeHome)
+    } catch {
+      Write-RuntimeLog 'ignored AudnCode hook with an invalid home path'
+      Write-Output '{}'
+      exit 0
+    }
     if ([string]::IsNullOrWhiteSpace($AudnCodeExpectedEvent)) {
       [void](Set-AudnCodeIngressFallbackLost `
           -HomePath $AudnCodeHome `
@@ -15809,6 +18610,31 @@ try {
     $promptId = [string](Get-FirstObjectValue $hookInput @('prompt_id', 'prompt-id', 'promptId'))
     $agentId = [string](Get-FirstObjectValue $hookInput @('agent_id', 'agent-id', 'agentId'))
     $transcriptPath = [string](Get-FirstObjectValue $hookInput @('transcript_path', 'transcript-path', 'transcriptPath'))
+    if ($isAudnCode) {
+      try {
+        if ([string]::IsNullOrWhiteSpace($transcriptPath) -or
+            -not [IO.Path]::IsPathRooted($transcriptPath)) {
+          throw 'AudnCode transcript is not an absolute path'
+        }
+        # Keep every session, lifecycle, and runtime comparison in one Windows
+        # path representation. This must happen before any handler persists the
+        # value; normalizing only inside one downstream registry leaves the
+        # session record vulnerable to short/long-path mismatches.
+        $transcriptPath = [IO.Path]::GetFullPath($transcriptPath)
+      } catch {
+        if ($null -ne $audnCodeIngressArm) {
+          [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail)
+        } else {
+          [void](Set-AudnCodeIngressFallbackLost `
+              -HomePath $AudnCodeHome `
+              -HookStartTicks $HookProcessStartUtcTicks `
+              -Reason 'audncode-hook-transcript-path-invalid')
+        }
+        Write-RuntimeLog 'ignored AudnCode hook with an invalid transcript path'
+        Write-Output '{}'
+        exit 0
+      }
+    }
     if ($isAudnCode -and
         -not [string]::Equals($hookName, $AudnCodeExpectedEvent, [StringComparison]::Ordinal)) {
       if ($null -ne $audnCodeIngressArm) {
@@ -16011,6 +18837,42 @@ try {
         # this exact lifetime registration.
         Write-RuntimeLog 'AudnCode PostToolUse exact host lifetime could not be registered; preserving lifecycle loss'
       }
+      if ($toolName -eq 'AskUserQuestion') {
+        $answerMutation = if ([bool]$hostLifetimeRegistered -and
+            [string]::IsNullOrWhiteSpace($agentId) -and
+            (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath -HomePath $AudnCodeHome)) {
+          Set-AudnCodeQuestionAnsweredBusy `
+            -SessionId $sessionId `
+            -TranscriptPath $transcriptPath `
+            -HomePath $AudnCodeHome `
+            -HookStartTicks $HookProcessStartUtcTicks `
+            -IngressHostPid ([int](Get-ObjectValue $audnCodeIngressArm 'host_pid' 0)) `
+            -IngressHostStartedUnixMs ([int64](Get-ObjectValue $audnCodeIngressArm 'host_started_unix_ms' 0)) `
+            -HookInput $hookInput
+        } else { $null }
+        $answerEpoch = [int64](Get-ObjectValue $answerMutation 'epoch' 0)
+        $answerCommitted = $null -ne $answerMutation -and
+          [bool](Get-ObjectValue $answerMutation 'ok' $false) -and $answerEpoch -gt 0
+        if ($answerCommitted -and $null -ne $audnCodeIngressArm) {
+          [void](Complete-AudnCodeBusyIngressHandoff `
+              -SessionId $sessionId `
+              -TranscriptPath $transcriptPath `
+              -BusyEpoch $answerEpoch `
+              -IngressArm $audnCodeIngressArm `
+              -HomePath $AudnCodeHome `
+              -HookStartTicks $HookProcessStartUtcTicks `
+              -BusyEventRank $AudnCodeUserPromptBusyEventRank `
+              -TaskListId ([string]$env:CLAUDE_CODE_TASK_LIST_ID) `
+              -TeamName ([string]$env:CLAUDE_CODE_TEAM_NAME))
+        } elseif ($null -ne $audnCodeIngressArm) {
+          [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail)
+        }
+        if (-not $answerCommitted) {
+          Write-RuntimeLog 'ignored uncorrelated AudnCode AskUserQuestion answer receipt'
+        }
+        Write-Output '{}'
+        exit 0
+      }
       $cronUpdated = $true
       $cronLifecycleArm = $null
       if ($toolName -in @('CronCreate', 'CronDelete')) {
@@ -16185,42 +19047,57 @@ try {
       $notificationType = [string](Get-FirstObjectValue $hookInput @('notification_type', 'notification-type', 'notificationType'))
       $idleUpdated = $false
       $supersededHostRetired = $false
+      $interventionReady = $false
+      $interventionHandled = $false
       if ($isAudnCode) {
-        # idle_prompt is emitted only after the complete query loop returns.
-        # Task/agent completion notifications are deliberately ignored because
-        # they can be intermediate. Require the still-pending Stop candidate so
-        # a late async idle notification cannot mark a newer prompt idle.
-        $sessionState = Read-ClaudeSessionState -SessionId $sessionId
-        $promptId = [string](Get-ObjectValue $sessionState 'prompt_id' '')
-        $sessionEpoch = [int64](Get-ObjectValue $sessionState 'epoch' 0)
-        $hostPid = [int](Get-ObjectValue $sessionState 'audncode_host_pid' 0)
-        $hostStarted = [int64](Get-ObjectValue $sessionState 'audncode_host_started_unix_ms' 0)
-        $actualHost = Get-AudnCodeHostSession -SessionId $sessionId -HomePath $AudnCodeHome
-        $actualHostPid = [int](Get-ObjectValue $actualHost 'pid' 0)
-        $actualHostStarted = [int64](Get-ObjectValue $actualHost 'started_unix_ms' 0)
-        $isCurrentHost = [bool](Get-ObjectValue $actualHost 'ok' $false) -and
-          $actualHostPid -eq $hostPid -and $actualHostStarted -eq $hostStarted
-        $hasOrderedTranscript = $notificationType -eq 'idle_prompt' -and
-          (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath) -and
-          (Test-AudnCodeTranscriptCorrelation -SessionState $sessionState -TranscriptPath $transcriptPath)
-        if ($hasOrderedTranscript -and $isCurrentHost -and
-            (Test-AudnCodePendingCandidate -SessionId $sessionId -PromptId $promptId -SessionEpoch $sessionEpoch -TranscriptPath $transcriptPath -SessionState $sessionState -IdleHookStartTicks $HookProcessStartUtcTicks)) {
-          $idleUpdated = Set-ClaudeSessionIdle -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath -NotificationType $notificationType -HookStartTicks $HookProcessStartUtcTicks
-        } elseif ($hasOrderedTranscript -and [bool](Get-ObjectValue $actualHost 'ok' $false) -and -not $isCurrentHost) {
-          # A previous live owner remains a hard gate until that exact
-          # home/PID/start lifetime supplies Stop followed by idle_prompt.
-          # Retiring it never marks the current prompt idle or creates a
-          # candidate; it only releases that one superseded lifetime.
-          $retirement = Complete-AudnCodeSupersededHostIdleProof `
+        if ($notificationType -eq 'permission_prompt' -and
+            [string]::IsNullOrWhiteSpace($agentId) -and
+            (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath -HomePath $AudnCodeHome)) {
+          $intervention = Add-AudnCodeQuestionIntervention `
             -SessionId $sessionId `
             -TranscriptPath $transcriptPath `
             -HomePath $AudnCodeHome `
-            -HostPid $actualHostPid `
-            -HostStartedUnixMs $actualHostStarted `
+            -Cwd ([string](Get-FirstObjectValue $hookInput @('cwd', 'working-directory', 'working_directory'))) `
             -HookStartTicks $HookProcessStartUtcTicks
-          $supersededHostRetired = [bool](Get-ObjectValue $retirement 'retired' $false)
-          if (-not $supersededHostRetired) {
-            Write-RuntimeLog "kept superseded AudnCode host lifetime reason=$(Sanitize-NotificationText -Text ([string](Get-ObjectValue $retirement 'reason' 'unverifiable-terminal-pair')) -MaxLength 80)"
+          $interventionStatus = [string](Get-ObjectValue $intervention 'status' 'ignored')
+          $interventionHandled = $interventionStatus -ne 'ignored'
+          $interventionReady = $interventionStatus -eq 'queued'
+        } elseif ($notificationType -eq 'idle_prompt') {
+          # idle_prompt is emitted only after the complete query loop returns.
+          # Task/agent completion notifications are deliberately ignored because
+          # they can be intermediate. Require the still-pending Stop candidate so
+          # a late async idle notification cannot mark a newer prompt idle.
+          $sessionState = Read-ClaudeSessionState -SessionId $sessionId
+          $promptId = [string](Get-ObjectValue $sessionState 'prompt_id' '')
+          $sessionEpoch = [int64](Get-ObjectValue $sessionState 'epoch' 0)
+          $hostPid = [int](Get-ObjectValue $sessionState 'audncode_host_pid' 0)
+          $hostStarted = [int64](Get-ObjectValue $sessionState 'audncode_host_started_unix_ms' 0)
+          $actualHost = Get-AudnCodeHostSession -SessionId $sessionId -HomePath $AudnCodeHome
+          $actualHostPid = [int](Get-ObjectValue $actualHost 'pid' 0)
+          $actualHostStarted = [int64](Get-ObjectValue $actualHost 'started_unix_ms' 0)
+          $isCurrentHost = [bool](Get-ObjectValue $actualHost 'ok' $false) -and
+            $actualHostPid -eq $hostPid -and $actualHostStarted -eq $hostStarted
+          $hasOrderedTranscript = (Test-AudnCodeTranscriptPath -SessionId $sessionId -TranscriptPath $transcriptPath) -and
+            (Test-AudnCodeTranscriptCorrelation -SessionState $sessionState -TranscriptPath $transcriptPath)
+          if ($hasOrderedTranscript -and $isCurrentHost -and
+              (Test-AudnCodePendingCandidate -SessionId $sessionId -PromptId $promptId -SessionEpoch $sessionEpoch -TranscriptPath $transcriptPath -SessionState $sessionState -IdleHookStartTicks $HookProcessStartUtcTicks)) {
+            $idleUpdated = Set-ClaudeSessionIdle -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath -NotificationType $notificationType -HookStartTicks $HookProcessStartUtcTicks
+          } elseif ($hasOrderedTranscript -and [bool](Get-ObjectValue $actualHost 'ok' $false) -and -not $isCurrentHost) {
+            # A previous live owner remains a hard gate until that exact
+            # home/PID/start lifetime supplies Stop followed by idle_prompt.
+            # Retiring it never marks the current prompt idle or creates a
+            # candidate; it only releases that one superseded lifetime.
+            $retirement = Complete-AudnCodeSupersededHostIdleProof `
+              -SessionId $sessionId `
+              -TranscriptPath $transcriptPath `
+              -HomePath $AudnCodeHome `
+              -HostPid $actualHostPid `
+              -HostStartedUnixMs $actualHostStarted `
+              -HookStartTicks $HookProcessStartUtcTicks
+            $supersededHostRetired = [bool](Get-ObjectValue $retirement 'retired' $false)
+            if (-not $supersededHostRetired) {
+              Write-RuntimeLog "kept superseded AudnCode host lifetime reason=$(Sanitize-NotificationText -Text ([string](Get-ObjectValue $retirement 'reason' 'unverifiable-terminal-pair')) -MaxLength 80)"
+            }
           }
         }
       } elseif ($notificationType -in @('idle_prompt', 'agent_completed') -and
@@ -16228,12 +19105,12 @@ try {
           -not [string]::IsNullOrWhiteSpace($promptId)) {
         $idleUpdated = Set-ClaudeSessionIdle -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath -NotificationType $notificationType
       }
-      if ([bool]$idleUpdated -or [bool]$supersededHostRetired) {
+      if ([bool]$idleUpdated -or [bool]$supersededHostRetired -or [bool]$interventionReady) {
         if ([bool]$supersededHostRetired) {
           Write-RuntimeLog 'retired one superseded AudnCode host after trusted Stop and idle_prompt'
         }
         Start-DetachedWorker
-      } else {
+      } elseif (-not [bool]$interventionHandled) {
         Write-RuntimeLog "ignored unsupported or uncorrelated $hostLabel notification type=$(Sanitize-NotificationText -Text $notificationType -MaxLength 80)"
       }
       Write-Output '{}'
@@ -16342,6 +19219,7 @@ try {
       $sessionState = Read-ClaudeSessionState -SessionId $sessionId
     }
     $audnStopFailureProof = $null
+    $audnManagedRecoveryAttestation = $null
     if ($isAudnCode -and $hookName -eq 'StopFailure') {
       $hookMarker = Get-AudnCodeCronObservationMarker `
         -HomePath $AudnCodeHome `
@@ -16354,6 +19232,18 @@ try {
           [int64](Get-ObjectValue $hookMarker 'installed_unix_ms' 0) -ne
             [int64](Get-ObjectValue $sessionState 'audncode_cron_hook_installed_unix_ms' 0)) {
         Write-RuntimeLog 'ignored AudnCode StopFailure without the trusted installed hook shape'
+        Write-Output '{}'
+        exit 0
+      }
+      $audnManagedRecoveryAttestation = Get-AudnCodeManagedRecoveryHookAttestation `
+        -SessionId $sessionId `
+        -HomePath $AudnCodeHome
+      if ([bool](Get-ObjectValue $audnManagedRecoveryAttestation 'declared' $false) -and
+          -not [bool](Get-ObjectValue $audnManagedRecoveryAttestation 'ok' $false)) {
+        # The launcher explicitly declared managed recovery, so any malformed,
+        # stale, unrelated, or non-ancestor marker must fail closed. Never fall
+        # back to the ordinary terminal-error path for this hook.
+        Write-RuntimeLog 'ignored AudnCode StopFailure with an unverifiable managed recovery marker'
         Write-Output '{}'
         exit 0
       }
@@ -16428,6 +19318,14 @@ try {
         } else {
           Write-RuntimeLog 'ignored AudnCode StopFailure without one stable correlated transcript error'
         }
+        Write-Output '{}'
+        exit 0
+      }
+      if ([bool](Get-ObjectValue $audnManagedRecoveryAttestation 'declared' $false) -and
+          [int](Get-ObjectValue $audnManagedRecoveryAttestation 'revision' 0) -eq 2 -and
+          [string](Get-ObjectValue $audnManagedRecoveryAttestation 'failure_record_uuid' '') -ne
+            (Get-AudnCodeManagedRecoveryGuid -Value (Get-ObjectValue $audnStopFailureProof 'uuid'))) {
+        Write-RuntimeLog 'ignored AudnCode StopFailure whose managed recovery terminal bound another failure'
         Write-Output '{}'
         exit 0
       }
@@ -16538,6 +19436,21 @@ try {
       'audncode-stop-failure-payload-hash' = if ($null -ne $audnStopFailureProof) { [string]$audnStopFailureProof.payload_hash } else { '' }
       'audncode-stop-failure-line-hash' = if ($null -ne $audnStopFailureProof) { [string]$audnStopFailureProof.line_hash } else { '' }
       'audncode-stop-failure-proof-hash' = if ($null -ne $audnStopFailureProof) { [string]$audnStopFailureProof.proof_hash } else { '' }
+      'audncode-recovery-managed' = [bool](Get-ObjectValue $audnManagedRecoveryAttestation 'declared' $false)
+      'audncode-recovery-marker-path' = [string](Get-ObjectValue $audnManagedRecoveryAttestation 'path' '')
+      'audncode-recovery-home' = [string](Get-ObjectValue $audnManagedRecoveryAttestation 'home' '')
+      'audncode-recovery-binding' = [string](Get-ObjectValue $audnManagedRecoveryAttestation 'binding' '')
+      'audncode-recovery-manager-instance-id' = [string](Get-ObjectValue $audnManagedRecoveryAttestation 'manager_instance_id' '')
+      'audncode-recovery-operation-id' = [string](Get-ObjectValue $audnManagedRecoveryAttestation 'operation_id' '')
+      'audncode-recovery-attempt-id' = [string](Get-ObjectValue $audnManagedRecoveryAttestation 'attempt_id' '')
+      'audncode-recovery-manager-pid' = [int](Get-ObjectValue $audnManagedRecoveryAttestation 'manager_pid' 0)
+      'audncode-recovery-manager-process-start-utc-ticks' = [int64](Get-ObjectValue $audnManagedRecoveryAttestation 'manager_process_start_utc_ticks' 0)
+      'audncode-recovery-created-unix-ms' = [int64](Get-ObjectValue $audnManagedRecoveryAttestation 'created_unix_ms' 0)
+      'audncode-recovery-initial-state' = [string](Get-ObjectValue $audnManagedRecoveryAttestation 'state' '')
+      'audncode-recovery-initial-revision' = [int](Get-ObjectValue $audnManagedRecoveryAttestation 'revision' 0)
+      'audncode-recovery-terminal-hash' = $(if ([int](Get-ObjectValue $audnManagedRecoveryAttestation 'revision' 0) -eq 2) {
+          [string](Get-ObjectValue $audnManagedRecoveryAttestation 'content_hash' '')
+        } else { '' })
       'goal-status' = if ($goalState -eq 'failed') { 'blocked' } elseif ($goalState -eq 'achieved') { 'complete' } else { '' }
       'completion-event-type' = if ($hookName -eq 'StopFailure') { 'turn_aborted' } else { 'task_complete' }
     }
@@ -16617,8 +19530,16 @@ try {
   }
   $record = New-EventRecord -Event $event -EventOrigin (Get-DefaultOrigin) -EventSessionHome $eventSessionHome -EventSqliteHome $eventSqliteHome -EventClassification $eventClassification -EventIncludeMessage $config.includeMessage -CandidateKind $candidateKind -SourceEvent $sourceEvent -Provider $provider
   if ($config.suppressSubagents -and $eventClassification -eq 'subagent') {
-    Move-ToSuppressed -Path (Join-Path $OutboxDir ($record.key + '.json')) -Record $record
-    Write-RuntimeLog "suppressed subagent completion thread=$($threadId.Substring(0, [Math]::Min(8, $threadId.Length)))"
+    $suppression = Add-UnqueuedSuppressedEvent -Record $record -Reason 'subagent'
+    $suppressionStatus = [string](Get-ObjectValue $suppression 'status' '')
+    if ($suppressionStatus -eq 'suppressed') {
+      Write-RuntimeLog "suppressed subagent completion thread=$($threadId.Substring(0, [Math]::Min(8, $threadId.Length)))"
+    } elseif ($suppressionStatus -eq 'existing') {
+      # A previous identical hook may have committed the queue file and died
+      # before starting its worker. This hook must not mutate that canonical
+      # revision, but it can safely restore liveness.
+      Start-DetachedWorker
+    }
     if ($HookEvent -or $ClaudeHook -or $AudnCodeHook) { Write-Output '{}' }
     exit 0
   }
@@ -16650,6 +19571,20 @@ try {
     [void](Complete-AudnCodeIngressMutation -IngressArm $audnCodeIngressArm -Fail)
   }
   Write-RuntimeLog "hook error: $(Sanitize-NotificationText -Text $_.Exception.Message -MaxLength 500)"
+  if ($null -ne $script:AbandonedRawNotificationRead) {
+    # A timed-out BeginRead still owns the Console stdin SafeHandle. Avoid
+    # managed cleanup/finalizers and terminate the one-shot hook directly once
+    # its durable fail-closed state and log entry are committed.
+    if ($HookEvent -or $ClaudeHook -or $AudnCodeHook) {
+      if ($BridgeFallback) { [Environment]::Exit(1) }
+      $ack = $Utf8NoBom.GetBytes('{}' + [Environment]::NewLine)
+      $standardOutput = [Console]::OpenStandardOutput()
+      $standardOutput.Write($ack, 0, $ack.Length)
+      $standardOutput.Flush()
+      [Environment]::Exit(0)
+    }
+    [Environment]::Exit(1)
+  }
   if ($HookEvent -or $ClaudeHook -or $AudnCodeHook) {
     if ($BridgeFallback) { exit 1 }
     Write-Output '{}'

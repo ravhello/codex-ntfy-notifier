@@ -156,7 +156,7 @@ Preserve these invariants:
 - invalid records isolated without stopping the rest of the queue;
 - active-child orphan handling is explicit and bounded by `subagent_orphan_seconds`;
 - installers preserve unrelated `hooks.json` groups/handlers/metadata, register only managed `Stop`, and never edit the Codex trust store;
-- AudnCode lifecycle changes preserve shape-8 parity: seven synchronous 60-second events, exact matchers, trusted expected-event arguments, and fail-closed tests for `SendMessage`, same-ID resumes, teams, CCR, and causal cron lease/file evidence;
+- AudnCode lifecycle changes preserve shape-9 parity: seven synchronous 60-second events, exact idle/question/tool matchers, trusted expected-event arguments, and fail-closed tests for `AskUserQuestion`, `SendMessage`, managed recovery, same-ID resumes, teams, CCR, and causal cron lease/file evidence;
 - an AudnCode team releases only after `TeamDelete` removes its directory; `isActive: false` and membership removal are never standalone finality proof; `CronDelete` closes only an exact same-runtime session-only incarnation, while durable cron finality still requires native lease/file evidence;
 - secrets absent from doctor output, logs, exceptions, tests, and repository history;
 - private permissions for config, hooks, state, staging, and backups.

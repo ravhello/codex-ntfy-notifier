@@ -586,7 +586,7 @@ class NotifierContractTests(unittest.TestCase):
                     "schema": 1,
                     "kind": "codex-ntfy-audncode-hooks",
                     "notifier_version": "2.6.0",
-                    "hook_shape_version": 8,
+                    "hook_shape_version": 9,
                     "audncode_home": str(self.audncode_home.resolve()),
                     "generation": resolved_generation,
                     "installed_unix_ms": installed_unix_ms,
@@ -596,6 +596,336 @@ class NotifierContractTests(unittest.TestCase):
         )
         self.audncode_hook_generation = resolved_generation
         return marker
+
+    def windows_process_start_utc_ticks(self, pid: int) -> int:
+        result = subprocess.run(
+            [
+                str(WINDOWS_POWERSHELL),
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"[Diagnostics.Process]::GetProcessById({pid}).StartTime.ToUniversalTime().Ticks",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return int(result.stdout.strip())
+
+    def protect_audncode_recovery_directory(self, path: Path) -> None:
+        if not hasattr(self, "_windows_current_sid"):
+            result = subprocess.run(
+                [
+                    str(WINDOWS_POWERSHELL),
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self._windows_current_sid = result.stdout.strip()
+        icacls = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "icacls.exe"
+        result = subprocess.run(
+            [
+                str(icacls),
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"*{self._windows_current_sid}:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+    def protect_audncode_recovery_file(self, path: Path) -> None:
+        if not hasattr(self, "_windows_current_sid"):
+            self.protect_audncode_recovery_directory(path.parent)
+        icacls = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "icacls.exe"
+        result = subprocess.run(
+            [
+                str(icacls),
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"*{self._windows_current_sid}:F",
+                "*S-1-5-18:F",
+                "*S-1-5-32-544:F",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+    def create_audncode_recovery_marker(
+        self,
+        event: dict,
+        *,
+        host: tuple[subprocess.Popen[bytes], int] | None = None,
+        manager_instance_id: str | None = None,
+        operation_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> tuple[Path, dict[str, object]]:
+        selected_host = host or self.audncode_hosts[event["session_id"]]
+        manager_process, _host_started_at = selected_host
+        manager_id = manager_instance_id or str(uuid.uuid4())
+        operation = operation_id or str(uuid.uuid4())
+        attempt = attempt_id or str(uuid.uuid4())
+        recovery_root = self.audncode_home / "codex-ntfy-recovery"
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        self.protect_audncode_recovery_directory(recovery_root)
+        marker_dir = recovery_root / manager_id
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        self.protect_audncode_recovery_directory(marker_dir)
+        marker_path = marker_dir / f"{operation}-{attempt}.json"
+        now_ms = int(time.time() * 1000)
+        marker: dict[str, object] = {
+            "schema": 1,
+            "kind": "codex-ntfy-audncode-recovery",
+            "manager_instance_id": manager_id,
+            "operation_id": operation,
+            "attempt_id": attempt,
+            "session_id": event["session_id"],
+            "manager_pid": manager_process.pid,
+            "manager_process_start_utc_ticks": self.windows_process_start_utc_ticks(
+                manager_process.pid
+            ),
+            "state": "recovering",
+            "revision": 1,
+            "reason": "runtime-attempt-active",
+            "failure_record_uuid": "",
+            "created_unix_ms": now_ms,
+            "updated_unix_ms": now_ms,
+        }
+        marker_path.write_text(json.dumps(marker, separators=(",", ":")), encoding="utf-8")
+        self.protect_audncode_recovery_file(marker_path)
+        return marker_path, marker
+
+    def transition_audncode_recovery_marker(
+        self,
+        marker_path: Path,
+        marker: dict[str, object],
+        *,
+        state: str,
+        reason: str,
+        failure_record_uuid: str,
+        revision: int = 2,
+    ) -> dict[str, object]:
+        transitioned = {
+            **marker,
+            "state": state,
+            "revision": revision,
+            "reason": reason,
+            "failure_record_uuid": failure_record_uuid,
+            "updated_unix_ms": max(
+                int(marker["created_unix_ms"]), int(time.time() * 1000)
+            ),
+        }
+        temporary = marker_path.with_name(f".{marker_path.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(
+            json.dumps(transitioned, separators=(",", ":")), encoding="utf-8"
+        )
+        os.replace(temporary, marker_path)
+        self.protect_audncode_recovery_file(marker_path)
+        return transitioned
+
+    def write_audncode_recovery_marker(
+        self, marker_path: Path, marker: dict[str, object]
+    ) -> None:
+        temporary = marker_path.with_name(f".{marker_path.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(json.dumps(marker, separators=(",", ":")), encoding="utf-8")
+        os.replace(temporary, marker_path)
+        self.protect_audncode_recovery_file(marker_path)
+
+    def prepare_audncode_managed_failure(
+        self, label: str
+    ) -> tuple[dict, dict, str, Path, dict[str, object]]:
+        session_id = str(uuid.uuid4())
+        transcript = self.audncode_home / "projects" / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.audncode_event(session_id=session_id, transcript_path=transcript)
+        self.run_audncode_hook(
+            self.audncode_prompt_event(event, prompt=f"Managed recovery {label}")
+        )
+        failure, _user_uuid, failure_uuid = self.append_audncode_stop_failure_proof(
+            event,
+            error="rate_limit",
+            message=f"Managed provider failure {label}",
+        )
+        marker_path, marker = self.create_audncode_recovery_marker(event)
+        return event, failure, failure_uuid, marker_path, marker
+
+    def seed_audncode_recovery_journal_fixture(self, label: str) -> dict[str, object]:
+        """Create a valid content-bearing recovery journal without live hook latency."""
+        thread_id = str(uuid.uuid4())
+        turn_id = str(uuid.uuid4())
+        key = hashlib.sha256(
+            f"codex-ntfy/v1|claude|{thread_id}|{turn_id}".encode("utf-8")
+        ).hexdigest()
+        now_ms = int(time.time() * 1000)
+        private_sentinel = f"private recovery journal {label} <Qwen & S1>"
+        successor = {
+            "schema": 1,
+            "key": key,
+            "sequence_id": f"claude-{key[:32]}",
+            "provider": "claude",
+            "origin": "audncode",
+            "weak_identity": False,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "candidate_kind": "audncode_stop",
+            "source_event": "Stop",
+            "completion_event_type": "task_complete",
+            "candidate_revision": uuid.uuid4().hex,
+            "candidate_identity": "",
+            "audncode_stop_failure_uuid": "",
+            "audncode_recovery_managed": False,
+            "audncode_recovery_binding_invalid": False,
+            "audncode_stop_failure_ambiguous": False,
+            "created_unix_ms": now_ms,
+            "next_attempt_unix_ms": 0,
+            "attempts": 0,
+            "event": {
+                "type": "agent-turn-complete",
+                "cwd": rf"C:\private\{label}",
+                "last-assistant-message": private_sentinel,
+            },
+        }
+        serialized = json.dumps(
+            successor, separators=(",", ":"), ensure_ascii=False
+        )
+        successor_hash = hashlib.sha256(
+            ("audncode-managed-recovery-successor/v1|" + serialized).encode("utf-8")
+        ).hexdigest()
+        failure_revision = uuid.uuid4().hex
+        candidate_identity = hashlib.sha256(
+            f"failure-proof|{label}|{uuid.uuid4()}".encode("utf-8")
+        ).hexdigest()
+        failure_uuid = str(uuid.uuid4())
+        recovery_binding = hashlib.sha256(
+            f"recovery-binding|{label}|{uuid.uuid4()}".encode("utf-8")
+        ).hexdigest()
+        receipt_key = hashlib.sha256(
+            (
+                "audncode-managed-recovery-succeeded-receipt/v1|"
+                f"{key}|{candidate_identity}|{failure_uuid}"
+            ).encode("utf-8")
+        ).hexdigest()
+        receipt_name = f"r-{receipt_key}.json"
+        suppressed_dir = self.state / "suppressed"
+        journal_dir = self.state / "recovery-journals"
+        suppressed_dir.mkdir(parents=True, exist_ok=True)
+        journal_dir.mkdir(parents=True, exist_ok=True)
+        tombstone_path = suppressed_dir / receipt_name
+        index_path = journal_dir / receipt_name
+        tombstone_path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "key": key,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "origin": "audncode",
+                    "candidate_revision": failure_revision,
+                    "suppressed_at": datetime.now(timezone.utc).isoformat(),
+                    "reason": "audncode-managed-recovery-succeeded",
+                    "candidate_identity": candidate_identity,
+                    "audncode_stop_failure_uuid": failure_uuid,
+                    "audncode_recovery_binding": recovery_binding,
+                    "audncode_recovery_terminal_hash": hashlib.sha256(
+                        f"terminal|{label}".encode("utf-8")
+                    ).hexdigest(),
+                    "successor": serialized,
+                    "successor_hash": successor_hash,
+                },
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        index_path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "key": key,
+                    "receipt_name": receipt_name,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "key": key,
+            "successor": successor,
+            "failure_revision": failure_revision,
+            "tombstone_path": tombstone_path,
+            "index_path": index_path,
+            "private_sentinel": private_sentinel,
+        }
+
+    def write_schema2_terminal_suppression(
+        self, fixture: dict[str, object], record: dict[str, object], reason: str
+    ) -> Path:
+        path = self.state / "suppressed" / f"{fixture['key']}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 2,
+                    "key": record["key"],
+                    "provider": record["provider"],
+                    "weak_identity": record["weak_identity"],
+                    "sequence_id": record["sequence_id"],
+                    "thread_id": record["thread_id"],
+                    "turn_id": record["turn_id"],
+                    "origin": record["origin"],
+                    "candidate_kind": record["candidate_kind"],
+                    "source_event": record["source_event"],
+                    "completion_event_type": record["completion_event_type"],
+                    "candidate_revision": record["candidate_revision"],
+                    "suppressed_at": datetime.now(timezone.utc).isoformat(),
+                    "reason": reason,
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def assert_content_free_suppression_receipt(
+        self, record: dict[str, object], reason: str
+    ) -> dict[str, object]:
+        receipts = list((self.state / "suppressed").glob("*.json"))
+        self.assertEqual(len(receipts), 1, self.state_debug())
+        receipt = json.loads(receipts[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(receipt.get("schema"), 2, receipt)
+        self.assertEqual(receipt.get("reason"), reason, receipt)
+        self.assertEqual(receipt.get("provider"), "claude", receipt)
+        self.assertFalse(receipt.get("weak_identity"), receipt)
+        self.assertRegex(str(receipt.get("candidate_revision", "")), r"^[0-9a-f]{32}$")
+        for field in (
+            "key",
+            "sequence_id",
+            "thread_id",
+            "turn_id",
+            "candidate_kind",
+            "source_event",
+            "completion_event_type",
+            "candidate_revision",
+        ):
+            self.assertEqual(receipt.get(field), record.get(field), receipt)
+        for private_field in ("event", "last-assistant-message", "transcript_path"):
+            self.assertNotIn(private_field, receipt, receipt)
+        return receipt
 
     def start_audncode_host(
         self, session_id: str, *, cwd: str = r"C:\work\perfect notifier"
@@ -734,7 +1064,21 @@ while True:
             while child.poll() is None and time.monotonic() < delay_deadline:
                 time.sleep(min(0.01, max(0, delay_deadline - time.monotonic())))
         try:
-            if request.get("hold_stdin_open"):
+            close_stdin_after_ms = max(0, int(request.get("close_stdin_after_ms", 0)))
+            exited_before_stdin_close = False
+            if close_stdin_after_ms:
+                stdin_bytes = base64.b64decode(request["input"])
+                if stdin_bytes:
+                    child.stdin.write(stdin_bytes)
+                    child.stdin.flush()
+                close_deadline = time.monotonic() + (close_stdin_after_ms / 1000)
+                while child.poll() is None and time.monotonic() < close_deadline:
+                    time.sleep(min(0.01, max(0, close_deadline - time.monotonic())))
+                exited_before_stdin_close = child.poll() is not None
+                child.stdin.close()
+                child.stdin = None
+                stdout, stderr = child.communicate(timeout=60)
+            elif request.get("hold_stdin_open"):
                 stdin_bytes = base64.b64decode(request["input"])
                 if stdin_bytes:
                     child.stdin.write(stdin_bytes)
@@ -761,6 +1105,7 @@ while True:
             "stdout": base64.b64encode(stdout).decode("ascii"),
             "stderr": base64.b64encode(stderr).decode("ascii"),
             "prearm_seen": prearm_seen.is_set(),
+            "exited_before_stdin_close": exited_before_stdin_close,
         }
     except subprocess.TimeoutExpired as exc:
         response = {
@@ -1213,6 +1558,125 @@ while True:
             "message": "Claude is waiting for your input",
         }
 
+    def append_audncode_question(
+        self,
+        event: dict,
+        *,
+        question: str = "Quale opzione devo usare?",
+        tool_name: str = "AskUserQuestion",
+        tool_use_id: str | None = None,
+        sidechain: bool = False,
+        agent_id: str | None = None,
+        multiple_tool_calls: bool = False,
+    ) -> dict[str, object]:
+        _state_path, session_state = self.read_audncode_session_state(event["session_id"])
+        busy_ms = int(session_state["busy_unix_ms"])
+        root_uuid = str(uuid.uuid4())
+        assistant_uuid = str(uuid.uuid4())
+        resolved_tool_use_id = tool_use_id or f"toolu_{uuid.uuid4().hex}"
+        tool_input = {
+            "questions": [
+                {
+                    "question": question,
+                    "header": "Scelta",
+                    "options": [
+                        {"label": "Prima", "description": "Usa la prima opzione."},
+                        {"label": "Seconda", "description": "Usa la seconda opzione."},
+                    ],
+                    "multiSelect": False,
+                }
+            ]
+        }
+        root_entry = {
+            "parentUuid": None,
+            "isSidechain": False,
+            "type": "user",
+            "message": {"role": "user", "content": "Prompt root corrente"},
+            "uuid": root_uuid,
+            "timestamp": datetime.fromtimestamp((busy_ms + 1) / 1000, timezone.utc).isoformat(),
+            "sessionId": event["session_id"],
+        }
+        content: list[dict[str, object]] = [
+            {"type": "thinking", "thinking": "Serve una scelta esplicita."},
+            {
+                "type": "tool_use",
+                "id": resolved_tool_use_id,
+                "name": tool_name,
+                "input": tool_input,
+            },
+        ]
+        if multiple_tool_calls:
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": f"toolu_{uuid.uuid4().hex}",
+                    "name": "AskUserQuestion",
+                    "input": tool_input,
+                }
+            )
+        assistant_entry: dict[str, object] = {
+            "parentUuid": root_uuid,
+            "isSidechain": sidechain,
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": content,
+                "stop_reason": "tool_use",
+            },
+            "uuid": assistant_uuid,
+            "timestamp": datetime.fromtimestamp((busy_ms + 2) / 1000, timezone.utc).isoformat(),
+            "sessionId": event["session_id"],
+        }
+        if agent_id is not None:
+            assistant_entry["agentId"] = agent_id
+        with Path(event["transcript_path"]).open(
+            "a", encoding="utf-8", newline="\n"
+        ) as stream:
+            for entry in (root_entry, assistant_entry):
+                stream.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+        return {
+            "root_uuid": root_uuid,
+            "assistant_uuid": assistant_uuid,
+            "tool_use_id": resolved_tool_use_id,
+            "tool_input": tool_input,
+            "question": question,
+        }
+
+    def append_audncode_question_answer(self, event: dict, question: dict[str, object]) -> dict:
+        answer_uuid = str(uuid.uuid4())
+        answer_entry = {
+            "parentUuid": question["assistant_uuid"],
+            "isSidechain": False,
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": question["tool_use_id"],
+                        "content": "L'utente ha scelto: Prima",
+                    }
+                ],
+            },
+            "uuid": answer_uuid,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "sessionId": event["session_id"],
+        }
+        with Path(event["transcript_path"]).open(
+            "a", encoding="utf-8", newline="\n"
+        ) as stream:
+            stream.write(json.dumps(answer_entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+        return {
+            "hook_event_name": "PostToolUse",
+            "session_id": event["session_id"],
+            "transcript_path": event["transcript_path"],
+            "cwd": event.get("cwd", ""),
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": question["tool_use_id"],
+            "tool_input": question["tool_input"],
+            "tool_response": {"answers": {"Scelta": "Prima"}},
+        }
+
     def audncode_cron_tool_event(
         self,
         event: dict,
@@ -1371,6 +1835,7 @@ while True:
         host: tuple[subprocess.Popen[bytes], int],
         delay_input_ms: int = 0,
         hold_stdin_open: bool = False,
+        close_stdin_after_ms: int = 0,
         child_started_path: Path | None = None,
         env_overrides: dict[str, str] | None = None,
         expect_success: bool = True,
@@ -1385,6 +1850,7 @@ while True:
             "env": {**self.env, **(env_overrides or {})},
             "delay_input_ms": delay_input_ms,
             "hold_stdin_open": hold_stdin_open,
+            "close_stdin_after_ms": close_stdin_after_ms,
         }
         if child_started_path is not None:
             request["child_started_path"] = str(child_started_path)
@@ -1393,6 +1859,8 @@ while True:
         response_line = host_process.stdout.readline()
         self.assertTrue(response_line, "AudnCode host exited before raw hook returned")
         response = json.loads(response_line.decode("utf-8"))
+        if close_stdin_after_ms > 0:
+            self.assertFalse(response.get("exited_before_stdin_close"), response)
         result = subprocess.CompletedProcess(
             command,
             int(response["returncode"]),
@@ -1506,7 +1974,14 @@ while True:
     def state_debug(self) -> str:
         files = {
             name: [path.name for path in (self.state / name).glob("*.json")]
-            for name in ("pending", "outbox", "sent", "suppressed", "dead")
+            for name in (
+                "pending",
+                "outbox",
+                "sent",
+                "suppressed",
+                "dead",
+                "recovery-journals",
+            )
         }
         pending_details: list[dict] = []
         for pending_path in (self.state / "pending").glob("*.json"):
@@ -2152,6 +2627,337 @@ $sddl = $sddl -replace 'D:(P?)(AR)?AI(?=\()', 'D:$1$2'
                 with self.server.lock:
                     self.server.payloads.clear()
 
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows PowerShell test")
+    def test_coalesce_retries_after_legacy_revision_migration_without_double_delivery(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            watch_rollouts=False,
+            suppress_technical_turns=True,
+        )
+        thread_id = str(uuid.uuid4())
+        old_turn = "00000000-0000-7000-8000-000000000101"
+        new_turn = "00000000-0000-7000-8000-000000000102"
+        rollout = self.write_session_meta(thread_id, subagent=False)
+        for turn_id, message in (
+            (old_turn, "LEGACY INTERMEDIATE"),
+            (new_turn, "MODERN FINAL"),
+        ):
+            self.append_rollout(rollout, "task_started", turn_id=turn_id)
+            self.append_rollout(rollout, "user_message", message="Continue")
+            self.append_rollout(
+                rollout,
+                "task_complete",
+                turn_id=turn_id,
+                message=message,
+            )
+            event = self.event(thread_id=thread_id, turn_id=turn_id)
+            event["last-assistant-message"] = message
+            self.run_ok(self.hook_command("powershell", event))
+
+        pending_by_turn: dict[str, tuple[Path, dict]] = {}
+        for path in (self.state / "pending").glob("*.json"):
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
+            pending_by_turn[str(record["turn_id"])] = (path, record)
+        self.assertEqual(set(pending_by_turn), {old_turn, new_turn}, self.state_debug())
+        old_path, old_record = pending_by_turn[old_turn]
+        new_path, new_record = pending_by_turn[new_turn]
+        self.assertRegex(new_record["candidate_revision"], r"^[0-9a-f]{32}$")
+        old_record.pop("candidate_revision", None)
+        old_path.write_text(
+            json.dumps(old_record, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        # The one-shot worker must retry coalescing after it atomically adds the
+        # legacy token; only the reread snapshot may suppress the predecessor.
+        self.run_ok(self.worker_command("powershell"), timeout=60)
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertIn("MODERN FINAL", payloads[0]["message"])
+        self.assertNotIn("LEGACY INTERMEDIATE", payloads[0]["message"])
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 1, self.state_debug())
+
+        suppressed_paths = list((self.state / "suppressed").glob("*.json"))
+        sent_paths = list((self.state / "sent").glob("*.json"))
+        self.assertEqual(len(suppressed_paths), 1, self.state_debug())
+        self.assertEqual(len(sent_paths), 1, self.state_debug())
+        suppression = json.loads(
+            suppressed_paths[0].read_text(encoding="utf-8-sig")
+        )
+        sent = json.loads(sent_paths[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(suppression["schema"], 2, suppression)
+        self.assertEqual(suppression["reason"], "superseded", suppression)
+        self.assertEqual(suppression["key"], old_record["key"], suppression)
+        self.assertRegex(suppression["candidate_revision"], r"^[0-9a-f]{32}$")
+        self.assertEqual(sent["key"], new_record["key"], sent)
+        self.assertFalse(old_path.exists(), self.state_debug())
+        self.assertFalse(new_path.exists(), self.state_debug())
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "dead").glob("*.json")), self.state_debug())
+
+        log = (self.state / "notify.log").read_text(
+            encoding="utf-8-sig", errors="replace"
+        )
+        migration_entry = (
+            "migrated legacy queue candidate revision "
+            f"key={str(old_record['key'])[:12]}"
+        )
+        superseded_entry = (
+            f"superseded idle candidate key={str(old_record['key'])[:12]}"
+        )
+        self.assertEqual(log.count(migration_entry), 1, log)
+        # A premature declaration on the migration attempt would yield a second
+        # superseded line before the sole durable receipt is eventually written.
+        self.assertEqual(log.count(superseded_entry), 1, log)
+        self.assertLess(log.index(migration_entry), log.index(superseded_entry), log)
+        self.assertNotIn(
+            f"superseded idle candidate key={str(new_record['key'])[:12]}",
+            log,
+        )
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_question_intervention_uses_session_then_record_lock_order(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.audncode_home / "projects" / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.audncode_event(session_id=session_id, transcript_path=transcript)
+        self.run_audncode_hook(
+            self.audncode_prompt_event(event, prompt="Prepare the lock-order question")
+        )
+        question_text = "Confermi il deploy concorrente?"
+        question = self.append_audncode_question(event, question=question_text)
+        session_state_path, session_state = self.read_audncode_session_state(session_id)
+        session_state["prompt_id"] = question["root_uuid"]
+        session_state_path.write_text(
+            json.dumps(session_state, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        permission = self.audncode_idle_event(
+            event, notification_type="permission_prompt"
+        )
+
+        # Seed the exact intervention record, then place it back in pending to
+        # model a worker promotion racing a duplicate permission_prompt for the
+        # same proof/key.
+        self.run_audncode_hook(permission)
+        outbox_paths = list((self.state / "outbox").glob("*.json"))
+        self.assertEqual(len(outbox_paths), 1, self.state_debug())
+        intervention = json.loads(outbox_paths[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(intervention["candidate_kind"], "audncode_intervention")
+        pending_path = self.state / "pending" / outbox_paths[0].name
+        os.replace(outbox_paths[0], pending_path)
+
+        record_lock = (
+            self.state
+            / "mutation-locks"
+            / f"{str(intervention['key'])[:2]}.lock"
+        )
+        session_key = hashlib.sha256(
+            f"codex-ntfy/v1|claude-session|{session_id}".encode("utf-8")
+        ).hexdigest()
+        session_lock = self.state / "claude-sessions" / f"{session_key}.lock"
+        holder_marker = self.temp / "question-record-lock-held.marker"
+        holder_release = self.temp / "question-record-lock.release"
+        final_gate_marker = self.temp / "question-final-gate.marker"
+        final_gate_release = self.temp / "question-final-gate.release"
+        holder_command = [
+            str(WINDOWS_POWERSHELL),
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            r"""
+$stream = $null
+try {
+  $stream = [IO.File]::Open(
+    $env:CODEX_NTFY_TEST_LOCK_PATH,
+    [IO.FileMode]::OpenOrCreate,
+    [IO.FileAccess]::ReadWrite,
+    [IO.FileShare]::None
+  )
+  [IO.File]::WriteAllText(
+    $env:CODEX_NTFY_TEST_LOCK_MARKER,
+    'locked',
+    (New-Object Text.UTF8Encoding($false))
+  )
+  $deadline = [DateTimeOffset]::UtcNow.AddSeconds(15)
+  while (-not (Test-Path -LiteralPath $env:CODEX_NTFY_TEST_LOCK_RELEASE -PathType Leaf) -and
+      [DateTimeOffset]::UtcNow -lt $deadline) {
+    Start-Sleep -Milliseconds 10
+  }
+} finally {
+  if ($null -ne $stream) { $stream.Dispose() }
+}
+""",
+        ]
+        holder_env = {
+            **self.env,
+            "CODEX_NTFY_TEST_LOCK_PATH": str(record_lock),
+            "CODEX_NTFY_TEST_LOCK_MARKER": str(holder_marker),
+            "CODEX_NTFY_TEST_LOCK_RELEASE": str(holder_release),
+        }
+        holder: subprocess.Popen[str] | None = None
+        worker: subprocess.Popen[str] | None = None
+        hook_thread: threading.Thread | None = None
+        hook_results: list[subprocess.CompletedProcess[bytes]] = []
+        hook_errors: list[BaseException] = []
+
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        close_handle = ctypes.windll.kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        invalid_handle = wintypes.HANDLE(-1).value
+
+        def session_lock_is_held() -> bool:
+            handle = create_file(
+                str(session_lock),
+                0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+                0,
+                None,
+                4,  # OPEN_ALWAYS
+                0x00000080,  # FILE_ATTRIBUTE_NORMAL
+                None,
+            )
+            if handle == invalid_handle:
+                return True
+            self.assertTrue(close_handle(handle))
+            return False
+
+        def launch_permission_hook() -> None:
+            try:
+                hook_results.append(
+                    self.run_audncode_hook(
+                        permission,
+                        child_started_path=hook_started,
+                    )
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                hook_errors.append(error)
+
+        hook_started = self.temp / "question-permission-hook.pid"
+        try:
+            worker = subprocess.Popen(
+                self.worker_command("powershell"),
+                env={
+                    **self.env,
+                    "CODEX_NTFY_TEST_AFTER_FINAL_GATE_MS": "10000",
+                    "CODEX_NTFY_TEST_AFTER_FINAL_GATE_MARKER": str(
+                        final_gate_marker
+                    ),
+                    "CODEX_NTFY_TEST_AFTER_FINAL_GATE_RELEASE": str(
+                        final_gate_release
+                    ),
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not final_gate_marker.exists():
+                self.assertIsNone(worker.poll(), self.state_debug())
+                time.sleep(0.01)
+            self.assertTrue(final_gate_marker.exists(), self.state_debug())
+
+            holder = subprocess.Popen(
+                holder_command,
+                env=holder_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not holder_marker.exists():
+                time.sleep(0.01)
+            self.assertTrue(holder_marker.exists(), self.state_debug())
+            final_gate_release.write_text("continue", encoding="ascii")
+
+            deadline = time.monotonic() + 10
+            worker_holds_session = False
+            while time.monotonic() < deadline:
+                if session_lock_is_held():
+                    worker_holds_session = True
+                    break
+                self.assertIsNone(worker.poll(), self.state_debug())
+                time.sleep(0.01)
+            self.assertTrue(worker_holds_session, self.state_debug())
+
+            hook_thread = threading.Thread(
+                target=launch_permission_hook,
+                daemon=True,
+            )
+            hook_thread.start()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not hook_started.exists():
+                time.sleep(0.01)
+            self.assertTrue(hook_started.exists(), self.state_debug())
+            time.sleep(0.15)
+            self.assertTrue(hook_thread.is_alive(), self.state_debug())
+            self.assertTrue(session_lock_is_held(), self.state_debug())
+            holder_release.write_text("release", encoding="ascii")
+
+            assert holder is not None
+            holder_stdout, holder_stderr = holder.communicate(timeout=10)
+            self.assertEqual(
+                holder.returncode,
+                0,
+                f"stdout={holder_stdout}\nstderr={holder_stderr}",
+            )
+            hook_thread.join(timeout=20)
+            self.assertFalse(hook_thread.is_alive(), self.state_debug())
+            if hook_errors:
+                raise hook_errors[0]
+            self.assertEqual(len(hook_results), 1, self.state_debug())
+            self.assertEqual(hook_results[0].returncode, 0)
+            worker_stdout, worker_stderr = worker.communicate(timeout=30)
+            self.assertEqual(
+                worker.returncode,
+                0,
+                f"stdout={worker_stdout}\nstderr={worker_stderr}\n{self.state_debug()}",
+            )
+        finally:
+            if not final_gate_release.exists():
+                final_gate_release.write_text("continue", encoding="ascii")
+            if not holder_release.exists():
+                holder_release.write_text("release", encoding="ascii")
+            if holder is not None and holder.poll() is None:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    holder.communicate(timeout=5)
+            if hook_thread is not None and hook_thread.is_alive():
+                hook_thread.join(timeout=5)
+            if worker is not None and worker.poll() is None:
+                worker.terminate()
+                worker.communicate(timeout=10)
+
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertEqual(payloads[0]["tags"], ["question"])
+        self.assertIn(question_text, payloads[0]["message"])
+        sent_paths = list((self.state / "sent").glob("*.json"))
+        self.assertEqual(len(sent_paths), 1, self.state_debug())
+        sent = json.loads(sent_paths[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(sent["key"], intervention["key"], sent)
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "dead").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "suppressed").glob("*.json")), self.state_debug())
+
     def test_lost_newer_hook_is_recovered_without_an_intermediate_notification(self) -> None:
         self.configure(
             idle_detection_mode="strict",
@@ -2378,6 +3184,112 @@ $sddl = $sddl -replace 'D:(P?)(AR)?AI(?=\()', 'D:$1$2'
                 ]
                 self.assertTrue(any(receipt.get("reason") == "technical-turn" for receipt in receipts))
                 shutil.rmtree(self.state, ignore_errors=True)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows PowerShell test")
+    def test_legacy_queue_candidate_revision_migrates_before_terminal_disposition(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            suppress_technical_turns=True,
+        )
+
+        def enqueue_technical_candidate(label: str) -> Path:
+            thread_id = str(uuid.uuid4())
+            turn_id = str(uuid.uuid4())
+            rollout = self.write_session_meta(thread_id, subagent=False)
+            self.append_rollout(rollout, "task_started", turn_id=turn_id)
+            # No user_message: the strict gate deterministically classifies it
+            # as a technical turn once it sees the terminal rollout event.
+            self.append_rollout(
+                rollout,
+                "task_complete",
+                turn_id=turn_id,
+                message=label,
+            )
+            event = self.event(thread_id=thread_id, turn_id=turn_id)
+            event["last-assistant-message"] = label
+            self.run_ok(self.hook_command("powershell", event))
+            candidates = list((self.state / "pending").glob("*.json"))
+            self.assertEqual(len(candidates), 1, self.state_debug())
+            return candidates[0]
+
+        pending_path = enqueue_technical_candidate("LEGACY REVISION MIGRATION")
+        legacy = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        legacy.pop("candidate_revision", None)
+        pending_path.write_text(
+            json.dumps(legacy, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        migration = subprocess.run(
+            self.worker_command("powershell"),
+            env={
+                **self.env,
+                "CODEX_NTFY_TEST_EXIT_AFTER_CANDIDATE_REVISION_MIGRATION": "1",
+            },
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            migration.returncode,
+            94,
+            f"stdout={migration.stdout}\nstderr={migration.stderr}\n{self.state_debug()}",
+        )
+        migrated = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        revision = migrated.pop("candidate_revision")
+        self.assertRegex(revision, r"^[0-9a-f]{32}$")
+        self.assertEqual(migrated, legacy)
+        self.assertTrue(pending_path.exists(), self.state_debug())
+        self.assertFalse(
+            list((self.state / "suppressed").glob("*.json")),
+            self.state_debug(),
+        )
+        self.assertFalse(list(pending_path.parent.glob("*.tmp")), self.state_debug())
+        migration_log = (self.state / "notify.log").read_text(
+            encoding="utf-8-sig", errors="replace"
+        )
+        self.assertIn("migrated legacy queue candidate revision", migration_log)
+        self.assertNotIn("suppressed technical turn", migration_log)
+
+        # The next pass rereads the durable revision and may now apply the
+        # technical-turn disposition. It must terminate rather than spin.
+        second_started = time.monotonic()
+        self.run_ok(self.worker_command("powershell"), timeout=30)
+        self.assertLess(time.monotonic() - second_started, 15)
+        self.assertFalse(pending_path.exists(), self.state_debug())
+        receipt_path = self.state / "suppressed" / pending_path.name
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(receipt["schema"], 2, receipt)
+        self.assertEqual(receipt["reason"], "technical-turn", receipt)
+        self.assertEqual(receipt["candidate_revision"], revision, receipt)
+        log = (self.state / "notify.log").read_text(
+            encoding="utf-8-sig", errors="replace"
+        )
+        self.assertEqual(log.count("migrated legacy queue candidate revision"), 1)
+
+        # A nonblank malformed revision is corruption, not a legacy record.
+        # Assert-QueuedRecord must dead-letter it and let the one-shot worker exit.
+        receipt_path.unlink()
+        malformed_path = enqueue_technical_candidate("MALFORMED REVISION")
+        malformed = json.loads(malformed_path.read_text(encoding="utf-8-sig"))
+        malformed["candidate_revision"] = "not-a-hex-revision"
+        malformed_path.write_text(
+            json.dumps(malformed, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        malformed_started = time.monotonic()
+        self.run_ok(self.worker_command("powershell"), timeout=30)
+        self.assertLess(time.monotonic() - malformed_started, 15)
+        self.assertFalse(malformed_path.exists(), self.state_debug())
+        dead_path = self.state / "dead" / malformed_path.name
+        dead = json.loads(dead_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(dead["last_error"], "invalid queue JSON", dead)
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
 
     def test_escaped_whitespace_is_not_a_final_message(self) -> None:
         self.configure(
@@ -3778,6 +4690,9 @@ $publicState = $publicProbe.state
         event = self.claude_event(session_id=session_id, transcript_path=transcript)
         self.run_claude_hook(self.claude_prompt_event(event))
         self.run_claude_hook(event)
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        candidate = json.loads(pending[0].read_text(encoding="utf-8-sig"))
 
         marker = self.temp / "before-session-epoch-promote.marker"
         worker_env = {
@@ -3811,8 +4726,9 @@ $publicState = $publicProbe.state
         self.assert_worker_ok(worker, timeout=45)
         with self.server.lock:
             self.assertEqual(self.server.payloads, [], self.state_debug())
-        for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+        for directory in ("pending", "outbox", "sent", "dead"):
             self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+        self.assert_content_free_suppression_receipt(candidate, "stale-session")
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
     def test_claude_unverifiable_session_state_is_terminal_even_during_refresh_race(self) -> None:
@@ -4079,7 +4995,11 @@ $publicState = $publicProbe.state
             while time.time() < deadline:
                 pending = list((self.state / "pending").glob("*.json"))
                 if pending:
-                    record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+                    try:
+                        record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+                    except (OSError, json.JSONDecodeError):
+                        time.sleep(0.05)
+                        continue
                     if record.get("claude_goal_state") == "active":
                         break
                 time.sleep(0.05)
@@ -4222,11 +5142,15 @@ $publicState = $publicProbe.state
         self.run_claude_hook(self.claude_prompt_event(event))
         self.append_claude_goal_status(transcript, met=True, sentinel=True)
         self.run_claude_hook({**event, "last_assistant_message": "Goal cleared."})
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        candidate = json.loads(pending[0].read_text(encoding="utf-8-sig"))
         self.run_ok(self.worker_command("powershell"))
         with self.server.lock:
             self.assertEqual(self.server.payloads, [], self.state_debug())
-        for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+        for directory in ("pending", "outbox", "sent", "dead"):
             self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+        self.assert_content_free_suppression_receipt(candidate, "goal-cancelled")
 
         next_event = self.claude_event(session_id=session_id, transcript_path=transcript)
         self.run_claude_hook(self.claude_prompt_event(next_event))
@@ -4250,12 +5174,16 @@ $publicState = $publicProbe.state
         transcript.write_text("", encoding="utf-8")
         self.append_claude_goal_status(transcript, met=True, sentinel=True)
         self.run_claude_hook({**event, "last_assistant_message": "Goal cleared."})
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        candidate = json.loads(pending[0].read_text(encoding="utf-8-sig"))
         self.run_ok(self.worker_command("powershell"))
 
         with self.server.lock:
             self.assertEqual(self.server.payloads, [], self.state_debug())
-        for directory in ("pending", "outbox", "sent", "suppressed", "dead"):
+        for directory in ("pending", "outbox", "sent", "dead"):
             self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+        self.assert_content_free_suppression_receipt(candidate, "goal-cancelled")
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Claude Code Windows test")
     def test_claude_historical_terminal_markers_do_not_label_later_ordinary_turns(self) -> None:
@@ -4506,6 +5434,170 @@ $publicState = $publicProbe.state
         self.assertTrue(any("Rate limit reached" in payload["message"] for payload in payloads))
         failed_payload = next(payload for payload in payloads if "Rate limit reached" in payload["message"])
         self.assertEqual(failed_payload["tags"], ["warning"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_permission_prompt_is_exact_once_across_resume_and_new_question(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            include_thread_title=True,
+        )
+        session_id = str(uuid.uuid4())
+        transcript = self.audncode_home / "projects" / f"{session_id}.jsonl"
+        title = "Scelta deploy — già pronta 中文"
+        transcript.write_text(
+            json.dumps(
+                {"type": "custom-title", "sessionId": session_id, "customTitle": title},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        event = self.audncode_event(session_id=session_id, transcript_path=transcript)
+        self.run_audncode_hook(self.audncode_prompt_event(event, prompt="Prepara il deploy"))
+        first_text = "Confermi l’opzione ‘Prima’ — sì/no? 中文"
+        self.append_audncode_question(event, question=first_text)
+        permission = self.audncode_idle_event(event, notification_type="permission_prompt")
+
+        self.run_audncode_hooks_concurrently([permission, permission])
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertEqual(payloads[0]["title"], title)
+        self.assertEqual(payloads[0]["tags"], ["question"])
+        self.assertIn(first_text, payloads[0]["message"])
+        self.assertNotIn("Done", payloads[0]["title"])
+        self.assertNotIn("Qwen", payloads[0]["title"])
+        self.assertNotIn("❓", payloads[0]["title"])
+        for mojibake in ("ÔÇ", "├", "Γ£", "≡ƒ", "�"):
+            self.assertNotIn(mojibake, payloads[0]["title"])
+            self.assertNotIn(mojibake, payloads[0]["message"])
+
+        self.run_audncode_hook(self.audncode_session_start_event(event, source="resume"))
+        self.run_audncode_hook(permission)
+        self.run_ok(self.worker_command("powershell"))
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 1, self.state_debug())
+
+        self.run_audncode_hook(
+            self.audncode_prompt_event(event, prompt="Annulla la scelta precedente e chiedine una nuova")
+        )
+        second_text = "Quale ambiente vuoi usare adesso?"
+        self.append_audncode_question(event, question=second_text)
+        self.run_audncode_hook(permission)
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(2)
+        self.assertEqual(len(payloads), 2, self.state_debug())
+        self.assertEqual(payloads[1]["tags"], ["question"])
+        self.assertIn(second_text, payloads[1]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_permission_prompt_rejects_untrusted_or_non_root_question_shapes(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        scenarios = (
+            "spoof-only",
+            "bash-tool",
+            "sidechain",
+            "nested-agent",
+            "multiple-tools",
+            "answered",
+            "provider-error",
+            "invalid-utf8",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                session_id = str(uuid.uuid4())
+                transcript = self.audncode_home / "projects" / f"{session_id}.jsonl"
+                transcript.write_text("", encoding="utf-8")
+                event = self.audncode_event(session_id=session_id, transcript_path=transcript)
+                self.run_audncode_hook(self.audncode_prompt_event(event, prompt=f"Scenario {scenario}"))
+                if scenario == "bash-tool":
+                    self.append_audncode_question(event, tool_name="Bash")
+                elif scenario == "sidechain":
+                    self.append_audncode_question(event, sidechain=True)
+                elif scenario == "nested-agent":
+                    self.append_audncode_question(event, agent_id="a12345678")
+                elif scenario == "multiple-tools":
+                    self.append_audncode_question(event, multiple_tool_calls=True)
+                elif scenario == "answered":
+                    question = self.append_audncode_question(event)
+                    self.append_audncode_question_answer(event, question)
+                elif scenario == "provider-error":
+                    self.append_audncode_question(event)
+                    self.append_audncode_stop_failure_proof(
+                        event,
+                        error="ProviderError",
+                        message="Provider retry exhausted in this transcript tail.",
+                    )
+                elif scenario == "invalid-utf8":
+                    self.append_audncode_question(event)
+                    with transcript.open("ab") as stream:
+                        stream.write(b'{"type":"user","bad":"\xff"}\n')
+                permission = self.audncode_idle_event(
+                    event, notification_type="permission_prompt"
+                )
+                permission["message"] = "AskUserQuestion spoof in Notification text"
+                self.run_audncode_hook(permission)
+                self.assertEqual(
+                    list((self.state / "outbox").glob("*.json")),
+                    [],
+                    self.state_debug(),
+                )
+        self.run_ok(self.worker_command("powershell"))
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_question_answer_opens_one_epoch_before_one_final_completion(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.audncode_home / "projects" / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.audncode_event(
+            session_id=session_id,
+            transcript_path=transcript,
+            message="Risposta finale dopo la scelta.",
+        )
+        self.run_audncode_hook(self.audncode_prompt_event(event, prompt="Chiedi e completa"))
+        question = self.append_audncode_question(event, question="Procedo con la prima opzione?")
+        permission = self.audncode_idle_event(event, notification_type="permission_prompt")
+        self.run_audncode_hook(permission)
+        self.run_ok(self.worker_command("powershell"))
+        self.assertEqual(len(self.wait_for_payloads(1)), 1, self.state_debug())
+        _state_path, before_answer = self.read_audncode_session_state(session_id)
+        old_epoch = int(before_answer["epoch"])
+
+        answer = self.append_audncode_question_answer(event, question)
+        self.run_audncode_hooks_concurrently([answer, answer])
+        _state_path, after_concurrent = self.read_audncode_session_state(session_id)
+        self.assertEqual(int(after_concurrent["epoch"]), old_epoch + 1, self.state_debug())
+        self.assertEqual(
+            after_concurrent["audncode_question_answer_tool_use_id"],
+            question["tool_use_id"],
+        )
+        self.run_audncode_hook(answer)
+        _state_path, after_delayed = self.read_audncode_session_state(session_id)
+        self.assertEqual(int(after_delayed["epoch"]), old_epoch + 1, after_delayed)
+
+        self.run_audncode_hook(permission)
+        self.run_ok(self.worker_command("powershell"))
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 1, self.state_debug())
+
+        self.run_audncode_hook(event)
+        self.run_audncode_hook(self.audncode_idle_event(event))
+        self.run_ok(self.worker_command("powershell"))
+        payloads = self.wait_for_payloads(2)
+        self.assertEqual(len(payloads), 2, self.state_debug())
+        self.assertEqual(payloads[0]["tags"], ["question"])
+        self.assertNotEqual(payloads[1]["tags"], ["question"])
+        self.assertIn("Risposta finale dopo la scelta.", payloads[1]["message"])
+
+        self.run_audncode_hook(event)
+        self.run_audncode_hook(self.audncode_idle_event(event))
+        self.run_ok(self.worker_command("powershell"))
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 2, self.state_debug())
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
     def test_audncode_intermediate_stops_wait_for_idle_and_latest_utf8_result_wins(self) -> None:
@@ -6118,6 +7210,1402 @@ if (-not [string]::Equals([string]$persisted.home, $canonicalHome, [StringCompar
             self.assertIn(message, combined)
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_managed_recovery_suppresses_transient_and_recovered_failures(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        _event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("transient then recovered")
+        )
+        marker_env = {"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)}
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        queued = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        self.assertTrue(queued["audncode_recovery_managed"], queued)
+        self.assertEqual(queued["audncode_recovery_initial_revision"], 1, queued)
+        self.assertEqual(queued["audncode_recovery_observed_revision"], 1, queued)
+        self.assertEqual(queued["audncode_recovery_terminal_hash"], "", queued)
+
+        worker = self.start_worker("powershell")
+        try:
+            deadline = time.monotonic() + 30
+            active: dict[str, object] = {}
+            while time.monotonic() < deadline:
+                pending = list((self.state / "pending").glob("*.json"))
+                if len(pending) == 1:
+                    try:
+                        active = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+                    except (OSError, json.JSONDecodeError):
+                        active = {}
+                    if active.get("gate_reason") == "audncode-managed-recovery-active":
+                        break
+                time.sleep(0.05)
+            self.assertEqual(
+                active.get("gate_reason"), "audncode-managed-recovery-active", active
+            )
+            with self.server.lock:
+                self.assertEqual(self.server.payloads, [], self.state_debug())
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=10)
+
+        recovered = self.transition_audncode_recovery_marker(
+            marker_path,
+            marker,
+            state="recovered",
+            reason="same-session-retry-scheduled",
+            failure_record_uuid=failure_uuid,
+        )
+        time.sleep(0.35)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        for directory in ("pending", "outbox", "sent", "dead"):
+            self.assertFalse(list((self.state / directory).glob("*.json")), self.state_debug())
+        suppressed = list((self.state / "suppressed").glob("*.json"))
+        self.assertEqual(len(suppressed), 1, self.state_debug())
+        self.assertRegex(suppressed[0].name, r"^r-[0-9a-f]{64}\.json$")
+        receipt = json.loads(suppressed[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(receipt["schema"], 1, receipt)
+        self.assertEqual(receipt["reason"], "audncode-managed-recovery-succeeded", receipt)
+        self.assertEqual(receipt["key"], queued["key"], receipt)
+        self.assertEqual(receipt["thread_id"], queued["thread_id"], receipt)
+        self.assertEqual(receipt["turn_id"], queued["turn_id"], receipt)
+        self.assertEqual(receipt["candidate_identity"], queued["candidate_identity"], receipt)
+        self.assertRegex(receipt["candidate_revision"], r"^[0-9a-f]{32}$")
+        self.assertEqual(receipt["audncode_stop_failure_uuid"], failure_uuid, receipt)
+        self.assertEqual(receipt["audncode_recovery_binding"], queued["audncode_recovery_binding"], receipt)
+        self.assertRegex(receipt["audncode_recovery_terminal_hash"], r"^[0-9a-f]{64}$")
+        self.assertIsNone(receipt["successor"], receipt)
+        self.assertEqual(receipt["successor_hash"], "", receipt)
+        receipt_bytes = suppressed[0].read_bytes()
+
+        # Recovery tombstones are not ordinary suppressed receipts. Even an old
+        # valid tombstone must survive maintenance because age cannot prove that
+        # a delayed StopFailure replay is safe. A replay that lost the launcher's
+        # marker environment must still fail closed against the same tombstone.
+        stale = time.time() - (90 * 24 * 60 * 60)
+        os.utime(suppressed[0], (stale, stale))
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        self.assertTrue(suppressed[0].exists(), self.state_debug())
+        self.assertEqual(suppressed[0].read_bytes(), receipt_bytes)
+        self.run_audncode_hook(failure)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+        # A duplicate asynchronous StopFailure can be replayed after the
+        # canonical pending record was removed. Even an adversarial rev2 rewrite
+        # from recovered to exhausted must hit the durable suppression receipt.
+        rewritten = {
+            **recovered,
+            "state": "exhausted",
+            "reason": "launcher-unrecoverable",
+            "updated_unix_ms": int(recovered["updated_unix_ms"]) + 1,
+        }
+        self.write_audncode_recovery_marker(marker_path, rewritten)
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        self.assertEqual(suppressed[0].read_bytes(), receipt_bytes)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_recovered_tombstone_allows_successful_stop_and_blocks_old_failure_replays(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("recovered then successful Stop")
+        )
+        marker_env = {"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)}
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        self.transition_audncode_recovery_marker(
+            marker_path,
+            marker,
+            state="recovered",
+            reason="runtime-completed",
+            failure_record_uuid=failure_uuid,
+        )
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+
+        tombstones = list((self.state / "suppressed").glob("r-*.json"))
+        self.assertEqual(len(tombstones), 1, self.state_debug())
+        tombstone_bytes = tombstones[0].read_bytes()
+        success = {
+            **event,
+            "last_assistant_message": "Recovered provider attempt completed successfully.",
+        }
+        self.run_audncode_hook(success)
+
+        # Replay the exact old asynchronous failure while the successful Stop is
+        # pending. Its random candidate_revision must not replace that Stop.
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        successful_record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(successful_record["candidate_kind"], "audncode_stop", successful_record)
+        cleared_tombstone = json.loads(tombstones[0].read_text(encoding="utf-8-sig"))
+        self.assertIsNone(
+            cleared_tombstone["successor"],
+            {"tombstone": cleared_tombstone, "state": self.state_debug()},
+        )
+        self.assertEqual(cleared_tombstone["successor_hash"], "", cleared_tombstone)
+        self.assertNotIn("Recovered provider attempt completed successfully.", tombstones[0].read_text(encoding="utf-8-sig"))
+        self.run_audncode_hook(self.audncode_idle_event(success))
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertIn("Recovered provider attempt completed successfully.", payloads[0]["message"])
+        self.assertNotIn("Managed provider failure", payloads[0]["message"])
+        self.assertEqual(tombstones[0].read_bytes(), tombstone_bytes)
+
+        # Once the completion is sent, the sent receipt and the identity-specific
+        # recovery tombstone independently prevent the old failure from reviving.
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 1, self.state_debug())
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        self.assertEqual(len(list((self.state / "sent").glob("*.json"))), 1, self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_successful_stop_linearizes_recovery_tombstone_before_worker(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("Stop races recovery tombstone")
+        )
+        marker_env = {"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)}
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        self.transition_audncode_recovery_marker(
+            marker_path,
+            marker,
+            state="recovered",
+            reason="same-session-retry-scheduled",
+            failure_record_uuid=failure_uuid,
+        )
+
+        # No worker has observed rev2 yet. Upgrade-PendingRecordFromStop must
+        # publish the tombstone and replace the old failure under one per-key lock.
+        success = {
+            **event,
+            "last_assistant_message": "Successful Stop won the recovery race.",
+        }
+        self.run_audncode_hook(success)
+        tombstones = list((self.state / "suppressed").glob("r-*.json"))
+        self.assertEqual(len(tombstones), 1, self.state_debug())
+        tombstone_bytes = tombstones[0].read_bytes()
+        pending_path = next((self.state / "pending").glob("*.json"))
+        pending = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(pending["candidate_kind"], "audncode_stop", pending)
+        cleared_tombstone = json.loads(tombstones[0].read_text(encoding="utf-8-sig"))
+        self.assertIsNone(cleared_tombstone["successor"], cleared_tombstone)
+        self.assertEqual(cleared_tombstone["successor_hash"], "", cleared_tombstone)
+        self.assertNotIn("Successful Stop won the recovery race.", tombstones[0].read_text(encoding="utf-8-sig"))
+
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        after_replay = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(after_replay["candidate_revision"], pending["candidate_revision"])
+        self.assertEqual(after_replay["candidate_kind"], "audncode_stop", after_replay)
+        self.assertEqual(tombstones[0].read_bytes(), tombstone_bytes)
+
+        self.run_audncode_hook(self.audncode_idle_event(success))
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertIn("Successful Stop won the recovery race.", payloads[0]["message"])
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 1, self.state_debug())
+
+    @unittest.skipUnless(
+        os.name == "nt"
+        and WINDOWS_POWERSHELL.exists()
+        and POWERSHELL_7 is not None
+        and POWERSHELL_7.exists(),
+        "AudnCode cross-PowerShell recovery test",
+    )
+    def test_audncode_recovery_journal_restores_successful_stop_after_crash_gap(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("journal survives hook crash gap")
+        )
+        marker_env = {"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)}
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        pending_path = next((self.state / "pending").glob("*.json"))
+        self.transition_audncode_recovery_marker(
+            marker_path,
+            marker,
+            state="recovered",
+            reason="runtime-completed",
+            failure_record_uuid=failure_uuid,
+        )
+
+        success = {
+            **event,
+            "last_assistant_message": "Journal <Qwen & recovery> restored 'successfully'.",
+        }
+        crashed = self.run_audncode_hook(
+            success,
+            env_overrides={"CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_JOURNAL": "1"},
+            expect_success=False,
+        )
+        self.assertEqual(crashed.returncode, 91, crashed.stderr.decode("utf-8", errors="replace"))
+        tombstone_path = next((self.state / "suppressed").glob("r-*.json"))
+        tombstone = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+        self.assertIsInstance(tombstone.get("successor"), str, tombstone)
+        journaled_successor = json.loads(tombstone["successor"])
+        self.assertEqual(journaled_successor["candidate_kind"], "audncode_stop", tombstone)
+        self.assertRegex(str(tombstone.get("successor_hash", "")), r"^[0-9a-f]{64}$")
+        journal_indexes = list((self.state / "recovery-journals").glob("r-*.json"))
+        self.assertEqual(len(journal_indexes), 1, self.state_debug())
+        self.assertEqual(journal_indexes[0].name, tombstone_path.name)
+
+        # The PS5 hook exited after the write-ahead commit but before the pending
+        # replacement. Force a PS7 crash immediately after restoring the Stop so
+        # the second two-file gap is deterministic rather than timing-dependent.
+        worker_command = self.worker_command("powershell")
+        worker_command[0] = str(POWERSHELL_7)
+        restore_env = {
+            **self.env,
+            "CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_SUCCESSOR_WRITE": "1",
+        }
+        restoring = subprocess.run(
+            worker_command,
+            env=restore_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(
+            restoring.returncode,
+            92,
+            {"stdout": restoring.stdout, "stderr": restoring.stderr, "state": self.state_debug()},
+        )
+        restored_text = pending_path.read_text(encoding="utf-8-sig")
+        restored = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(
+            restored["candidate_kind"],
+            "audncode_stop",
+            {
+                "record": restored,
+                "state": self.state_debug(),
+                "worker_stdout": restoring.stdout,
+                "worker_stderr": restoring.stderr,
+            },
+        )
+        self.assertEqual(
+            restored["event"]["last-assistant-message"],
+            "Journal <Qwen & recovery> restored 'successfully'.",
+            restored,
+        )
+        still_journaled = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+        self.assertIsInstance(still_journaled.get("successor"), str, still_journaled)
+        self.assertEqual(
+            len(list((self.state / "recovery-journals").glob("r-*.json"))),
+            1,
+            self.state_debug(),
+        )
+
+        # Force the third crash gap too: privacy-bearing content is erased first,
+        # while the content-free active index is deliberately left for restart.
+        clear_env = {
+            **self.env,
+            "CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_JOURNAL_CLEAR": "1",
+        }
+        clearing = subprocess.run(
+            worker_command,
+            env=clear_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(
+            clearing.returncode,
+            93,
+            {"stdout": clearing.stdout, "stderr": clearing.stderr, "state": self.state_debug()},
+        )
+        privacy_cleared = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+        self.assertIsNone(privacy_cleared.get("successor"), privacy_cleared)
+        self.assertEqual(privacy_cleared.get("successor_hash"), "", privacy_cleared)
+        self.assertEqual(pending_path.read_text(encoding="utf-8-sig"), restored_text)
+        self.assertEqual(
+            len(list((self.state / "recovery-journals").glob("r-*.json"))),
+            1,
+            self.state_debug(),
+        )
+
+        # A clean PS7 restart removes only the stale content-free index and leaves
+        # the durable Stop bytes untouched.
+        cleanup_command = self.worker_command("powershell")
+        cleanup_command[0] = str(POWERSHELL_7)
+        cleanup_worker = subprocess.Popen(
+            cleanup_command,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            cleanup_deadline = time.monotonic() + 30
+            while time.monotonic() < cleanup_deadline:
+                if not list((self.state / "recovery-journals").glob("r-*.json")):
+                    break
+                time.sleep(0.05)
+        finally:
+            if cleanup_worker.poll() is None:
+                cleanup_worker.terminate()
+            cleanup_worker.communicate(timeout=10)
+        cleared_tombstone = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(pending_path.read_text(encoding="utf-8-sig"), restored_text)
+        self.assertIsNone(
+            cleared_tombstone["successor"],
+            {"tombstone": cleared_tombstone, "state": self.state_debug()},
+        )
+        self.assertEqual(cleared_tombstone["successor_hash"], "", cleared_tombstone)
+        tombstone_text = tombstone_path.read_text(encoding="utf-8-sig")
+        self.assertNotIn("Qwen", tombstone_text)
+        self.assertNotIn(str(self.audncode_home), tombstone_text)
+        self.assertNotIn(str(event["transcript_path"]), tombstone_text)
+        self.assertFalse(
+            list((self.state / "recovery-journals").glob("r-*.json")),
+            self.state_debug(),
+        )
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+        self.run_audncode_hook(self.audncode_idle_event(success))
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertIn("Journal <Qwen & recovery> restored 'successfully'.", payloads[0]["message"])
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 1, self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_recovery_journal_clears_after_exact_coalescing_suppression(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("journal coalescing cleanup")
+        )
+        marker_env = {"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)}
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        pending_path = next((self.state / "pending").glob("*.json"))
+        durable_failure = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        self.transition_audncode_recovery_marker(
+            marker_path,
+            marker,
+            state="recovered",
+            reason="runtime-completed",
+            failure_record_uuid=failure_uuid,
+        )
+
+        success = {
+            **event,
+            "last_assistant_message": "Coalesced private recovery journal content.",
+        }
+        crashed = self.run_audncode_hook(
+            success,
+            env_overrides={"CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_JOURNAL": "1"},
+            expect_success=False,
+        )
+        self.assertEqual(crashed.returncode, 91, crashed.stderr.decode("utf-8", errors="replace"))
+        tombstone_path = next((self.state / "suppressed").glob("r-*.json"))
+        self.assertEqual(
+            len(list((self.state / "recovery-journals").glob("r-*.json"))),
+            1,
+            self.state_debug(),
+        )
+
+        # Reproduce the durable state left when coalescing supersedes the old
+        # failure between receipt publication and successor restoration.
+        superseded_path = self.state / "suppressed" / f"{durable_failure['key']}.json"
+        superseded_path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "key": durable_failure["key"],
+                    "thread_id": durable_failure["thread_id"],
+                    "turn_id": durable_failure["turn_id"],
+                    "origin": durable_failure["origin"],
+                    "candidate_revision": durable_failure["candidate_revision"],
+                    "suppressed_at": "2026-08-30T00:00:00+00:00",
+                    "reason": "superseded",
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        pending_path.unlink()
+
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        cleared_tombstone = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+        self.assertIsNone(cleared_tombstone["successor"], cleared_tombstone)
+        self.assertEqual(cleared_tombstone["successor_hash"], "", cleared_tombstone)
+        tombstone_text = tombstone_path.read_text(encoding="utf-8-sig")
+        self.assertNotIn("Coalesced private recovery journal content", tombstone_text)
+        self.assertNotIn(str(self.audncode_home), tombstone_text)
+        self.assertNotIn(str(event["transcript_path"]), tombstone_text)
+        self.assertFalse(
+            list((self.state / "recovery-journals").glob("r-*.json")),
+            self.state_debug(),
+        )
+        self.assertTrue(superseded_path.exists(), self.state_debug())
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_recovery_journal_cleans_logical_s2_but_retains_identity_drift(self) -> None:
+        matching = self.seed_audncode_recovery_journal_fixture("durable-s2")
+        matching_s1 = matching["successor"]
+        self.assertIsInstance(matching_s1, dict)
+        matching_s2 = json.loads(json.dumps(matching_s1))
+        matching_s2["candidate_revision"] = uuid.uuid4().hex
+        matching_s2["created_unix_ms"] = int(matching_s2["created_unix_ms"]) + 1
+        matching_s2["next_attempt_unix_ms"] = int(time.time() * 1000) + 5000
+        matching_s2["attempts"] = 3
+        matching_s2["last_error"] = "transient retry after S2"
+        matching_s2["event"]["last-assistant-message"] = (
+            "newer durable S2 with different private content"
+        )
+        self.assertNotEqual(
+            matching_s2["candidate_revision"], matching_s1["candidate_revision"]
+        )
+
+        drifted = self.seed_audncode_recovery_journal_fixture("identity-drift")
+        drifted_s1 = drifted["successor"]
+        self.assertIsInstance(drifted_s1, dict)
+        drifted_s2 = json.loads(json.dumps(drifted_s1))
+        drifted_s2["candidate_revision"] = uuid.uuid4().hex
+        drifted_s2["origin"] = "audncode-identity-drift"
+        drifted_s2["event"]["last-assistant-message"] = "identity drift must retain S1"
+
+        dead_dir = self.state / "dead"
+        dead_dir.mkdir(parents=True, exist_ok=True)
+        matching_dead = dead_dir / f"{matching['key']}.json"
+        drifted_dead = dead_dir / f"{drifted['key']}.json"
+        matching_dead.write_text(
+            json.dumps(matching_s2, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        drifted_dead.write_text(
+            json.dumps(drifted_s2, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        matching_dead_bytes = matching_dead.read_bytes()
+        drifted_dead_bytes = drifted_dead.read_bytes()
+
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+
+        matching_tombstone_path = matching["tombstone_path"]
+        matching_index_path = matching["index_path"]
+        self.assertIsInstance(matching_tombstone_path, Path)
+        self.assertIsInstance(matching_index_path, Path)
+        matching_tombstone = json.loads(
+            matching_tombstone_path.read_text(encoding="utf-8-sig")
+        )
+        self.assertIsNone(matching_tombstone["successor"], matching_tombstone)
+        self.assertEqual(matching_tombstone["successor_hash"], "", matching_tombstone)
+        self.assertFalse(matching_index_path.exists(), self.state_debug())
+        self.assertNotIn(
+            str(matching["private_sentinel"]),
+            matching_tombstone_path.read_text(encoding="utf-8-sig"),
+        )
+        self.assertEqual(matching_dead.read_bytes(), matching_dead_bytes)
+
+        drifted_tombstone_path = drifted["tombstone_path"]
+        drifted_index_path = drifted["index_path"]
+        self.assertIsInstance(drifted_tombstone_path, Path)
+        self.assertIsInstance(drifted_index_path, Path)
+        drifted_tombstone = json.loads(
+            drifted_tombstone_path.read_text(encoding="utf-8-sig")
+        )
+        self.assertIsInstance(drifted_tombstone["successor"], str, drifted_tombstone)
+        self.assertRegex(drifted_tombstone["successor_hash"], r"^[0-9a-f]{64}$")
+        self.assertTrue(drifted_index_path.exists(), self.state_debug())
+        self.assertIn(
+            str(drifted["private_sentinel"]),
+            drifted_tombstone_path.read_text(encoding="utf-8-sig"),
+        )
+        self.assertEqual(drifted_dead.read_bytes(), drifted_dead_bytes)
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_recovery_schema2_suppression_cleanup_matrix(self) -> None:
+        terminal_reasons = (
+            "subagent",
+            "technical-turn",
+            "superseded",
+            "unverifiable",
+            "claude-session-unverifiable",
+            "stale-session",
+            "goal-cancelled",
+        )
+        successor_cases: dict[str, dict[str, object]] = {}
+        failure_cases: dict[str, dict[str, object]] = {}
+
+        for reason in terminal_reasons:
+            successor_fixture = self.seed_audncode_recovery_journal_fixture(
+                f"suppressed-s2-{reason}"
+            )
+            successor_s1 = successor_fixture["successor"]
+            self.assertIsInstance(successor_s1, dict)
+            successor_s2 = json.loads(json.dumps(successor_s1))
+            successor_s2["candidate_revision"] = uuid.uuid4().hex
+            successor_s2["created_unix_ms"] = int(successor_s2["created_unix_ms"]) + 1
+            successor_s2["event"]["last-assistant-message"] = f"suppressed S2 {reason}"
+            suppression_path = self.write_schema2_terminal_suppression(
+                successor_fixture, successor_s2, reason
+            )
+            successor_cases[reason] = {
+                "fixture": successor_fixture,
+                "suppression_path": suppression_path,
+            }
+
+            failure_fixture = self.seed_audncode_recovery_journal_fixture(
+                f"suppressed-failure-{reason}"
+            )
+            journaled_successor = failure_fixture["successor"]
+            self.assertIsInstance(journaled_successor, dict)
+            failure_record = {
+                "key": journaled_successor["key"],
+                "provider": "claude",
+                "weak_identity": False,
+                "sequence_id": journaled_successor["sequence_id"],
+                "thread_id": journaled_successor["thread_id"],
+                "turn_id": journaled_successor["turn_id"],
+                "origin": journaled_successor["origin"],
+                "candidate_kind": "audncode_stop_failure",
+                "source_event": "StopFailure",
+                "completion_event_type": "task_failed",
+                "candidate_revision": failure_fixture["failure_revision"],
+            }
+            failure_suppression_path = self.write_schema2_terminal_suppression(
+                failure_fixture, failure_record, reason
+            )
+            failure_cases[reason] = {
+                "fixture": failure_fixture,
+                "suppression_path": failure_suppression_path,
+            }
+
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+
+        for reason, case in successor_cases.items():
+            with self.subTest(kind="successor-s2", reason=reason):
+                fixture = case["fixture"]
+                self.assertIsInstance(fixture, dict)
+                tombstone_path = fixture["tombstone_path"]
+                index_path = fixture["index_path"]
+                suppression_path = case["suppression_path"]
+                self.assertIsInstance(tombstone_path, Path)
+                self.assertIsInstance(index_path, Path)
+                self.assertIsInstance(suppression_path, Path)
+                tombstone = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+                suppression = json.loads(
+                    suppression_path.read_text(encoding="utf-8-sig")
+                )
+                self.assertEqual(suppression["schema"], 2, suppression)
+                self.assertEqual(suppression["reason"], reason, suppression)
+                self.assertIsNone(tombstone["successor"], tombstone)
+                self.assertEqual(tombstone["successor_hash"], "", tombstone)
+                self.assertFalse(index_path.exists(), self.state_debug())
+                self.assertNotIn(
+                    str(fixture["private_sentinel"]),
+                    tombstone_path.read_text(encoding="utf-8-sig"),
+                )
+
+        for reason, case in failure_cases.items():
+            with self.subTest(kind="failure", reason=reason):
+                fixture = case["fixture"]
+                self.assertIsInstance(fixture, dict)
+                tombstone_path = fixture["tombstone_path"]
+                index_path = fixture["index_path"]
+                self.assertIsInstance(tombstone_path, Path)
+                self.assertIsInstance(index_path, Path)
+                tombstone = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+                self.assertIsNone(tombstone["successor"], tombstone)
+                self.assertEqual(tombstone["successor_hash"], "", tombstone)
+                self.assertFalse(index_path.exists(), self.state_debug())
+                self.assertNotIn(
+                    str(fixture["private_sentinel"]),
+                    tombstone_path.read_text(encoding="utf-8-sig"),
+                )
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_recovery_terminal_failure_receipt_wins_crash_state(self) -> None:
+        pending_dir = self.state / "pending"
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        cases: dict[str, dict[str, object]] = {}
+
+        for reason in ("technical-turn", "unverifiable"):
+            fixture = self.seed_audncode_recovery_journal_fixture(
+                f"pending-failure-{reason}"
+            )
+            successor = fixture["successor"]
+            tombstone_path = fixture["tombstone_path"]
+            self.assertIsInstance(successor, dict)
+            self.assertIsInstance(tombstone_path, Path)
+            tombstone = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+            failure = json.loads(json.dumps(successor))
+            failure.update(
+                {
+                    "candidate_kind": "audncode_stop_failure",
+                    "source_event": "StopFailure",
+                    "completion_event_type": "task_failed",
+                    "candidate_revision": fixture["failure_revision"],
+                    "candidate_identity": tombstone["candidate_identity"],
+                    "audncode_stop_failure_uuid": tombstone[
+                        "audncode_stop_failure_uuid"
+                    ],
+                    "audncode_recovery_managed": True,
+                    "audncode_recovery_binding": tombstone[
+                        "audncode_recovery_binding"
+                    ],
+                    "audncode_recovery_observed_revision": 2,
+                    "audncode_recovery_terminal_hash": tombstone[
+                        "audncode_recovery_terminal_hash"
+                    ],
+                }
+            )
+            failure["event"]["last-assistant-message"] = (
+                f"terminally suppressed provider failure {reason}"
+            )
+            pending_path = pending_dir / f"{fixture['key']}.json"
+            pending_path.write_text(
+                json.dumps(failure, separators=(",", ":"), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            suppression_path = self.write_schema2_terminal_suppression(
+                fixture, failure, reason
+            )
+            cases[reason] = {
+                "fixture": fixture,
+                "pending_path": pending_path,
+                "suppression_path": suppression_path,
+            }
+
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+
+        for reason, case in cases.items():
+            with self.subTest(reason=reason):
+                fixture = case["fixture"]
+                pending_path = case["pending_path"]
+                suppression_path = case["suppression_path"]
+                self.assertIsInstance(fixture, dict)
+                self.assertIsInstance(pending_path, Path)
+                self.assertIsInstance(suppression_path, Path)
+                tombstone_path = fixture["tombstone_path"]
+                index_path = fixture["index_path"]
+                self.assertIsInstance(tombstone_path, Path)
+                self.assertIsInstance(index_path, Path)
+                tombstone = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+                suppression = json.loads(
+                    suppression_path.read_text(encoding="utf-8-sig")
+                )
+                self.assertEqual(suppression["schema"], 2, suppression)
+                self.assertEqual(suppression["candidate_kind"], "audncode_stop_failure")
+                self.assertEqual(suppression["reason"], reason, suppression)
+                self.assertIsNone(tombstone["successor"], tombstone)
+                self.assertEqual(tombstone["successor_hash"], "", tombstone)
+                self.assertFalse(index_path.exists(), self.state_debug())
+                self.assertFalse(pending_path.exists(), self.state_debug())
+                self.assertNotIn(
+                    str(fixture["private_sentinel"]),
+                    tombstone_path.read_text(encoding="utf-8-sig"),
+                )
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "sent").glob("*.json")), self.state_debug())
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_legacy_empty_revision_suppression_requires_modern_stop_revision(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        session_id = str(uuid.uuid4())
+        transcript = self.audncode_home / "projects" / f"{session_id}.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.audncode_event(session_id=session_id, transcript_path=transcript)
+        self.run_audncode_hook(
+            self.audncode_prompt_event(event, prompt="Revive legacy suppression")
+        )
+        _state_path, session_state = self.read_audncode_session_state(session_id)
+        prompt_id = str(session_state["prompt_id"])
+        key = hashlib.sha256(
+            f"codex-ntfy/v1|claude|{session_id}|{prompt_id}".encode("utf-8")
+        ).hexdigest()
+        suppressed_dir = self.state / "suppressed"
+        suppressed_dir.mkdir(parents=True, exist_ok=True)
+        suppression_path = suppressed_dir / f"{key}.json"
+
+        def write_legacy_suppression() -> None:
+            suppression_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "key": key,
+                        "thread_id": session_id,
+                        "turn_id": prompt_id,
+                        "origin": "audncode",
+                        "candidate_revision": "",
+                        "suppressed_at": datetime.now(timezone.utc).isoformat(),
+                        "reason": "technical-turn",
+                    },
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+
+        write_legacy_suppression()
+        self.run_audncode_hook(
+            {**event, "last_assistant_message": "Modern Stop revives legacy receipt."}
+        )
+        pending_path = self.state / "pending" / f"{key}.json"
+        self.assertTrue(pending_path.exists(), self.state_debug())
+        modern = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        self.assertRegex(modern["candidate_revision"], r"^[0-9a-f]{32}$")
+        self.assertFalse(suppression_path.exists(), self.state_debug())
+
+        modern["candidate_revision"] = ""
+        pending_path.write_text(
+            json.dumps(modern, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        write_legacy_suppression()
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        self.assertFalse(pending_path.exists(), self.state_debug())
+        self.assertTrue(suppression_path.exists(), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "sent").glob("*.json")), self.state_debug())
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_direct_delete_keeps_stop_when_active_journal_index_is_malformed(self) -> None:
+        fixture = self.seed_audncode_recovery_journal_fixture("malformed-active-index")
+        successor = fixture["successor"]
+        index_path = fixture["index_path"]
+        tombstone_path = fixture["tombstone_path"]
+        self.assertIsInstance(successor, dict)
+        self.assertIsInstance(index_path, Path)
+        self.assertIsInstance(tombstone_path, Path)
+
+        transcript = self.temp / "direct-delete-malformed-index.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        event = self.claude_event(
+            session_id=str(successor["thread_id"]),
+            prompt_id=str(successor["turn_id"]),
+            transcript_path=transcript,
+        )
+        self.run_claude_hook(self.claude_prompt_event(event))
+        pending_dir = self.state / "pending"
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        pending_path = pending_dir / f"{fixture['key']}.json"
+        pending_path.write_text(
+            json.dumps(successor, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        pending_bytes = pending_path.read_bytes()
+        index_path.write_bytes(b"{malformed-active-index")
+
+        self.run_claude_hook(
+            {
+                **event,
+                "background_tasks": [{"task_id": "still-active"}],
+                "session_crons": [],
+            }
+        )
+
+        self.assertTrue(pending_path.exists(), self.state_debug())
+        self.assertEqual(pending_path.read_bytes(), pending_bytes)
+        self.assertEqual(index_path.read_bytes(), b"{malformed-active-index")
+        tombstone = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+        self.assertIsInstance(tombstone["successor"], str, tombstone)
+        self.assertRegex(tombstone["successor_hash"], r"^[0-9a-f]{64}$")
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_recovery_tombstone_corruption_keeps_canonical_failure(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("corrupt identity receipt")
+        )
+        marker_env = {"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)}
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        pending_path = next((self.state / "pending").glob("*.json"))
+        self.transition_audncode_recovery_marker(
+            marker_path,
+            marker,
+            state="recovered",
+            reason="runtime-completed",
+            failure_record_uuid=failure_uuid,
+        )
+
+        # Exit at the deterministic write-ahead crash point, then corrupt that
+        # permanent identity receipt. The worker must keep the old failure and
+        # the malformed tombstone quarantined indefinitely.
+        crashed = self.run_audncode_hook(
+            {**event, "last_assistant_message": "Completion after receipt repair."},
+            env_overrides={"CODEX_NTFY_TEST_EXIT_AFTER_RECOVERY_JOURNAL": "1"},
+            expect_success=False,
+        )
+        self.assertEqual(crashed.returncode, 91, crashed.stderr.decode("utf-8", errors="replace"))
+        tombstone_path = next((self.state / "suppressed").glob("r-*.json"))
+        corrupt = json.loads(tombstone_path.read_text(encoding="utf-8-sig"))
+        corrupt["candidate_identity"] = "f" * 64
+        tombstone_path.write_text(json.dumps(corrupt), encoding="utf-8")
+        stale = time.time() - (90 * 24 * 60 * 60)
+        os.utime(tombstone_path, (stale, stale))
+        canonical_bytes = pending_path.read_bytes()
+
+        worker = self.start_worker("powershell")
+        try:
+            deadline = time.monotonic() + 30
+            log_text = ""
+            last_log_error: OSError | None = None
+            expected_log_entry = (
+                "kept AudnCode provider failure with unverifiable recovery receipt"
+            )
+            while time.monotonic() < deadline:
+                log_path = self.state / "notify.log"
+                try:
+                    if log_path.exists():
+                        log_text = log_path.read_text(
+                            encoding="utf-8-sig", errors="replace"
+                        )
+                        if expected_log_entry in log_text:
+                            break
+                except OSError as error:
+                    # Write-RuntimeLog may briefly own an incompatible Windows
+                    # sharing handle while this live worker appends the entry.
+                    # Keep the bounded poll; a persistent ACL error still fails
+                    # below and is reported explicitly.
+                    last_log_error = error
+                time.sleep(0.05)
+            self.assertIn(
+                expected_log_entry,
+                log_text,
+                f"last_log_error={last_log_error!r}\n{self.state_debug()}",
+            )
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=10)
+        self.assertTrue(pending_path.exists(), self.state_debug())
+        self.assertEqual(pending_path.read_bytes(), canonical_bytes)
+        self.assertTrue(tombstone_path.exists(), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_managed_recovery_duplicate_reingress_keeps_first_terminal_hash(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        _event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("duplicate terminal reingress")
+        )
+        marker_env = {"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)}
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+
+        recovered = self.transition_audncode_recovery_marker(
+            marker_path,
+            marker,
+            state="recovered",
+            reason="runtime-completed",
+            failure_record_uuid=failure_uuid,
+        )
+        # The duplicate is ingested while the original candidate is still
+        # pending. It must atomically attach the first terminal hash to that
+        # canonical record instead of replacing its candidate revision.
+        pending_path = next((self.state / "pending").glob("*.json"))
+        before = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        first_terminal = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(first_terminal["candidate_revision"], before["candidate_revision"])
+        self.assertEqual(first_terminal["audncode_recovery_observed_revision"], 2)
+        self.assertRegex(first_terminal["audncode_recovery_terminal_hash"], r"^[0-9a-f]{64}$")
+
+        rewritten = {
+            **recovered,
+            "state": "exhausted",
+            "reason": "rollover-budget-exhausted",
+            "updated_unix_ms": int(recovered["updated_unix_ms"]) + 1,
+        }
+        self.write_audncode_recovery_marker(marker_path, rewritten)
+        self.run_audncode_hook(failure, env_overrides=marker_env)
+        after_rewrite = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(after_rewrite["candidate_revision"], before["candidate_revision"])
+        self.assertEqual(
+            after_rewrite["audncode_recovery_terminal_hash"],
+            first_terminal["audncode_recovery_terminal_hash"],
+        )
+
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        suppressed = list((self.state / "suppressed").glob("*.json"))
+        self.assertEqual(len(suppressed), 1, self.state_debug())
+        receipt = json.loads(suppressed[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(receipt["reason"], "unverifiable", receipt)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_managed_recovery_exhausted_persists_and_notifies_exactly_once(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        _event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("terminal exhaustion")
+        )
+        self.run_audncode_hook(
+            failure,
+            env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)},
+        )
+        self.transition_audncode_recovery_marker(
+            marker_path,
+            marker,
+            state="exhausted",
+            reason="rollover-budget-exhausted",
+            failure_record_uuid=failure_uuid,
+        )
+        time.sleep(1.4)
+
+        barrier = self.temp / "recovery-before-third-gate"
+        release = self.temp / "recovery-before-third-gate-release"
+        worker = subprocess.Popen(
+            self.worker_command("powershell"),
+            env={
+                **self.env,
+                "CODEX_NTFY_TEST_BEFORE_PROMOTE_MS": "10000",
+                "CODEX_NTFY_TEST_BEFORE_PROMOTE_MARKER": str(barrier),
+                "CODEX_NTFY_TEST_BEFORE_PROMOTE_RELEASE": str(release),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not barrier.exists():
+                time.sleep(0.05)
+            self.assertTrue(barrier.exists(), self.state_debug())
+            pending = list((self.state / "pending").glob("*.json"))
+            self.assertEqual(len(pending), 1, self.state_debug())
+            durable = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+            self.assertEqual(durable["audncode_recovery_observed_revision"], 2, durable)
+            self.assertRegex(durable["audncode_recovery_terminal_hash"], r"^[0-9a-f]{64}$")
+            release.write_text("continue", encoding="ascii")
+            self.assert_worker_ok(worker, timeout=120)
+        finally:
+            release.write_text("continue", encoding="ascii")
+            if worker.poll() is None:
+                worker.terminate()
+                worker.communicate(timeout=10)
+
+        payloads = self.wait_for_payloads(1)
+        self.assertEqual(len(payloads), 1, self.state_debug())
+        self.assertIn("Managed provider failure terminal exhaustion", payloads[0]["message"])
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 1, self.state_debug())
+        self.assertEqual(len(list((self.state / "sent").glob("*.json"))), 1, self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_managed_recovery_accepts_terminal_before_and_during_ingress(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+
+        before_event, before_failure, before_uuid, _unused_path, _unused_marker = (
+            self.prepare_audncode_managed_failure("terminal before ingress")
+        )
+        original_host = self.audncode_hosts[before_event["session_id"]]
+        retired_manager = self.start_audncode_host(before_event["session_id"])
+        self.audncode_hosts[
+            f"{before_event['session_id']}:retired-recovery-manager"
+        ] = retired_manager
+        before_path, before_marker = self.create_audncode_recovery_marker(
+            before_event, host=retired_manager
+        )
+        self.transition_audncode_recovery_marker(
+            before_path,
+            before_marker,
+            state="recovered",
+            reason="runtime-completed",
+            failure_record_uuid=before_uuid,
+        )
+        # The asynchronous hook may not read the marker until the recovery
+        # manager has exited. Keep the prompt-owning host stable so this test
+        # isolates terminal-safe marker attestation from prompt supersession.
+        retired_manager[0].terminate()
+        retired_manager[0].communicate(timeout=10)
+        (
+            self.audncode_home / "sessions" / f"{retired_manager[0].pid}.json"
+        ).unlink(missing_ok=True)
+        self.run_audncode_hook(
+            before_failure,
+            host=original_host,
+            env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(before_path)},
+        )
+        before_pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(before_pending), 1, self.state_debug())
+        before_record = json.loads(before_pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(before_record["audncode_recovery_initial_revision"], 2, before_record)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+
+        _during_event, during_failure, during_uuid, during_path, during_marker = (
+            self.prepare_audncode_managed_failure("terminal during ingress")
+        )
+        observed = self.temp / "recovery-ingress-observed"
+        release = self.temp / "recovery-ingress-release"
+        errors: list[BaseException] = []
+
+        def run_during_ingress() -> None:
+            try:
+                self.run_audncode_hook(
+                    during_failure,
+                    env_overrides={
+                        "CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(during_path),
+                        "CODEX_NTFY_TEST_RECOVERY_INGRESS_MARKER": str(observed),
+                        "CODEX_NTFY_TEST_RECOVERY_INGRESS_RELEASE": str(release),
+                    },
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        hook_thread = threading.Thread(target=run_during_ingress)
+        hook_thread.start()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not observed.exists():
+            time.sleep(0.02)
+        self.assertTrue(observed.exists(), self.state_debug())
+        self.transition_audncode_recovery_marker(
+            during_path,
+            during_marker,
+            state="recovered",
+            reason="rollover-committed",
+            failure_record_uuid=during_uuid,
+        )
+        release.write_text("continue", encoding="ascii")
+        hook_thread.join(timeout=60)
+        self.assertFalse(hook_thread.is_alive(), self.state_debug())
+        if errors:
+            raise errors[0]
+        during_pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(during_pending), 1, self.state_debug())
+        during_record = json.loads(during_pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(during_record["audncode_recovery_initial_revision"], 2, during_record)
+        self.run_ok(self.worker_command("powershell"), timeout=120)
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_managed_recovery_marker_schema_and_identity_fail_closed(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("invalid marker matrix")
+        )
+
+        terminal = {
+            **marker,
+            "state": "exhausted",
+            "revision": 2,
+            "reason": "launcher-unrecoverable",
+            "failure_record_uuid": failure_uuid,
+        }
+        cases: list[tuple[str, dict[str, object]]] = []
+        extra = {**marker, "unexpected": True}
+        cases.append(("extra-property", extra))
+        missing = dict(marker)
+        missing.pop("reason")
+        cases.append(("missing-property", missing))
+        cases.extend(
+            [
+                ("uppercase-d-uuid", {**marker, "manager_instance_id": str(marker["manager_instance_id"]).upper()}),
+                ("n-uuid", {**marker, "session_id": str(marker["session_id"]).replace("-", "")}),
+                ("braced-uuid", {**marker, "operation_id": "{" + str(marker["operation_id"]) + "}"}),
+                ("parenthesized-uuid", {**marker, "attempt_id": "(" + str(marker["attempt_id"]) + ")"}),
+                ("recovering-space-failure", {**marker, "failure_record_uuid": " "}),
+                ("recovering-wrong-reason", {**marker, "reason": "runtime-completed"}),
+                ("recovering-wrong-state", {**marker, "state": "recovered"}),
+                ("revision-three", {**terminal, "revision": 3}),
+                ("recovered-exhausted-reason", {**terminal, "state": "recovered"}),
+                ("exhausted-recovered-reason", {**terminal, "reason": "runtime-completed"}),
+                ("terminal-empty-failure", {**terminal, "failure_record_uuid": ""}),
+                ("terminal-uppercase-failure", {**terminal, "failure_record_uuid": failure_uuid.upper()}),
+                (
+                    "terminal-live-manager-start-drift",
+                    {
+                        **terminal,
+                        "manager_process_start_utc_ticks": int(marker["manager_process_start_utc_ticks"]) + 1,
+                    },
+                ),
+                (
+                    "manager-start-drift",
+                    {
+                        **marker,
+                        "manager_process_start_utc_ticks": int(marker["manager_process_start_utc_ticks"]) + 1,
+                    },
+                ),
+            ]
+        )
+        for label, invalid_marker in cases:
+            with self.subTest(case=label):
+                self.write_audncode_recovery_marker(marker_path, invalid_marker)
+                self.run_audncode_hook(
+                    failure,
+                    env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)},
+                )
+                self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+
+        marker_path.write_bytes(b'{"schema":1,"kind":')
+        self.run_audncode_hook(
+            failure,
+            env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)},
+        )
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        marker_path.unlink()
+        self.run_audncode_hook(
+            failure,
+            env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)},
+        )
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+
+        wrong_parent = (
+            self.audncode_home
+            / "codex-ntfy-recovery"
+            / str(uuid.uuid4())
+            / marker_path.name
+        )
+        wrong_parent.parent.mkdir(parents=True)
+        wrong_parent.write_text(json.dumps(marker), encoding="utf-8")
+        self.run_audncode_hook(
+            failure,
+            env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(wrong_parent)},
+        )
+        wrong_name = marker_path.with_name(f"{uuid.uuid4()}-{marker['attempt_id']}.json")
+        wrong_name.write_text(json.dumps(marker), encoding="utf-8")
+        self.run_audncode_hook(
+            failure,
+            env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(wrong_name)},
+        )
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+
+        self.write_audncode_recovery_marker(marker_path, marker)
+        icacls = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "icacls.exe"
+        acl_result = subprocess.run(
+            [str(icacls), str(marker_path), "/grant", "*S-1-1-0:R"],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(acl_result.returncode, 0, acl_result.stdout + acl_result.stderr)
+        self.run_audncode_hook(
+            failure,
+            env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)},
+        )
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+
+        for label, acl_path in (
+            ("unprotected-marker-acl", marker_path),
+            ("inherited-recovery-root-ace", marker_path.parent.parent),
+        ):
+            with self.subTest(case=label):
+                self.write_audncode_recovery_marker(marker_path, marker)
+                inheritance_result = subprocess.run(
+                    [str(icacls), str(acl_path), "/inheritance:e"],
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(
+                    inheritance_result.returncode,
+                    0,
+                    inheritance_result.stdout + inheritance_result.stderr,
+                )
+                self.run_audncode_hook(
+                    failure,
+                    env_overrides={
+                        "CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)
+                    },
+                )
+                self.assertFalse(
+                    list((self.state / "pending").glob("*.json")), self.state_debug()
+                )
+                self.protect_audncode_recovery_directory(marker_path.parent.parent)
+                self.protect_audncode_recovery_directory(marker_path.parent)
+                self.protect_audncode_recovery_file(marker_path)
+
+        self.write_audncode_recovery_marker(marker_path, marker)
+        self.run_audncode_hook(
+            failure,
+            env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)},
+        )
+        pending = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending), 1, self.state_debug())
+        valid = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(valid["thread_id"], event["session_id"], valid)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_managed_recovery_terminal_rewrite_fails_closed_at_commit(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        _event, failure, failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("terminal rewrite")
+        )
+        self.run_audncode_hook(
+            failure,
+            env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)},
+        )
+        terminal = self.transition_audncode_recovery_marker(
+            marker_path,
+            marker,
+            state="exhausted",
+            reason="launcher-unrecoverable",
+            failure_record_uuid=failure_uuid,
+        )
+        time.sleep(1.4)
+        barrier = self.temp / "recovery-after-final-gate"
+        release = self.temp / "recovery-after-final-gate-release"
+        worker = subprocess.Popen(
+            self.worker_command("powershell"),
+            env={
+                **self.env,
+                "CODEX_NTFY_TEST_AFTER_FINAL_GATE_MS": "10000",
+                "CODEX_NTFY_TEST_AFTER_FINAL_GATE_MARKER": str(barrier),
+                "CODEX_NTFY_TEST_AFTER_FINAL_GATE_RELEASE": str(release),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not barrier.exists():
+                time.sleep(0.05)
+            self.assertTrue(barrier.exists(), self.state_debug())
+            rewritten = {
+                **terminal,
+                "reason": "rollover-unrecoverable",
+                "updated_unix_ms": int(terminal["updated_unix_ms"]) + 1,
+            }
+            self.write_audncode_recovery_marker(marker_path, rewritten)
+            release.write_text("continue", encoding="ascii")
+            self.assert_worker_ok(worker, timeout=120)
+        finally:
+            release.write_text("continue", encoding="ascii")
+            if worker.poll() is None:
+                worker.terminate()
+                worker.communicate(timeout=10)
+        with self.server.lock:
+            self.assertEqual(self.server.payloads, [], self.state_debug())
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        self.assertEqual(len(list((self.state / "suppressed").glob("*.json"))), 1, self.state_debug())
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_managed_recovery_post_attestation_invalidity_never_promotes(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+
+        for mode in ("missing", "corrupt", "identity-drift", "revision-rollback", "manager-exited"):
+            with self.subTest(mode=mode):
+                event, failure, failure_uuid, marker_path, marker = (
+                    self.prepare_audncode_managed_failure(f"post attestation {mode}")
+                )
+                if mode == "revision-rollback":
+                    self.transition_audncode_recovery_marker(
+                        marker_path,
+                        marker,
+                        state="exhausted",
+                        reason="seed-budget-exhausted",
+                        failure_record_uuid=failure_uuid,
+                    )
+                self.run_audncode_hook(
+                    failure,
+                    env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)},
+                )
+                self.assertEqual(
+                    len(list((self.state / "pending").glob("*.json"))),
+                    1,
+                    self.state_debug(),
+                )
+
+                if mode == "missing":
+                    marker_path.unlink()
+                elif mode == "corrupt":
+                    marker_path.write_bytes(b"{not-json")
+                elif mode == "identity-drift":
+                    drifted = {
+                        **marker,
+                        "created_unix_ms": int(marker["created_unix_ms"]) + 1,
+                        "updated_unix_ms": int(marker["updated_unix_ms"]) + 1,
+                    }
+                    self.write_audncode_recovery_marker(marker_path, drifted)
+                elif mode == "revision-rollback":
+                    self.write_audncode_recovery_marker(marker_path, marker)
+                else:
+                    self.exit_audncode_host(event["session_id"])
+
+                self.run_ok(self.worker_command("powershell"), timeout=120)
+                self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+                self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+                with self.server.lock:
+                    self.assertEqual(self.server.payloads, [], self.state_debug())
+
+        self.assertEqual(
+            len(list((self.state / "suppressed").glob("*.json"))), 5, self.state_debug()
+        )
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
+    def test_audncode_managed_recovery_reparse_component_fails_closed(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
+        _event, failure, _failure_uuid, marker_path, marker = (
+            self.prepare_audncode_managed_failure("reparse component")
+        )
+        manager_directory = marker_path.parent
+        outside = self.temp / "outside-recovery-manager"
+        outside.mkdir()
+        outside_marker = outside / marker_path.name
+        outside_marker.write_text(json.dumps(marker), encoding="utf-8")
+        shutil.rmtree(manager_directory)
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(manager_directory), str(outside)],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        if created.returncode != 0:
+            self.skipTest(f"directory junction unavailable: {created.stdout}{created.stderr}")
+        try:
+            self.run_audncode_hook(
+                failure,
+                env_overrides={"CODEX_NTFY_AUDNCODE_RECOVERY_MARKER": str(marker_path)},
+            )
+            self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+            with self.server.lock:
+                self.assertEqual(self.server.payloads, [], self.state_debug())
+        finally:
+            os.rmdir(manager_directory)
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "AudnCode Windows test")
     def test_audncode_stop_failure_binds_the_current_root_chain_for_system_prompts(self) -> None:
         self.configure(idle_detection_mode="strict", idle_grace_seconds=0)
         canonical_task_prompt = """<task-notification>
@@ -6827,15 +9315,28 @@ if (-not [string]::Equals([string]$persisted.home, $canonicalHome, [StringCompar
         try:
             deadline = time.time() + 30
             gate_reason = ""
+            last_pending_error: OSError | json.JSONDecodeError | None = None
             while time.time() < deadline:
                 pending = list((self.state / "pending").glob("*.json"))
                 if len(pending) == 1:
-                    record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
-                    gate_reason = str(record.get("gate_reason", ""))
-                    if gate_reason == "claude-goal-active":
-                        break
+                    try:
+                        record = json.loads(
+                            pending[0].read_text(encoding="utf-8-sig")
+                        )
+                        gate_reason = str(record.get("gate_reason", ""))
+                        if gate_reason == "claude-goal-active":
+                            break
+                    except (OSError, json.JSONDecodeError) as error:
+                        # The live worker can be between an atomic replacement
+                        # and its ACL/share completion. Keep the bounded poll;
+                        # persistent unreadability still fails below.
+                        last_pending_error = error
                 time.sleep(0.05)
-            self.assertEqual(gate_reason, "claude-goal-active", self.state_debug())
+            self.assertEqual(
+                gate_reason,
+                "claude-goal-active",
+                f"last_pending_error={last_pending_error!r}\n{self.state_debug()}",
+            )
             with self.server.lock:
                 self.assertEqual(self.server.payloads, [], self.state_debug())
         finally:
@@ -6978,7 +9479,7 @@ if (-not [string]::Equals([string]$persisted.home, $canonicalHome, [StringCompar
                 log_path = self.state / "notify.log"
                 try:
                     commit_deferred = (
-                        "deferred AudnCode candidate because lifecycle changed"
+                        "deferred AudnCode candidate because lifecycle or recovery changed"
                         in log_path.read_text(encoding="utf-8-sig")
                     )
                 except OSError:
@@ -7811,7 +10312,16 @@ if (-not [string]::Equals([string]$persisted.home, $canonicalHome, [StringCompar
                     with self.server.lock:
                         self.assertEqual(self.server.payloads, [], self.state_debug())
                     for pending_path in (self.state / "pending").glob("*.json"):
-                        pending = json.loads(pending_path.read_text(encoding="utf-8-sig"))
+                        try:
+                            pending = json.loads(
+                                pending_path.read_text(encoding="utf-8-sig")
+                            )
+                        except (OSError, json.JSONDecodeError):
+                            # This poll deliberately overlaps File.Replace while
+                            # another handle temporarily denies delete sharing.
+                            # A transient open/replace window is not malformed
+                            # notifier state; retry the stable snapshot.
+                            continue
                         if pending.get("gate_reason") == expected_reason:
                             observed = True
                             break
@@ -8149,10 +10659,15 @@ if (-not [string]::Equals([string]$persisted.home, $canonicalHome, [StringCompar
             deferred = False
             while time.time() < deadline:
                 log_path = self.state / "notify.log"
-                if log_path.exists() and "deferred AudnCode candidate because lifecycle changed" in log_path.read_text(
-                    encoding="utf-8-sig", errors="replace"
-                ):
-                    deferred = True
+                try:
+                    deferred = (
+                        log_path.exists()
+                        and "deferred AudnCode candidate because lifecycle or recovery changed"
+                        in log_path.read_text(encoding="utf-8-sig", errors="replace")
+                    )
+                except OSError:
+                    deferred = False
+                if deferred:
                     break
                 time.sleep(0.05)
             self.assertTrue(deferred, self.state_debug())
@@ -11130,6 +13645,7 @@ print(child.pid, flush=True)
                     raw,
                     expected_event="PostToolUse",
                     host=host,
+                    close_stdin_after_ms=2000 if index == 2 else 0,
                 )
                 self.assertEqual(result.stdout.decode("utf-8").strip(), "{}")
                 _guard_path, guard = self.read_audncode_ingress_guard(host[0].pid)
@@ -11430,7 +13946,7 @@ try {
             while time.time() < deadline and not lifecycle_deferred:
                 try:
                     lifecycle_deferred = (
-                        "deferred AudnCode candidate because lifecycle changed"
+                        "deferred AudnCode candidate because lifecycle or recovery changed"
                         in (self.state / "notify.log").read_text(encoding="utf-8-sig")
                     )
                 except OSError:
@@ -13911,6 +16427,69 @@ if ($null -ne $candidate) { $candidate | ConvertTo-Json -Compress }
                 self.assertEqual(len(list((self.state / "suppressed").glob("*.json"))), 1)
                 shutil.rmtree(self.state, ignore_errors=True)
 
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows detached worker regression")
+    def test_preclassified_subagent_duplicate_restarts_worker_for_existing_queue_record(self) -> None:
+        thread_id = str(uuid.uuid4())
+        rollout = self.write_session_meta(thread_id, subagent=False)
+        self.index_thread_rollout(thread_id, rollout, subagent=False)
+        event = self.event(thread_id=thread_id)
+
+        # Model a hook that durably committed its canonical record and crashed
+        # before Start-DetachedWorker. The duplicate must not suppress or replace
+        # that record, but it must restore worker liveness.
+        self.run_ok(self.hook_command("powershell", event))
+        queued = list((self.state / "outbox").glob("*.json"))
+        self.assertEqual(len(queued), 1, self.state_debug())
+        canonical = json.loads(queued[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(canonical.get("session_classification"), "root")
+        self.assertFalse(list((self.state / "sent").glob("*.json")))
+
+        duplicate_command = self.hook_command("powershell", event)
+        duplicate_command.remove("-NoSpawn")
+        raw_event = duplicate_command.pop()
+        duplicate_command.extend(["-SessionClassification", "subagent", raw_event])
+        spawn_env = self.env.copy()
+        spawn_env.pop("CODEX_NTFY_NO_SPAWN", None)
+        result = subprocess.run(
+            duplicate_command,
+            env=spawn_env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            log_path = self.state / "notify.log"
+            log = log_path.read_text(encoding="utf-8-sig", errors="replace") if log_path.exists() else ""
+            with self.server.lock:
+                payload_count = len(self.server.payloads)
+            if (
+                payload_count == 1
+                and len(list((self.state / "sent").glob("*.json"))) == 1
+                and not list((self.state / "outbox").glob("*.json"))
+                and "worker stopped" in log
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            health_path = self.state / "worker-health.json"
+            if health_path.exists():
+                with contextlib.suppress(OSError, json.JSONDecodeError, TypeError, ValueError):
+                    worker_pid = int(json.loads(health_path.read_text(encoding="utf-8-sig")).get("pid", 0) or 0)
+                    if self.windows_pid_is_alive(worker_pid):
+                        self.taskkill_tree_if_running(worker_pid)
+            self.fail("detached worker did not dispose the pre-existing queue record\n" + self.state_debug())
+
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 1)
+        self.assertEqual(len(list((self.state / "sent").glob("*.json"))), 1, self.state_debug())
+        self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "suppressed").glob("*.json")), self.state_debug())
+        self.assertFalse(list((self.state / "dead").glob("*.json")), self.state_debug())
+
     def test_spawn_edge_overrides_generic_root_source(self) -> None:
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
@@ -14884,7 +17463,7 @@ print(process.pid, flush=True)
         first_hook_marker = json.loads(first_hook_marker_bytes.decode("utf-8-sig"))
         self.assertEqual(first_hook_marker["kind"], "codex-ntfy-audncode-hooks")
         self.assertEqual(first_hook_marker["notifier_version"], "2.6.0")
-        self.assertEqual(first_hook_marker["hook_shape_version"], 8)
+        self.assertEqual(first_hook_marker["hook_shape_version"], 9)
         self.assertRegex(first_hook_marker["generation"], r"^[a-f0-9]{32}$")
 
         installed = json.loads(settings_path.read_text(encoding="utf-8-sig"))
@@ -14939,7 +17518,7 @@ print(process.pid, flush=True)
                 for handler in group.get("hooks", [])
             )
         ]
-        self.assertEqual(notification_matchers, ["idle_prompt"])
+        self.assertEqual(notification_matchers, ["^(idle_prompt|permission_prompt)$"])
         post_tool_matchers = [
             group.get("matcher")
             for group in installed["hooks"]["PostToolUse"]
@@ -14950,7 +17529,7 @@ print(process.pid, flush=True)
         ]
         self.assertEqual(
             post_tool_matchers,
-            ["Agent|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage"],
+            ["^(Agent|AskUserQuestion|Bash|PowerShell|Monitor|TaskStop|KillShell|CronCreate|CronDelete|SendMessage)$"],
         )
         for event_name, handler in managed:
             self.assertEqual(handler["type"], "command")
@@ -15143,6 +17722,8 @@ print(process.pid, flush=True)
         write_temp = audncode_section.index("[IO.File]::WriteAllText($TempPath")
         self.assertLess(create_temp, protect_temp)
         self.assertLess(protect_temp, write_temp)
+        self.assertIn("[int]$ShapeProperty.Value -le 9", audncode_section)
+        self.assertNotIn("[int]$ShapeProperty.Value -le 8", audncode_section)
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows installer test")
     def test_windows_atomic_writer_secures_temp_before_content_in_permissive_directory(self) -> None:
@@ -15629,7 +18210,7 @@ Restore-AudnCodeHookObservationMarker `
         script = r"""
 $ErrorActionPreference = 'Stop'
 $NotifierVersion = '2.6.0'
-$AudnCodeHookShapeVersion = 8
+$AudnCodeHookShapeVersion = 9
 $Utf8NoBom = New-Object Text.UTF8Encoding($false)
 $Utf8StrictNoBom = New-Object Text.UTF8Encoding($false, $true)
 $tokens = $null
@@ -15753,7 +18334,7 @@ try {
         script = r"""
 $ErrorActionPreference = 'Stop'
 $NotifierVersion = '2.6.0'
-$AudnCodeHookShapeVersion = 8
+$AudnCodeHookShapeVersion = 9
 $Utf8NoBom = New-Object Text.UTF8Encoding($false)
 $Utf8StrictNoBom = New-Object Text.UTF8Encoding($false, $true)
 $tokens = $null
