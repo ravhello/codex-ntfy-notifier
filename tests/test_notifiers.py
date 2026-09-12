@@ -4293,6 +4293,96 @@ $publicState = $publicProbe.state
             if "powershell" in captured:
                 self.assertEqual(captured["powershell"], captured["python"])
 
+    def test_protocol_thread_titles_fall_back_without_overriding_valid_titles(self) -> None:
+        thread_id = "66666666-6666-7666-8666-666666666666"
+        turn_id = "77777777-7777-7777-8777-777777777777"
+        delegation = (
+            "<codex_delegation>\n"
+            "<source_thread_id>88888888-8888-7888-8888-888888888888</source_thread_id>"
+        )
+        cases = (
+            (
+                "polluted_database_uses_latest_named_index_entry",
+                delegation,
+                ["Titolo precedente", "Correggi metadati film (2)"],
+                "Correggi metadati film (2)",
+            ),
+            ("polluted_database_without_index_uses_project", delegation, None, "perfect notifier"),
+            (
+                "polluted_database_and_index_use_project",
+                delegation,
+                [delegation, "<source_thread_id>88888888-8888-7888-8888-888888888888"],
+                "perfect notifier",
+            ),
+            (
+                "non_string_and_blank_index_titles_do_not_shadow_valid_title",
+                delegation,
+                ["Titolo valido", 42, True, {"title": "not a title"}, ["not a title"], None, "  "],
+                "Titolo valido",
+            ),
+            (
+                "latest_protocol_index_entry_does_not_shadow_valid_title",
+                delegation,
+                ["Titolo valido", delegation],
+                "Titolo valido",
+            ),
+            (
+                "normal_database_title_can_mention_protocol_tag",
+                "Fix <codex_delegation> parsing",
+                ["Titolo obsoleto dall'indice"],
+                "Fix <codex_delegation> parsing",
+            ),
+            (
+                "bom_case_and_truncated_protocol_prefixes_are_rejected",
+                "\ufeff \n<CoDeX_DeLeGaTiOn>\n<source_thread_id>internal",
+                ["Titolo valido", "\ufeff \n</SoUrCe_ThReAd_Id>", "<codex_delegation"],
+                "Titolo valido",
+            ),
+            (
+                "similar_but_distinct_tag_is_not_a_protocol_prefix",
+                "<codex_delegation_feature> support",
+                ["Titolo obsoleto dall'indice"],
+                "<codex_delegation_feature> support",
+            ),
+        )
+        self.configure(include_thread_title=True)
+        index_path = self.codex_home / "session_index.jsonl"
+        for name, database_title, index_titles, expected_title in cases:
+            connection = sqlite3.connect(self.state_database)
+            try:
+                connection.execute(
+                    "INSERT OR REPLACE INTO threads(id, rollout_path, source, thread_source, title) "
+                    "VALUES (?, ?, 'vscode', 'user', ?)",
+                    (thread_id, str(self.codex_home / "missing-rollout.jsonl"), database_title),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            if index_titles is None:
+                index_path.unlink(missing_ok=True)
+            else:
+                index_path.write_text(
+                    "".join(
+                        json.dumps({"id": thread_id, "thread_name": title}, ensure_ascii=False) + "\n"
+                        for title in index_titles
+                    )
+                    + json.dumps({"id": "other-thread", "thread_name": "Not the requested task"})
+                    + "\n",
+                    encoding="utf-8",
+                )
+            captured: dict[str, dict] = {}
+            for implementation in self.implementations():
+                with self.subTest(case=name, implementation=implementation):
+                    self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id, turn_id=turn_id)))
+                    self.run_ok(self.worker_command(implementation))
+                    with self.server.lock:
+                        captured[implementation] = self.server.payloads.pop()
+                    self.assertEqual(captured[implementation]["title"], expected_title)
+                    self.assertEqual(captured[implementation]["tags"], ["white_check_mark"])
+                    shutil.rmtree(self.state, ignore_errors=True)
+            if "powershell" in captured and "python" in captured:
+                self.assertEqual(captured["powershell"], captured["python"])
+
     def test_concurrent_hooks_create_one_outbox_item(self) -> None:
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
