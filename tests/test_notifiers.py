@@ -17,6 +17,9 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+
+from notifier_test_io import read_text_shared_delete
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1367,6 +1370,11 @@ class NotifierContractTests(unittest.TestCase):
             suppress_technical_turns=False,
         )
         secret = "LARGE-PRIVATE-" + ("x" * 140_000)
+        spec = importlib.util.spec_from_file_location("partial_jsonl_notifier", PYTHON_NOTIFIER)
+        assert spec is not None and spec.loader is not None
+        notifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(notifier)
+        observer_runtime = SimpleNamespace(ensure=lambda: None, mutation_locks=self.state / "mutation-locks")
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
                 thread_id = str(uuid.uuid4())
@@ -1403,8 +1411,17 @@ class NotifierContractTests(unittest.TestCase):
                     while time.monotonic() < deadline and not observed_wait:
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
-                                pending_record = json.loads(pending_path.read_text(encoding="utf-8-sig"))
-                            except (OSError, json.JSONDecodeError):
+                                # MoveFileEx (Python os.replace) cannot replace
+                                # any open destination, even with share-delete.
+                                # Join its real key lock and close before unlock.
+                                # PowerShell File.Replace allows share-delete.
+                                guard = (
+                                    notifier.record_mutation_lock(observer_runtime, pending_path.stem)
+                                    if implementation == "python" else contextlib.nullcontext()
+                                )
+                                with guard:
+                                    pending_record = json.loads(read_text_shared_delete(pending_path))
+                            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             reason = str(pending_record.get("idle_reason") or pending_record.get("gate_reason") or "")
                             if reason:
@@ -1418,11 +1435,18 @@ class NotifierContractTests(unittest.TestCase):
                         if process.poll() is not None:
                             break
                         time.sleep(0.05)
-                    self.assertTrue(
-                        observed_wait,
-                        f"worker did not inspect the incomplete JSONL record; reasons={sorted(observed_reasons)} "
-                        f"exit={process.poll()}",
-                    )
+                    if not observed_wait:
+                        if process.poll() is None:
+                            process.terminate()
+                        try:
+                            stdout, stderr = process.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            stdout, stderr = process.communicate(timeout=5)
+                        self.fail(
+                            f"worker did not inspect the incomplete JSONL record; reasons={sorted(observed_reasons)} "
+                            f"exit={process.returncode}\nstdout={stdout}\nstderr={stderr}\n{self.state_debug()}"
+                        )
                     with self.server.lock:
                         self.assertEqual(self.server.payloads, [])
                     with rollout.open("ab") as handle:
@@ -1431,6 +1455,10 @@ class NotifierContractTests(unittest.TestCase):
                 finally:
                     if process.poll() is None:
                         process.terminate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
                         process.communicate(timeout=5)
                 payloads = self.wait_for_payloads(1)
                 diagnostic = {
