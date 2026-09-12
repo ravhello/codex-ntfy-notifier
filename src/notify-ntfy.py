@@ -33,7 +33,7 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.5.2"
+VERSION = "2.5.3"
 MAX_NTFY_MESSAGE_BYTES = 3500
 SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
@@ -2091,6 +2091,10 @@ def validate_record(record: Any, expected_key: str) -> dict[str, Any]:
         raise ValueError("queue item is not an object")
     if record.get("schema") != 1:
         raise ValueError("queue item has an unsupported schema")
+    if record.get("provider", "codex") != "codex" or record.get("candidate_kind", "legacy") not in {
+        "legacy", "hook_stop", "rollout_watch", "rollout_probe"
+    }:
+        raise ValueError("queue item has an unsupported provider or candidate kind")
     key = record.get("key")
     if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key) or key != expected_key:
         raise ValueError("queue item has an invalid key")

@@ -17,6 +17,9 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+
+from notifier_test_io import read_text_shared_delete
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1367,6 +1370,11 @@ class NotifierContractTests(unittest.TestCase):
             suppress_technical_turns=False,
         )
         secret = "LARGE-PRIVATE-" + ("x" * 140_000)
+        spec = importlib.util.spec_from_file_location("partial_jsonl_notifier", PYTHON_NOTIFIER)
+        assert spec is not None and spec.loader is not None
+        notifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(notifier)
+        observer_runtime = SimpleNamespace(ensure=lambda: None, mutation_locks=self.state / "mutation-locks")
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
                 thread_id = str(uuid.uuid4())
@@ -1403,8 +1411,17 @@ class NotifierContractTests(unittest.TestCase):
                     while time.monotonic() < deadline and not observed_wait:
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
-                                pending_record = json.loads(pending_path.read_text(encoding="utf-8-sig"))
-                            except (OSError, json.JSONDecodeError):
+                                # MoveFileEx (Python os.replace) cannot replace
+                                # any open destination, even with share-delete.
+                                # Join its real key lock and close before unlock.
+                                # PowerShell File.Replace allows share-delete.
+                                guard = (
+                                    notifier.record_mutation_lock(observer_runtime, pending_path.stem)
+                                    if implementation == "python" else contextlib.nullcontext()
+                                )
+                                with guard:
+                                    pending_record = json.loads(read_text_shared_delete(pending_path))
+                            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             reason = str(pending_record.get("idle_reason") or pending_record.get("gate_reason") or "")
                             if reason:
@@ -1418,11 +1435,18 @@ class NotifierContractTests(unittest.TestCase):
                         if process.poll() is not None:
                             break
                         time.sleep(0.05)
-                    self.assertTrue(
-                        observed_wait,
-                        f"worker did not inspect the incomplete JSONL record; reasons={sorted(observed_reasons)} "
-                        f"exit={process.poll()}",
-                    )
+                    if not observed_wait:
+                        if process.poll() is None:
+                            process.terminate()
+                        try:
+                            stdout, stderr = process.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            stdout, stderr = process.communicate(timeout=5)
+                        self.fail(
+                            f"worker did not inspect the incomplete JSONL record; reasons={sorted(observed_reasons)} "
+                            f"exit={process.returncode}\nstdout={stdout}\nstderr={stderr}\n{self.state_debug()}"
+                        )
                     with self.server.lock:
                         self.assertEqual(self.server.payloads, [])
                     with rollout.open("ab") as handle:
@@ -1431,6 +1455,10 @@ class NotifierContractTests(unittest.TestCase):
                 finally:
                     if process.poll() is None:
                         process.terminate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
                         process.communicate(timeout=5)
                 payloads = self.wait_for_payloads(1)
                 diagnostic = {
@@ -1877,6 +1905,47 @@ $publicState = $publicProbe.state
         self.assertTrue(summary["public_ok"])
         self.assertEqual(summary["public_message"], private_message)
 
+    def test_unicode_tool_output_does_not_poison_completed_rollout(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            watch_rollouts=False,
+            suppress_technical_turns=False,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                thread_id, turn_id = str(uuid.uuid4()), str(uuid.uuid4())
+                rollout = self.write_session_meta(thread_id, subagent=False)
+                self.append_rollout(rollout, "task_started", turn_id=turn_id)
+                self.append_rollout(rollout, "user_message", message="Complete the requested task.")
+                # This is valid JSON/UTF-8, not lifecycle authority. Real tool
+                # output may contain both a literal replacement glyph and JSON
+                # Unicode escapes without invalidating the surrounding chat.
+                tool_row = json.dumps(
+                    {"type": "response_item", "payload": {
+                        "type": "function_call_output", "call_id": "fixture",
+                        "output": "historical output: \ufffd; ESCAPED_SENTINEL",
+                    }}, ensure_ascii=False,
+                ).replace("ESCAPED_SENTINEL", r"\u263a")
+                self.assertIn("\ufffd", tool_row)
+                self.assertIn(r"\u263a", tool_row)
+                self.assertEqual(json.loads(tool_row)["type"], "response_item")
+                with rollout.open("a", encoding="utf-8") as handle:
+                    handle.write(tool_row + "\n")
+                self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="Final result — già pronto.")
+                event = self.event(thread_id=thread_id, turn_id=turn_id)
+                event["last-assistant-message"] = "Final result — già pronto."
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation))
+                with self.server.lock:
+                    self.assertEqual(len(self.server.payloads), 1)
+                    self.assertIn("Final result", self.server.payloads[0]["message"])
+                    self.server.payloads.clear()
+                self.assertFalse(list((self.state / "pending").glob("*.json")), self.state_debug())
+                self.assertFalse(list((self.state / "suppressed").glob("*.json")), self.state_debug())
+                shutil.rmtree(self.state, ignore_errors=True)
+
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows strict rollout UTF-8 test")
     def test_powershell_invalid_utf8_rollout_fails_closed(self) -> None:
         self.configure(
@@ -2139,7 +2208,13 @@ $publicState = $publicProbe.state
                 finally:
                     if process.poll() is None:
                         process.terminate()
-                        process.communicate(timeout=5)
+                    # Reap even a worker that exited between the assertion and
+                    # cleanup, so a failure cannot leak its captured pipes.
+                    try:
+                        process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=10)
                     shutil.rmtree(self.state, ignore_errors=True)
                     shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
                     database.unlink(missing_ok=True)
@@ -4068,6 +4143,24 @@ $publicState = $publicProbe.state
                 self.assertFalse(list(outbox.glob("*.json")))
                 self.assertEqual(len(list((self.state / "dead").glob("*.json"))), 1)
                 shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_unsupported_provider_or_candidate_is_quarantined_without_delivery(self) -> None:
+        for implementation in self.implementations():
+            for change in ({"provider": "removed-provider"}, {"candidate_kind": "removed_stop"}):
+                with self.subTest(implementation=implementation, change=change):
+                    self.run_ok(self.hook_command(implementation, self.event()))
+                    path = next((self.state / "outbox").glob("*.json"))
+                    record = json.loads(path.read_text(encoding="utf-8-sig"))
+                    record.update(change)
+                    path.write_text(json.dumps(record), encoding="utf-8")
+                    self.run_ok(self.hook_command(implementation, self.event()))
+                    self.run_ok(self.worker_command(implementation))
+                    with self.server.lock:
+                        self.assertEqual(len(self.server.payloads), 1)
+                        self.server.payloads.clear()
+                    self.assertFalse(list((self.state / "outbox").glob("*.json")))
+                    self.assertEqual(len(list((self.state / "dead").glob("*.json"))), 1)
+                    shutil.rmtree(self.state, ignore_errors=True)
 
     def test_outbox_drops_prompt_and_preserves_redacted_markdown(self) -> None:
         self.configure(markdown=True)

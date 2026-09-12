@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![Windows PowerShell 5.1](https://img.shields.io/badge/Windows%20PowerShell-5.1-5391FE.svg)](https://learn.microsoft.com/powershell/)
 
-One compact ntfy push when a local OpenAI Codex root task is verifiably idle—not for intermediate turns. It also supports Claude Code on Windows, including the Code tab in Claude Desktop, through opt-in native lifecycle hooks.
+Compact, deduplicated ntfy notifications when a local OpenAI Codex root task is verifiably idle—not for intermediate turns. It also supports Claude Code on Windows, including the Code tab in Claude Desktop, through opt-in native lifecycle hooks.
 
 ![Codex ntfy Notifier waits for locally verifiable idle before sending one compact completion notification](docs/assets/hero.svg)
 
@@ -114,6 +114,8 @@ Version 2.4 introduced the logical **idle epoch** retained by 2.5:
 
 Version 2.5 adds a provider-specific Claude path on Windows. Claude `Stop` is accepted only for the main agent when both authoritative work registries are present and empty; `session_id + prompt_id` provides stable deduplication, and `StopFailure` covers turns ended by an API error. `Stop`, `StopFailure`, and `UserPromptSubmit` are ordered synchronously so repeated same-prompt goal stops cannot finish out of order; their initial reverse scan is capped at 1 MiB and any full reconciliation runs in the worker. `UserPromptSubmit` snapshots the previous session-level goal marker and cancels stale candidates before a new prompt can finish. The gate then mirrors Claude's own resume rule from the newest local `attachment.goal_status`: active/not-met markers hold the candidate, a newer achieved/failed marker releases it, and a newer manual-clear sentinel discards it without a notification. `idle_prompt`/`agent_completed` with the same non-empty `prompt_id` are optional asynchronous fallbacks, never required for correctness, so delayed or uncorrelated VS Code idle events cannot release the wrong candidate. The notification body still uses Claude's supplied final message.
 
+For linked Claude transcripts, the goal check follows the current branch's `uuid`/`parentUuid` ancestry and explicit leaf metadata. Goals from abandoned branches do not block a later ordinary turn; incomplete ancestry stays unknown. The age of a goal alone never clears it.
+
 After the idle gate, the existing durable delivery engine takes over:
 
 - the event moves atomically to a per-host outbox before any network request;
@@ -201,7 +203,9 @@ Set `CODEX_NTFY_SKIP_SYSTEMD=1` to use only the on-demand worker. A continuous w
 
 ## Remote SSH hosts
 
-Run remote installers from a machine where the notifier is already configured. The private ntfy configuration is copied to the remote host and protected with host-native permissions. Host-local `watch_roots` are cleared during remote installation; register topology on the destination itself instead of copying source-machine paths.
+Run remote installers from a machine where the notifier is already configured. A fresh remote installation copies the private ntfy configuration and protects it with host-native permissions. Source-machine `watch_roots` are cleared from copied configuration; register topology on the destination itself.
+
+Windows upgrades preserve an existing remote configuration, credentials, and local watch roots by default. Use `-ReplaceRemoteConfig` only when you intentionally want to replace that configuration with the source machine's. Windows installers also preserve an existing `--previous-notify` forwarding chain for other integrations.
 
 Windows remote host, from PowerShell:
 
@@ -321,6 +325,7 @@ Read [Security and privacy](docs/security-and-privacy.md) before enabling messag
 
 ## Known limitations
 
+- Supported providers are OpenAI Codex and Claude Code, not third-party forks or ordinary browser chat tabs. Native macOS installation is being developed separately in [issue #9](https://github.com/ravhello/codex-ntfy-notifier/issues/9).
 - Modern hooks require explicit user review through `/hooks`. The installer never edits the trust store.
 - Claude support currently targets local Claude Code on Windows. The ordinary Claude Chat tab does not expose Claude Code hooks, user interrupts do not emit `Stop`, and hosted work without a local hook is outside the observation boundary.
 - Claude `/goal` finality relies on a memory-bounded reverse scan of Claude's local transcript `attachment.goal_status` records without loading the full transcript. That is an upstream local format and may require an adapter update if Claude changes it; missing or malformed active-goal evidence fails closed instead of sending an intermediate alert.

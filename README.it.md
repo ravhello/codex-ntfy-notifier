@@ -8,7 +8,7 @@
 
 [English](README.md) · [Architettura](docs/architecture.md) · [Privacy e sicurezza](docs/security-and-privacy.md) · [Supporto](SUPPORT.md) · [Alternative](docs/alternatives.md)
 
-Una sola notifica push ntfy compatta quando una task root locale di OpenAI Codex è verificabilmente inattiva, non a ogni risultato intermedio. Supporta anche Claude Code su Windows, inclusa la scheda Code di Claude Desktop, tramite hook lifecycle nativi opzionali.
+Notifiche push ntfy compatte e deduplicate quando una task root locale di OpenAI Codex è verificabilmente inattiva, non a ogni risultato intermedio. Supporta anche Claude Code su Windows, inclusa la scheda Code di Claude Desktop, tramite hook lifecycle nativi opzionali.
 
 ![Codex ntfy Notifier aspetta l'idle verificabile localmente prima di inviare una sola notifica di completamento compatta](docs/assets/hero.svg)
 
@@ -114,6 +114,8 @@ La versione 2.4 ha introdotto il **periodo di idle logico** mantenuto dalla 2.5:
 
 La versione 2.5 aggiunge un percorso Claude specifico su Windows. `Stop` viene accettato solo per l'agente principale quando entrambi i registri di lavoro autorevoli sono presenti e vuoti; `session_id + prompt_id` garantisce la deduplicazione e `StopFailure` copre i turni terminati da un errore API. `Stop`, `StopFailure` e `UserPromptSubmit` sono ordinati e sincroni, così gli stop ripetuti dello stesso goal non possono concludersi fuori ordine; la scansione iniziale è limitata a 1 MiB e l'eventuale riconciliazione completa avviene nel worker. `UserPromptSubmit` fotografa il marker goal precedente e annulla i candidati obsoleti prima che possa terminare il nuovo prompt. Il gate replica poi la regola di ripristino di Claude dal più recente `attachment.goal_status` locale: `active`/non raggiunto mantiene il candidato in attesa, un marker successivo raggiunto o fallito lo libera, mentre il sentinel di cancellazione manuale lo elimina senza notifica. `idle_prompt`/`agent_completed` con lo stesso `prompt_id` non vuoto sono solo fallback asincroni opzionali: eventi idle lenti o non correlabili in VS Code non possono liberare il candidato sbagliato. Il corpo usa comunque il messaggio finale fornito da Claude.
 
+Nei transcript Claude collegati, il controllo del goal segue i legami `uuid`/`parentUuid` del ramo corrente e i metadati espliciti della sua leaf. I goal di rami abbandonati non bloccano un turno ordinario successivo; una catena incompleta rimane non verificabile. La sola età del goal non basta mai a cancellarlo.
+
 Dopo la conferma di idle, il motore di consegna:
 
 - sposta atomicamente l’evento nell’outbox prima di usare la rete;
@@ -188,7 +190,9 @@ Con `CODEX_NTFY_SKIP_SYSTEMD=1` si usa soltanto il worker on-demand. Il worker c
 
 ## Host Remote SSH
 
-Gli installer remoti copiano destinazione, autenticazione e policy private, ma azzerano `watch_roots`: i percorsi WSL/custom del computer sorgente non sono portabili. Eventuali root aggiuntive vanno configurate sulla destinazione.
+Le nuove installazioni remote copiano destinazione, autenticazione e policy private, ma azzerano `watch_roots`: i percorsi WSL/custom del computer sorgente non sono portabili. Eventuali root aggiuntive vanno configurate sulla destinazione.
+
+Gli aggiornamenti Windows conservano per default configurazione, credenziali e watch root già presenti sull'host remoto. Usare `-ReplaceRemoteConfig` soltanto per sostituirli intenzionalmente con la configurazione sorgente. Gli installer Windows conservano anche le catene `--previous-notify` usate da altre integrazioni.
 
 Windows, da PowerShell:
 
@@ -293,6 +297,7 @@ Non cancellare `pending/` o `outbox/` durante un problema normale. Consultare [R
 
 ## Limiti noti
 
+- I provider supportati sono OpenAI Codex e Claude Code, non fork di terze parti o normali schede chat nel browser. L'installazione nativa macOS è coordinata separatamente nell'[issue #9](https://github.com/ravhello/codex-ntfy-notifier/issues/9).
 - Gli hook moderni richiedono approvazione esplicita tramite `/hooks`.
 - Il supporto Claude riguarda attualmente Claude Code locale su Windows. La normale scheda Chat di Claude non espone gli hook Code, un'interruzione manuale non emette `Stop` e il lavoro hosted senza hook locale non è osservabile.
 - La finalità di Claude `/goal` dipende da una scansione inversa a memoria limitata dei record locali `attachment.goal_status`, senza caricare l'intero transcript. È un formato upstream che può richiedere un adattamento se Claude lo cambia; prove mancanti o malformate per un goal attivo fanno fail-closed invece di inviare un risultato intermedio.
