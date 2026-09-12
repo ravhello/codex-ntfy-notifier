@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
   [string]$Origin = 'SSH:Windows',
+  [switch]$PreserveLocalConfiguration,
   [switch]$SkipScheduledTask
 )
 
@@ -14,6 +15,87 @@ $PrivateConfig = Join-Path $HomePath 'ntfy-config.json'
 $StatePath = Join-Path $HomePath 'ntfy-state'
 $TaskName = 'CodexNtfyWatcher'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Get-NotifierCommandTokens {
+  param([string]$CommandLine)
+
+  if ($CommandLine -notmatch '^\s*(?:"[^"]*"|[^\s"]+)(?:\s+(?:"[^"]*"|[^\s"]+))*\s*$') { return @() }
+  return @([regex]::Matches($CommandLine, '"([^"]*)"|([^\s"]+)') | ForEach-Object {
+      if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value }
+    })
+}
+
+function Test-OwnedNotifierInvocation {
+  param([string]$Executable, [string[]]$Arguments, [string]$HomePath)
+
+  try {
+    if (-not [IO.Path]::IsPathRooted($HomePath)) { return $false }
+    $homeFullPath = [IO.Path]::GetFullPath($HomePath).TrimEnd('\')
+    $name = [IO.Path]::GetFileName($Executable)
+    $scriptIndex = -1
+    if ($name -ieq 'wscript.exe') {
+      for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        if ($Arguments[$index] -in @('//B', '//Nologo')) { continue }
+        $scriptIndex = $index
+        break
+      }
+      if ($scriptIndex -lt 0 -or $scriptIndex -ne $Arguments.Count - 1) { return $false }
+      $expected = Join-Path $homeFullPath 'watch-codex-ntfy-hidden.vbs'
+      return [IO.Path]::IsPathRooted($Arguments[$scriptIndex]) -and
+        [IO.Path]::GetFullPath($Arguments[$scriptIndex]) -ieq $expected
+    }
+    if ($name -notin @('powershell.exe', 'pwsh.exe')) { return $false }
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+      $argument = $Arguments[$index]
+      if ($argument -ieq '-File') { $scriptIndex = $index + 1; break }
+      if ($argument -in @('-NoProfile', '-NonInteractive', '-NoLogo')) { continue }
+      if ($argument -ieq '-ExecutionPolicy' -and $index + 1 -lt $Arguments.Count -and $Arguments[$index + 1] -ieq 'Bypass') { $index++; continue }
+      if ($argument -ieq '-WindowStyle' -and $index + 1 -lt $Arguments.Count -and $Arguments[$index + 1] -ieq 'Hidden') { $index++; continue }
+      return $false
+    }
+    if ($scriptIndex -lt 0 -or $scriptIndex -ge $Arguments.Count -or -not [IO.Path]::IsPathRooted($Arguments[$scriptIndex])) { return $false }
+    $scriptPath = [IO.Path]::GetFullPath($Arguments[$scriptIndex])
+    if ($scriptPath -ieq (Join-Path $homeFullPath 'watch-codex-ntfy.ps1')) {
+      return $scriptIndex -eq $Arguments.Count - 1
+    }
+    if ($scriptPath -ine (Join-Path $homeFullPath 'notify-ntfy.ps1')) { return $false }
+    $workerMode = $false
+    for ($index = $scriptIndex + 1; $index -lt $Arguments.Count; $index++) {
+      $argument = $Arguments[$index]
+      if ($argument -in @('-Worker', '-Continuous', '-ScanRollouts', '-Maintenance')) { $workerMode = $true; continue }
+      if ($argument -ieq '-DeliveryOnly') { continue }
+      if ($argument -in @('-PollSeconds', '-ScanScope', '-ScanParentPid', '-ScanParentToken', '-Origin')) {
+        $index++
+        if ($index -ge $Arguments.Count -or [string]::IsNullOrWhiteSpace($Arguments[$index]) -or $Arguments[$index].StartsWith('-')) { return $false }
+        continue
+      }
+      return $false
+    }
+    return $workerMode
+  } catch {
+    return $false
+  }
+}
+
+function Test-OwnedNotifierProcess {
+  param([object]$Process, [string]$HomePath)
+
+  if ($null -eq $Process -or [string]$Process.Name -notin @('powershell.exe', 'pwsh.exe', 'wscript.exe')) { return $false }
+  $arguments = @(Get-NotifierCommandTokens -CommandLine ([string]$Process.CommandLine))
+  if ($arguments.Count -lt 2 -or [IO.Path]::GetFileName($arguments[0]) -ine [string]$Process.Name) { return $false }
+  return Test-OwnedNotifierInvocation -Executable $arguments[0] -Arguments @($arguments | Select-Object -Skip 1) -HomePath $HomePath
+}
+
+function Test-OwnedScheduledTask {
+  param([object]$Task, [string]$HomePath)
+
+  if ($null -eq $Task -or @($Task.Actions).Count -eq 0) { return $false }
+  foreach ($action in @($Task.Actions)) {
+    $arguments = @(Get-NotifierCommandTokens -CommandLine ([string]$action.Arguments))
+    if (-not (Test-OwnedNotifierInvocation -Executable ([string]$action.Execute) -Arguments $arguments -HomePath $HomePath)) { return $false }
+  }
+  return $true
+}
 
 function Write-TextAtomic {
   param(
@@ -45,6 +127,37 @@ function Test-ManagedHookHandler {
     }
   }
   return $false
+}
+
+function Ensure-TopLevelNotify {
+  param(
+    [string]$ConfigPath,
+    [string]$NotifyLine,
+    [string]$ExpectedMarker
+  )
+
+  $text = if (Test-Path -LiteralPath $ConfigPath) { [IO.File]::ReadAllText($ConfigPath) } else { '' }
+  $table = [regex]::Match($text, '(?m)^[ \t]*\[')
+  $rootText = if ($table.Success) { $text.Substring(0, $table.Index) } else { $text }
+  $match = [regex]::Match($rootText, '(?m)^[ \t]*notify[ \t]*=.*$')
+  if ($match.Success) {
+    if ($match.Value -notmatch [regex]::Escape($ExpectedMarker)) {
+      throw 'Existing remote notify command is unrelated; refusing to overwrite it.'
+    }
+    # Update the notifier in place without discarding integrations that forward
+    # to it through their serialized previous-notify command.
+    if ($match.Value -match '"--previous-notify"') { return }
+    if ($match.Value -ne $NotifyLine) {
+      Write-TextAtomic -Path $ConfigPath -Content ($text.Remove($match.Index, $match.Length).Insert($match.Index, $NotifyLine))
+    }
+    return
+  }
+  if ($table.Success) {
+    $text = $text.Insert($table.Index, $NotifyLine + [Environment]::NewLine + [Environment]::NewLine)
+  } else {
+    $text = $text.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $NotifyLine + [Environment]::NewLine
+  }
+  Write-TextAtomic -Path $ConfigPath -Content $text
 }
 
 function Ensure-StopHook {
@@ -163,12 +276,9 @@ if (-not (Test-Path -LiteralPath $ScriptPath) -or -not (Test-Path -LiteralPath $
 if (-not $SkipScheduledTask) {
   $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   if ($null -ne $existingTask) {
-    $owned = $false
-    foreach ($existingAction in @($existingTask.Actions)) {
-      $description = '{0} {1} {2}' -f $existingAction.Execute, $existingAction.Arguments, $existingAction.WorkingDirectory
-      if ($description -match '(?i)(?:watch-codex-ntfy|notify-ntfy)') { $owned = $true; break }
+    if (-not (Test-OwnedScheduledTask -Task $existingTask -HomePath $HomePath)) {
+      throw "Scheduled task '$TaskName' already exists but is unrelated; refusing to overwrite it."
     }
-    if (-not $owned) { throw "Scheduled task '$TaskName' already exists but is unrelated; refusing to overwrite it." }
   }
 }
 
@@ -216,7 +326,7 @@ $watchRootsProperty = $privateObject.PSObject.Properties['watch_roots']
 if ($null -eq $watchRootsProperty) {
   Add-Member -InputObject $privateObject -MemberType NoteProperty -Name 'watch_roots' -Value @()
   $privateChanged = $true
-} elseif (@($watchRootsProperty.Value).Count -ne 0) {
+} elseif (-not $PreserveLocalConfiguration -and @($watchRootsProperty.Value).Count -ne 0) {
   # WSL/custom watcher paths belong to the source host and are not portable.
   $watchRootsProperty.Value = @()
   $privateChanged = $true
@@ -226,7 +336,7 @@ $workerSqliteProperty = $privateObject.PSObject.Properties['worker_sqlite_path']
 if ($null -eq $workerSqliteProperty) {
   Add-Member -InputObject $privateObject -MemberType NoteProperty -Name 'worker_sqlite_path' -Value $workerSqlitePath
   $privateChanged = $true
-} elseif ([string]$workerSqliteProperty.Value -ne $workerSqlitePath) {
+} elseif (-not $PreserveLocalConfiguration -and [string]$workerSqliteProperty.Value -ne $workerSqlitePath) {
   $workerSqliteProperty.Value = $workerSqlitePath
   $privateChanged = $true
 }
@@ -244,30 +354,7 @@ $escapedOrigin = $effectiveOrigin.Replace('\', '\\').Replace('"', '\"')
 $windowsPowerShellPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $escapedPowerShell = $windowsPowerShellPath.Replace('\', '\\').Replace('"', '\"')
 $notifyLine = 'notify = ["' + $escapedPowerShell + '", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "' + $escaped + '", "-Origin", "' + $escapedOrigin + '"]'
-$text = if (Test-Path -LiteralPath $ConfigPath) { [System.IO.File]::ReadAllText($ConfigPath) } else { '' }
-$table = [regex]::Match($text, '(?m)^[ \t]*\[')
-$rootText = if ($table.Success) { $text.Substring(0, $table.Index) } else { $text }
-$match = [regex]::Match($rootText, '(?m)^[ \t]*notify[ \t]*=.*$')
-$writeConfig = $false
-if ($match.Success) {
-  if ($match.Value -notmatch 'notify-ntfy\.ps1') {
-    throw 'Existing remote notify command is unrelated; refusing to overwrite it.'
-  }
-  if ($match.Value -ne $notifyLine) {
-    $text = $text.Remove($match.Index, $match.Length).Insert($match.Index, $notifyLine)
-    $writeConfig = $true
-  }
-} else {
-  if ($table.Success) {
-    $text = $text.Insert($table.Index, $notifyLine + [Environment]::NewLine + [Environment]::NewLine)
-  } else {
-    $text = $text.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $notifyLine + [Environment]::NewLine
-  }
-  $writeConfig = $true
-}
-if ($writeConfig) {
-  [System.IO.File]::WriteAllText($ConfigPath, $text, $Utf8NoBom)
-}
+Ensure-TopLevelNotify -ConfigPath $ConfigPath -NotifyLine $notifyLine -ExpectedMarker 'notify-ntfy.ps1'
 
 $hookOrigin = $effectiveOrigin.Replace('"', '\"')
 $hookCommand = '"{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{1}" -Origin "{2}" -HookEvent' -f $windowsPowerShellPath, $ScriptPath, $hookOrigin

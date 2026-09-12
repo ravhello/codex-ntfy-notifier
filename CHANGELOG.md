@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.5.3] - 2026-09-12
+
+### Fixed
+
+- Windows root/subagent classification uses indexed SQLite identity and spawn edges before a bounded recent-session fallback, avoiding full-history scans on each hook.
+- Windows thread metadata is refreshed after a resumed conversation changes its rollout path, rather than remaining cached for the worker lifetime.
+- Valid Unicode in historical tool output is covered by a delivery regression: non-lifecycle output must not invalidate a completed conversation, while malformed lifecycle evidence remains fail-closed.
+- Queue records for unsupported providers or candidate kinds are quarantined without delivery; supported queued notifications continue independently.
+- Windows installation preserves an existing notification forwarding chain instead of removing another integration's `--previous-notify` wrapper.
+- Remote Windows upgrades preserve destination credentials and watch roots unless explicitly replaced; worker restarts are scoped to the installation being updated.
+- Claude goal checks follow the current transcript branch instead of treating a historical goal on an abandoned branch as current work. Existing pending candidates are reconciled only with matching session, prompt, and epoch evidence.
+
+### Scope
+
+- Supported providers remain OpenAI Codex and opt-in Claude Code on Windows. The unmerged experimental third-provider expansion is not part of this release.
+- Native macOS support is being coordinated separately in [issue #9](https://github.com/ravhello/codex-ntfy-notifier/issues/9); it is not claimed as available in this release.
+
 ## [2.5.2] - 2026-07-18
 
 ### Fixed
@@ -221,7 +238,8 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.2...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.3...HEAD
+[2.5.3]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.3
 [2.5.2]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.2
 [2.5.1]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.1
 [2.5.0]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.0

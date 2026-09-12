@@ -32,7 +32,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.5.2'
+$ScriptVersion = '2.5.3'
 $MaxNtfyMessageBytes = 3500
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
@@ -616,7 +616,8 @@ function Get-EventClassification {
   param(
     [object]$Event,
     [string]$ThreadId,
-    [string]$SessionHome = $CodexHome
+    [string]$SessionHome = $CodexHome,
+    [string]$SqliteHome = ''
   )
 
   try {
@@ -646,22 +647,76 @@ function Get-EventClassification {
   if ([string]::IsNullOrWhiteSpace($ThreadId)) {
     return 'unknown'
   }
-  foreach ($rootName in @('sessions', 'archived_sessions')) {
-    $root = Join-Path $SessionHome $rootName
-    if (-not (Test-Path -LiteralPath $root)) {
-      continue
+  if ([string]::IsNullOrWhiteSpace($SessionHome)) { $SessionHome = $CodexHome }
+  if ([string]::IsNullOrWhiteSpace($SqliteHome)) {
+    $SqliteHome = [string](Get-FirstObjectValue $Event @('session_sqlite_home', 'sqlite_home', 'sqliteHome'))
+    if ([string]::IsNullOrWhiteSpace($SqliteHome)) { $SqliteHome = $SessionHome }
+  }
+  # A historical/resumed thread is addressable by its primary key. Never walk
+  # the complete rollout archive on the synchronous hook path.
+  $database = Get-StateDatabasePath -SqliteHome $SqliteHome
+  $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT rollout_path, COALESCE(thread_source,''), COALESCE(source,'') FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 3
+  if (-not $row.ok -and $row.error -match '(?i)no such column') {
+    $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT rollout_path, '', COALESCE(source,'') FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 3
+  }
+  if ($row.ok -and $row.found) {
+    $threadSource = [string]$row.values[1]
+    $databaseSource = [string]$row.values[2]
+    if ($threadSource -eq 'subagent' -or $databaseSource -match '(?i)"subagent"') {
+      return 'subagent'
     }
+  }
+  $edge = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT child_thread_id FROM thread_spawn_edges WHERE child_thread_id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 1
+  if ($edge.ok -and $edge.found) { return 'subagent' }
+  if ($row.ok -and $row.found -and
+      (-not [string]::IsNullOrWhiteSpace($threadSource) -or
+       (-not [string]::IsNullOrWhiteSpace($databaseSource) -and $edge.ok))) {
+    return 'root'
+  }
+
+  $candidates = New-Object 'System.Collections.Generic.List[string]'
+  if ($row.ok -and $row.found -and -not [string]::IsNullOrWhiteSpace([string]$row.values[0])) {
     try {
-      $session = Get-ChildItem -LiteralPath $root -Filter "*$ThreadId*.jsonl" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-      if ($null -eq $session) {
-        continue
+      $path = [string]$row.values[0]
+      $normalized = $path.Replace('\', '/')
+      $marker = $normalized.IndexOf('/.codex/', [StringComparison]::OrdinalIgnoreCase)
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf) -and $marker -ge 0) {
+        $relative = $normalized.Substring($marker + '/.codex/'.Length).Replace('/', [IO.Path]::DirectorySeparatorChar)
+        $path = Join-Path $SessionHome $relative
       }
-      $firstLine = Read-FirstLineShared -Path $session.FullName
-      if ([string]::IsNullOrWhiteSpace($firstLine)) {
-        continue
+      $fullPath = [IO.Path]::GetFullPath($path)
+      foreach ($rootName in @('sessions', 'archived_sessions')) {
+        $root = [IO.Path]::GetFullPath((Join-Path $SessionHome $rootName)).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        if ($fullPath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and
+            (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+          $candidates.Add($fullPath)
+          break
+        }
       }
-      $metadata = $firstLine | ConvertFrom-Json
+    } catch { }
+  }
+  # New sessions may precede the index. Bound fallback discovery to two date
+  # buckets plus the flat archive; missing historical evidence stays unknown.
+  $today = [DateTime]::Now.Date
+  $buckets = @(
+    (Join-Path $SessionHome ('sessions/' + $today.ToString('yyyy/MM/dd'))),
+    (Join-Path $SessionHome ('sessions/' + $today.AddDays(-1).ToString('yyyy/MM/dd'))),
+    (Join-Path $SessionHome 'archived_sessions')
+  )
+  foreach ($bucket in $buckets) {
+    if (-not (Test-Path -LiteralPath $bucket -PathType Container)) { continue }
+    foreach ($session in @(Get-ChildItem -LiteralPath $bucket -Filter "*$ThreadId*.jsonl" -File -ErrorAction SilentlyContinue | Select-Object -First 8)) {
+      $candidates.Add($session.FullName)
+    }
+  }
+  foreach ($path in $candidates) {
+    try {
+      $firstLine = Read-FirstLineShared -Path $path
+      if ([string]::IsNullOrWhiteSpace($firstLine)) { continue }
+      $metadata = $firstLine | ConvertFrom-Json -ErrorAction Stop
       $payload = Get-ObjectValue $metadata 'payload'
+      if ([string](Get-ObjectValue $metadata 'type' '') -ne 'session_meta' -or
+          [string](Get-ObjectValue $payload 'id' '') -cne $ThreadId) { continue }
       $source = Get-ObjectValue $payload 'source'
       if ($null -ne $source -and $source -isnot [string] -and $null -ne (Get-ObjectValue $source 'subagent')) {
         return 'subagent'
@@ -1452,6 +1507,90 @@ function ConvertFrom-ClaudeGoalStatusLine {
   return [pscustomobject]@{ state = $state; marker = $marker; marker_unix_ms = $markerUnixMs }
 }
 
+function Update-ClaudeGoalLineageFromLine {
+  param([object]$Scan, [string]$Line)
+
+  if ([string]::IsNullOrWhiteSpace($Line) -or
+      $Line -notmatch '"(?:uuid|parentUuid|goal_status|last-prompt|leafUuid)"') { return }
+  try { $entry = $Line | ConvertFrom-Json -ErrorAction Stop } catch {
+    $Scan.invalid = $true
+    return
+  }
+  $sidechainProperty = $entry.PSObject.Properties['isSidechain']
+  if ($null -ne $sidechainProperty -and $sidechainProperty.Value -isnot [bool]) {
+    $Scan.invalid = $true
+    return
+  }
+  if ([string](Get-ObjectValue $entry 'type' '') -eq 'last-prompt') {
+    # Claude records an explicit leaf selection on rewind/branch changes. In a
+    # reverse pass it is authoritative only before a newer main-chain node (or
+    # a newer explicit selection) has already chosen the leaf.
+    if ($Scan.linked) { return }
+    $explicitProperty = $entry.PSObject.Properties['explicit']
+    if ($null -eq $explicitProperty) { return }
+    if ($explicitProperty.Value -isnot [bool]) { $Scan.invalid = $true; return }
+    if (-not [bool]$explicitProperty.Value) { return }
+    $leafProperty = $entry.PSObject.Properties['leafUuid']
+    if ($null -eq $leafProperty -or $leafProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$leafProperty.Value) -or
+        $null -ne $Scan.legacyGoal -or $Scan.unlinkedNodes) {
+      $Scan.invalid = $true
+      return
+    }
+    $Scan.linked = $true
+    $Scan.expected = [string]$leafProperty.Value
+    return
+  }
+  $goal = ConvertFrom-ClaudeGoalStatusLine -Line $Line
+  $parentProperty = $entry.PSObject.Properties['parentUuid']
+  $uuidProperty = $entry.PSObject.Properties['uuid']
+  if ($null -eq $parentProperty) {
+    # Older transcripts did not expose an ancestry chain. Keep their existing
+    # marker semantics, but never mix an unlinked goal into a linked branch.
+    if ($null -ne $goal -and $null -eq $Scan.legacyGoal) { $Scan.legacyGoal = $goal }
+    if ($null -ne $uuidProperty -and
+        [string](Get-ObjectValue $entry 'type' '') -in @('user', 'assistant', 'attachment', 'system')) {
+      $Scan.unlinkedNodes = $true
+      if ($Scan.linked -and [string]$uuidProperty.Value -ceq [string]$Scan.expected) {
+        $Scan.invalid = $true
+      }
+    }
+    return
+  }
+  if ($null -eq $uuidProperty -or $uuidProperty.Value -isnot [string] -or
+      [string]::IsNullOrWhiteSpace([string]$uuidProperty.Value) -or
+      ($null -ne $parentProperty.Value -and $parentProperty.Value -isnot [string])) {
+    $Scan.invalid = $true
+    return
+  }
+  $uuid = [string]$uuidProperty.Value
+  $parent = [string]$parentProperty.Value
+  if ($null -ne $parentProperty.Value -and [string]::IsNullOrWhiteSpace($parent)) {
+    $Scan.invalid = $true
+    return
+  }
+  if (-not $Scan.linked) {
+    if ([bool](Get-ObjectValue $entry 'isSidechain' $false)) { return }
+    if ($null -ne $Scan.legacyGoal -or $Scan.unlinkedNodes) {
+      $Scan.invalid = $true
+      return
+    }
+    $Scan.linked = $true
+    $Scan.expected = $uuid
+  }
+  if ($uuid -cne [string]$Scan.expected) { return }
+  # Parent records precede their children in the append-only transcript. A
+  # cycle or an unresolved parent cannot reach an explicit root in this pass.
+  $Scan.followed = [int]$Scan.followed + 1
+  if ($Scan.followed -gt 65536 -or $parent -ceq $uuid) {
+    $Scan.invalid = $true
+    return
+  }
+  if ($null -ne $goal -and $null -eq $Scan.goal) { $Scan.goal = $goal }
+  $Scan.expected = $parent
+  if ($null -eq $parentProperty.Value) { $Scan.complete = $true }
+}
+
 function Get-ClaudeGoalTranscriptState {
   param(
     [string]$TranscriptPath,
@@ -1479,6 +1618,10 @@ function Get-ClaudeGoalTranscriptState {
 
       $stream = $null
       $result = $empty
+      $lineage = [pscustomobject]@{
+        linked = $false; expected = ''; followed = 0; complete = $false
+        invalid = $false; goal = $null; legacyGoal = $null; unlinkedNodes = $false
+      }
       try {
         $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
         $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
@@ -1486,8 +1629,8 @@ function Get-ClaudeGoalTranscriptState {
         $position = [int64]$stream.Length
         $scanFloor = if ($MaxBytes -gt 0) { [Math]::Max([int64]0, $position - $MaxBytes) } else { [int64]0 }
         $limited = $scanFloor -gt 0
-        $goalToken = '"goal_status"'
-        $goalTokenOverlapLength = $goalToken.Length - 1
+        $goalTokenPattern = '"(?:uuid|parentUuid|goal_status|last-prompt|leafUuid)"'
+        $goalTokenOverlapLength = '"goal_status"'.Length - 1
         $carry = ''
         $rightPrefix = [byte[]]@()
         $lineOversize = $false
@@ -1507,7 +1650,7 @@ function Get-ClaudeGoalTranscriptState {
             $piece = [string]$parts[0]
             if ($lineOversize) {
               $probe = $piece + $oversizeBoundary
-              if ($probe.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+              if ($probe -match $goalTokenPattern) {
                 $result = $hardUnknown
                 $found = $true
               } else {
@@ -1516,7 +1659,7 @@ function Get-ClaudeGoalTranscriptState {
             } else {
               $candidate = $piece + $carry
               if ($Utf8NoBom.GetByteCount($candidate) -gt $MaxLineBytes) {
-                if ($candidate.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+                if ($candidate -match $goalTokenPattern) {
                   $result = $hardUnknown
                   $found = $true
                 } else {
@@ -1537,21 +1680,19 @@ function Get-ClaudeGoalTranscriptState {
           $trailingPiece = [string]$parts[$parts.Length - 1]
           if ($lineOversize) {
             $probe = $trailingPiece + $oversizeBoundary
-            if ($probe.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+            if ($probe -match $goalTokenPattern) {
               $result = $hardUnknown
               $found = $true
             }
           } else {
             $line = ($trailingPiece + $carry).TrimEnd([char]13)
-            if ($line.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
-              $parsed = if ($Utf8NoBom.GetByteCount($line) -gt $MaxLineBytes) {
-                $hardUnknown
-              } else {
-                ConvertFrom-ClaudeGoalStatusLine -Line $line
-              }
-              if ($null -ne $parsed) {
-                $result = $parsed
+            if ($line -match $goalTokenPattern) {
+              if ($Utf8NoBom.GetByteCount($line) -gt $MaxLineBytes) {
+                $result = $hardUnknown
                 $found = $true
+              } else {
+                Update-ClaudeGoalLineageFromLine -Scan $lineage -Line $line
+                $found = $lineage.complete -or $lineage.invalid
               }
             }
           }
@@ -1561,26 +1702,24 @@ function Get-ClaudeGoalTranscriptState {
           if ($found) { break }
 
           # Every middle element is a complete line wholly contained in this
-          # chunk. Visit newest to oldest so the first parsed marker wins.
+          # chunk. Follow only parents of the newest non-sidechain leaf. Goal
+          # attachments on a physically newer abandoned branch are irrelevant.
           for ($partIndex = $parts.Length - 2; $partIndex -ge 1 -and -not $found; $partIndex--) {
             $line = ([string]$parts[$partIndex]).TrimEnd([char]13)
-            if ($line.IndexOf($goalToken, [StringComparison]::Ordinal) -lt 0) { continue }
-            $parsed = if ($Utf8NoBom.GetByteCount($line) -gt $MaxLineBytes) {
-              $hardUnknown
-            } else {
-              ConvertFrom-ClaudeGoalStatusLine -Line $line
-            }
-            if ($null -ne $parsed) {
-              $result = $parsed
+            if ($line -notmatch $goalTokenPattern) { continue }
+            if ($Utf8NoBom.GetByteCount($line) -gt $MaxLineBytes) {
+              $result = $hardUnknown
               $found = $true
               break
             }
+            Update-ClaudeGoalLineageFromLine -Scan $lineage -Line $line
+            $found = $lineage.complete -or $lineage.invalid
           }
           if ($found) { break }
 
           $carry = [string]$parts[0]
           if ($Utf8NoBom.GetByteCount($carry) -gt $MaxLineBytes) {
-            if ($carry.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
+            if ($carry -match $goalTokenPattern) {
               $result = $hardUnknown
               $found = $true
             } else {
@@ -1598,14 +1737,25 @@ function Get-ClaudeGoalTranscriptState {
           # known irrelevant and can be skipped safely. A token-bearing one was
           # converted to unknown while streaming above.
           $line = $carry.TrimEnd([char]13)
-          if (-not $lineOversize -and $line.IndexOf($goalToken, [StringComparison]::Ordinal) -ge 0) {
-            $parsed = ConvertFrom-ClaudeGoalStatusLine -Line $line
-            if ($null -ne $parsed) { $result = $parsed }
+          if (-not $lineOversize -and $line -match $goalTokenPattern) {
+            Update-ClaudeGoalLineageFromLine -Scan $lineage -Line $line
           }
         } elseif (-not $found -and $limited -and $position -le $scanFloor) {
           # The bounded synchronous prompt hook did not see enough transcript to
           # prove there is no older active goal. Unknown is the safe result.
           $result = $unknown
+        }
+        if ([string]$result.state -ne 'unverifiable') {
+          if ($lineage.invalid -or ($lineage.linked -and -not $lineage.complete)) {
+            $result = $unknown
+          } elseif ($lineage.linked) {
+            $result = if ($null -ne $lineage.goal) { $lineage.goal } else {
+              [pscustomobject]@{ state = 'none'; marker = ''; marker_unix_ms = [int64]0 }
+            }
+            $result | Add-Member -NotePropertyName lineage_verified -NotePropertyValue $true -Force
+          } elseif ($null -ne $lineage.legacyGoal) {
+            $result = $lineage.legacyGoal
+          }
         }
       } finally {
         if ($null -ne $stream) { $stream.Dispose() }
@@ -2626,14 +2776,39 @@ function Get-ThreadDatabaseInfo {
     [string]$SessionHome
   )
 
-  $cacheKey = ($SqliteHome + '|' + $SessionHome + '|' + $ThreadId).ToLowerInvariant()
-  if ($script:ThreadDatabaseCache.ContainsKey($cacheKey)) {
-    return $script:ThreadDatabaseCache[$cacheKey]
-  }
   if ([string]::IsNullOrWhiteSpace($ThreadId) -or [string]::IsNullOrWhiteSpace($SqliteHome) -or [string]::IsNullOrWhiteSpace($SessionHome)) {
     return [pscustomobject]@{ ok = $false; found = $false; classification = 'unknown'; rolloutPath = ''; error = 'thread identity missing' }
   }
+  $cacheKey = ($SqliteHome + '|' + $SessionHome + '|' + $ThreadId).ToLowerInvariant()
   $database = Get-StateDatabasePath -SqliteHome $SqliteHome
+  $getDatabaseStamp = {
+    param([string]$Path)
+    try {
+      $parts = foreach ($leaf in @($Path, ($Path + '-wal'))) {
+        $file = [IO.FileInfo]::new($leaf)
+        $file.Refresh()
+        if ($file.Exists) {
+          '{0}:{1}:{2}' -f $file.Length, $file.LastWriteTimeUtc.Ticks, $file.CreationTimeUtc.Ticks
+        } else { 'missing' }
+      }
+      return $Path + '|' + ($parts -join '|')
+    } catch { return '' }
+  }
+  $stamp = & $getDatabaseStamp $database
+  $nowTicks = [Diagnostics.Stopwatch]::GetTimestamp()
+  if ($script:ThreadDatabaseCache.ContainsKey($cacheKey)) {
+    $cached = $script:ThreadDatabaseCache[$cacheKey]
+    # A resumed thread can acquire a different rollout without changing its
+    # ID. Observe DB/WAL writes immediately and cap even an unchanged stamp at
+    # one monotonic second (coarse timestamps must not pin an old rollout).
+    if (-not [string]::IsNullOrWhiteSpace($stamp) -and
+        [string]$cached.stamp -ceq $stamp -and
+        [int64]$cached.expiresAtTicks -gt $nowTicks -and
+        (Test-Path -LiteralPath ([string]$cached.info.rolloutPath) -PathType Leaf)) {
+      return $cached.info
+    }
+    [void]$script:ThreadDatabaseCache.Remove($cacheKey)
+  }
   $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT rollout_path, COALESCE(thread_source,''), COALESCE(source,'') FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 3
   if (-not $row.ok -and $row.error -match '(?i)no such column') {
     $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT rollout_path, '', COALESCE(source,'') FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 3
@@ -2643,22 +2818,43 @@ function Get-ThreadDatabaseInfo {
   }
   $threadSource = [string]$row.values[1]
   $source = [string]$row.values[2]
-  $classification = if ($threadSource -eq 'subagent' -or $source -match '(?i)"subagent"') {
+  $edge = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT child_thread_id FROM thread_spawn_edges WHERE child_thread_id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 1
+  $classification = if (($edge.ok -and $edge.found) -or $threadSource -eq 'subagent' -or $source -match '(?i)"subagent"') {
     'subagent'
   } elseif (-not [string]::IsNullOrWhiteSpace($threadSource) -or -not [string]::IsNullOrWhiteSpace($source)) {
     'root'
   } else {
     'unknown'
   }
+  # Only the authoritative indexed path (or its exact cross-home translation)
+  # is relevant. A missing path is not a reason to search years of history.
+  $rolloutPath = [string]$row.values[0]
+  if ([string]::IsNullOrWhiteSpace($rolloutPath) -or
+      -not (Test-Path -LiteralPath $rolloutPath -PathType Leaf)) {
+    $normalized = $rolloutPath.Replace('\', '/')
+    $marker = $normalized.IndexOf('/.codex/', [StringComparison]::OrdinalIgnoreCase)
+    $rolloutPath = ''
+    if ($marker -ge 0) {
+      $relative = $normalized.Substring($marker + '/.codex/'.Length).Replace('/', [IO.Path]::DirectorySeparatorChar)
+      $translated = Join-Path $SessionHome $relative
+      if (Test-Path -LiteralPath $translated -PathType Leaf) { $rolloutPath = $translated }
+    }
+  }
   $info = [pscustomobject]@{
     ok = $true
     found = $true
     classification = $classification
-    rolloutPath = Resolve-RolloutPath -DatabasePathValue ([string]$row.values[0]) -SessionHome $SessionHome
+    rolloutPath = $rolloutPath
     error = ''
   }
-  if (-not [string]::IsNullOrWhiteSpace($info.rolloutPath)) {
-    $script:ThreadDatabaseCache[$cacheKey] = $info
+  if (-not [string]::IsNullOrWhiteSpace($info.rolloutPath) -and
+      -not [string]::IsNullOrWhiteSpace($stamp) -and
+      $stamp -ceq (& $getDatabaseStamp $database)) {
+    $script:ThreadDatabaseCache[$cacheKey] = [pscustomobject]@{
+      info = $info
+      stamp = $stamp
+      expiresAtTicks = $nowTicks + [Diagnostics.Stopwatch]::Frequency
+    }
   }
   return $info
 }
@@ -2775,6 +2971,11 @@ function Get-ActiveDescendants {
       return [pscustomobject]@{ ok = $false; busy = $false; count = $active; invalidEvidence = $false; error = $childInfo.error }
     }
     $rolloutPath = if ($childInfo.found) { [string]$childInfo.rolloutPath } else { '' }
+    if ($childInfo.found -and [string]::IsNullOrWhiteSpace($rolloutPath)) {
+      # The indexed incarnation is authoritative even before its file appears;
+      # an older same-thread rollout cannot prove that this child is idle.
+      return [pscustomobject]@{ ok = $false; busy = $true; count = ($active + 1); invalidEvidence = $true; error = 'indexed descendant rollout unavailable' }
+    }
     if ([string]::IsNullOrWhiteSpace($rolloutPath)) {
       $rolloutPath = Find-RolloutPathByThread -ThreadId $childId -SessionHome $SessionHome
     }
@@ -3295,7 +3496,26 @@ function Test-RecordIdleGate {
           -not [string]::IsNullOrWhiteSpace($recordGoalMarker) -and
           -not [string]::IsNullOrWhiteSpace($latestMarker) -and
           $latestMarker -ne $recordGoalMarker
-        if ($terminalTransition) {
+        $verifiedGoalAbsent = $false
+        if ($latestState -eq 'none' -and [bool](Get-ObjectValue $latestGoal 'lineage_verified' $false)) {
+          # A pre-upgrade candidate may contain a goal from an abandoned branch.
+          # Reconcile it only against a complete current lineage and the exact
+          # prompt epoch; an arbitrary missing transcript is not such proof.
+          $sessionState = Read-ClaudeSessionState -SessionId ([string](Get-ObjectValue $Record 'thread_id' ''))
+          $recordEpoch = [int64](Get-ObjectValue $Record 'claude_session_epoch' 0)
+          $recordPrompt = [string](Get-ObjectValue $Record 'turn_id' '')
+          $verifiedGoalAbsent = $null -ne $sessionState -and $recordEpoch -gt 0 -and
+            $recordEpoch -eq [int64](Get-ObjectValue $sessionState 'epoch' 0) -and
+            -not [string]::IsNullOrWhiteSpace($recordPrompt) -and
+            $recordPrompt -ceq [string](Get-ObjectValue $sessionState 'prompt_id' '') -and
+            [string]::Equals([string](Get-ObjectValue $Record 'candidate_rollout_path' ''),
+              [string](Get-ObjectValue $sessionState 'transcript_path' ''), [StringComparison]::OrdinalIgnoreCase)
+        }
+        if ($verifiedGoalAbsent) {
+          Set-RecordValue -Record $Record -Name 'claude_goal_state' -Value 'none'
+          Set-RecordValue -Record $Record -Name 'claude_goal_marker' -Value ''
+          $needsIdleFallback = $false
+        } elseif ($terminalTransition) {
           if ($latestState -eq 'cleared') {
             return New-GateResult -State 'cancelled' -Reason 'claude-goal-cleared' -RetryAtUnixMs $now
           }
@@ -3438,6 +3658,9 @@ function Test-RecordIdleGate {
     return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'classification-unknown'
   }
   $rolloutPath = if ($databaseInfo.found) { [string]$databaseInfo.rolloutPath } else { '' }
+  if ($databaseInfo.found -and [string]::IsNullOrWhiteSpace($rolloutPath)) {
+    return Get-UnknownGateResult -Record $Record -Config $Config -Reason 'rollout-path-unknown' -NeverPromote $true
+  }
   if ([string]::IsNullOrWhiteSpace($rolloutPath)) {
     $rolloutPath = [string](Get-ObjectValue $Record 'candidate_rollout_path' '')
     $rolloutPath = Resolve-RolloutPath -DatabasePathValue $rolloutPath -SessionHome $sessionHome
@@ -4139,6 +4362,16 @@ function Assert-QueuedRecord {
   }
   if ([int](Get-ObjectValue $Record 'schema' 0) -ne 1) {
     throw 'queue item has an unsupported schema'
+  }
+  $provider = [string](Get-ObjectValue $Record 'provider' 'codex')
+  $candidateKind = [string](Get-ObjectValue $Record 'candidate_kind' 'legacy')
+  $supportedKinds = if ($provider -eq 'claude') {
+    @('claude_stop', 'claude_stop_failure')
+  } elseif ($provider -eq 'codex') {
+    @('legacy', 'hook_stop', 'rollout_watch', 'rollout_probe')
+  } else { @() }
+  if ($candidateKind -notin $supportedKinds) {
+    throw 'queue item has an unsupported provider or candidate kind'
   }
   $key = [string](Get-ObjectValue $Record 'key' '')
   if ($key -notmatch '^[0-9a-f]{64}$' -or $key -ne $ExpectedKey) {

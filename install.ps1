@@ -320,6 +320,11 @@ function Ensure-TopLevelNotify {
     if ($match.Value -notmatch [regex]::Escape($ExpectedMarker)) {
       throw "Existing notify command in $ConfigPath is unrelated; refusing to overwrite it."
     }
+    # Some integrations wrap the existing notifier and forward to it. Updating
+    # the runtime at the same path must not remove the outer integration.
+    if ($match.Value -match '"--previous-notify"') {
+      return
+    }
     if ($match.Value -ne $NotifyLine) {
       $updated = $text.Remove($match.Index, $match.Length).Insert($match.Index, $NotifyLine)
       Write-TextAtomic -Path $ConfigPath -Content $updated
@@ -772,6 +777,28 @@ function Restore-WindowsInstallation {
   }
 }
 
+function Test-OwnedNotifierProcess {
+  param([object]$Process, [string]$HomePath)
+  if ($Process.Name -notin @('powershell.exe', 'pwsh.exe', 'wscript.exe')) { return $false }
+  $command = [string]$Process.CommandLine
+  $homePrefix = [IO.Path]::GetFullPath($HomePath).TrimEnd('\') + '\'
+  $executable = '^(?:"[^"]+"|[^\s"]+)\s+'
+  foreach ($leaf in @('watch-codex-ntfy.ps1', 'watch-codex-ntfy-hidden.vbs', 'notify-ntfy.ps1')) {
+    $path = [regex]::Escape($homePrefix + $leaf)
+    $scriptArgument = '(?:"' + $path + '"|' + $path + ')(?=\s|$)'
+    if ($leaf -like '*.vbs') {
+      if ($Process.Name -ne 'wscript.exe') { continue }
+      $prefix = $executable + '(?:(?://B|//Nologo)\s+)*'
+    } else {
+      if ($Process.Name -notin @('powershell.exe', 'pwsh.exe')) { continue }
+      $prefix = $executable + '(?:(?:-(?:NoProfile|NonInteractive|NoLogo|Sta|Mta)|-(?:ExecutionPolicy|WindowStyle)\s+[A-Za-z]+)\s+)*-File\s+'
+    }
+    $suffix = if ($leaf -eq 'notify-ntfy.ps1') { '\s+-(?:Worker|Continuous|ScanRollouts|Maintenance)(?=\s|$)' } else { '(?:\s|$)' }
+    if ($command -match ('(?i)' + $prefix + $scriptArgument + $suffix)) { return $true }
+  }
+  return $false
+}
+
 function Stop-LegacyTask {
   try {
     & schtasks.exe /End /TN $TaskName 2>$null | Out-Null
@@ -781,9 +808,7 @@ function Stop-LegacyTask {
   $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
   do {
     $watchers = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -in @('powershell.exe', 'pwsh.exe', 'wscript.exe') -and
-        ($_.CommandLine -match '(?i)watch-codex-ntfy(?:-hidden)?\.(?:ps1|vbs)' -or
-         $_.CommandLine -match '(?i)notify-ntfy\.ps1.*-(?:Worker|Continuous|ScanRollouts|Maintenance)(?:\s|$)')
+        Test-OwnedNotifierProcess -Process $_ -HomePath $CodexHome
       })
     if ($watchers.Count -eq 0) {
       return
@@ -791,16 +816,37 @@ function Stop-LegacyTask {
     Start-Sleep -Milliseconds 250
   } while ([DateTimeOffset]::UtcNow -lt $deadline)
   foreach ($process in $watchers) {
-    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    $runtime = $null
+    try {
+      $runtime = [Diagnostics.Process]::GetProcessById([int]$process.ProcessId)
+      # Pin the process object to its kernel handle before comparing identity;
+      # killing a PID after a separate CIM check can race with PID reuse.
+      [void]$runtime.Handle
+      $current = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f [int]$process.ProcessId) -ErrorAction Stop
+      $startTicks = $runtime.StartTime.ToUniversalTime().Ticks
+      if ($null -ne $current -and $current.CreationDate -eq $process.CreationDate -and
+          ($startTicks - ($startTicks % 10)) -eq $current.CreationDate.ToUniversalTime().Ticks -and
+          (Test-OwnedNotifierProcess -Process $current -HomePath $CodexHome)) {
+        $runtime.Kill()
+      }
+    } catch [ArgumentException] {
+      # The observed process exited before its handle could be acquired.
+    } catch [InvalidOperationException] {
+      # The pinned process already exited; never retry with a fresh PID.
+    } finally {
+      if ($null -ne $runtime) { $runtime.Dispose() }
+    }
   }
-  $ownedIds = @($watchers.ProcessId | Sort-Object -Unique)
   $forcedDeadline = [DateTimeOffset]::UtcNow.AddSeconds(120)
   do {
     $aliveIds = @()
-    foreach ($ownedId in $ownedIds) {
+    foreach ($previous in $watchers) {
       try {
-        [System.Diagnostics.Process]::GetProcessById([int]$ownedId) | Out-Null
-        $aliveIds += $ownedId
+        $current = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f [int]$previous.ProcessId) -ErrorAction Stop
+        if ($null -ne $current -and $current.CreationDate -eq $previous.CreationDate -and
+            (Test-OwnedNotifierProcess -Process $current -HomePath $CodexHome)) {
+          $aliveIds += $previous.ProcessId
+        }
       } catch {
       }
     }
@@ -897,12 +943,16 @@ function Ensure-ScheduledWorker {
 function Test-OwnedScheduledTask {
   param([object]$Task)
 
-  if ($null -eq $Task) { return $false }
+  if ($null -eq $Task -or @($Task.Actions).Count -eq 0) { return $false }
   foreach ($action in @($Task.Actions)) {
-    $description = '{0} {1} {2}' -f $action.Execute, $action.Arguments, $action.WorkingDirectory
-    if ($description -match '(?i)(?:watch-codex-ntfy|notify-ntfy)') { return $true }
+    $execute = ([string]$action.Execute).Trim('"')
+    $process = [pscustomobject]@{
+      Name = [IO.Path]::GetFileName($execute)
+      CommandLine = '"' + $execute + '" ' + [string]$action.Arguments
+    }
+    if (-not (Test-OwnedNotifierProcess -Process $process -HomePath $CodexHome)) { return $false }
   }
-  return $false
+  return $true
 }
 
 function Convert-WslHomeToUnc {
