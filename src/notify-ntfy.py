@@ -33,7 +33,7 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.5.3"
+VERSION = "2.5.4"
 MAX_NTFY_MESSAGE_BYTES = 3500
 SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
@@ -368,6 +368,16 @@ def safe_server_display(value: str) -> str:
         return "invalid"
 
 
+def is_notification_thread_title(value: object) -> bool:
+    # Do not expose an imported chat's internal handoff as its display title.
+    # Reject the whole candidate, then fall back to the saved conversation name.
+    return isinstance(value, str) and bool(value.strip()) and not re.match(
+        r"^[\s\ufeff]*</?(?:codex_delegation|source_thread_id)(?=[\s/>]|$)",
+        value,
+        re.IGNORECASE,
+    )
+
+
 def thread_title(runtime: Runtime, thread_id: str, session_home: str = "", sqlite_home: str = "") -> str:
     if not thread_id:
         return ""
@@ -376,7 +386,7 @@ def thread_title(runtime: Runtime, thread_id: str, session_home: str = "", sqlit
         "SELECT COALESCE(title, '') FROM threads WHERE id = ? LIMIT 1",
         thread_id,
     )
-    if database_title:
+    if is_notification_thread_title(database_title):
         return database_title
     index = Path(session_home or runtime.codex_home) / "session_index.jsonl"
     if not index.exists():
@@ -389,8 +399,8 @@ def thread_title(runtime: Runtime, thread_id: str, session_home: str = "", sqlit
                     continue
                 with contextlib.suppress(json.JSONDecodeError):
                     item = json.loads(line)
-                    if item.get("id") == thread_id and item.get("thread_name"):
-                        title = str(item["thread_name"])
+                    if isinstance(item, dict) and item.get("id") == thread_id and is_notification_thread_title(item.get("thread_name")):
+                        title = item["thread_name"]
     except OSError:
         pass
     return title

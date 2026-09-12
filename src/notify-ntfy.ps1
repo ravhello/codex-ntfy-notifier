@@ -32,7 +32,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.5.3'
+$ScriptVersion = '2.5.4'
 $MaxNtfyMessageBytes = 3500
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
@@ -535,6 +535,15 @@ function Get-ProjectName {
   return [string]$parts[-1]
 }
 
+function Test-NotificationThreadTitle {
+  param([object]$Value)
+
+  if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) { return $false }
+  # Imported chats can retain their internal handoff as SQLite's title. Reject
+  # that candidate, rather than stripping tags and exposing the handoff body.
+  return $Value -notmatch '(?i)^[\s\uFEFF]*</?(?:codex_delegation|source_thread_id)(?=[\s/>]|$)'
+}
+
 function Get-ThreadTitle {
   param(
     [string]$ThreadId,
@@ -548,7 +557,7 @@ function Get-ThreadTitle {
   if (-not [string]::IsNullOrWhiteSpace($SqliteHome)) {
     $database = Get-StateDatabasePath -SqliteHome $SqliteHome
     $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT COALESCE(title,'') FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 1
-    if ($row.ok -and $row.found -and -not [string]::IsNullOrWhiteSpace([string]$row.values[0])) {
+    if ($row.ok -and $row.found -and (Test-NotificationThreadTitle -Value $row.values[0])) {
       return [string]$row.values[0]
     }
   }
@@ -569,8 +578,12 @@ function Get-ThreadTitle {
       try {
         $item = $line | ConvertFrom-Json
         if ([string](Get-ObjectValue $item 'id' '') -eq $ThreadId) {
-          $candidate = [string](Get-ObjectValue $item 'thread_name' '')
-          if (-not [string]::IsNullOrWhiteSpace($candidate)) { $title = $candidate }
+          # Read directly: returning through a PowerShell function would unwrap
+          # a one-element JSON array and incorrectly treat it as a string.
+          $titleProperty = $item.PSObject.Properties['thread_name']
+          $candidate = $null
+          if ($null -ne $titleProperty) { $candidate = $titleProperty.Value }
+          if (Test-NotificationThreadTitle -Value $candidate) { $title = $candidate }
         }
       } catch {
         continue

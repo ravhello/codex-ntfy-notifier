@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.5.4] - 2026-09-12
+
+### Fixed
+
+- Codex notification titles no longer display internal delegation wrappers from imported conversations. PowerShell and Python skip those title candidates and use the latest valid saved conversation name, or the project name when none is available. Ordinary database titles retain precedence; conversation history and names are not modified.
+
 ## [2.5.3] - 2026-09-12
 
 ### Fixed
@@ -238,7 +244,8 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.3...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.4...HEAD
+[2.5.4]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.4
 [2.5.3]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.3
 [2.5.2]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.2
 [2.5.1]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.1
