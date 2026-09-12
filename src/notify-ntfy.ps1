@@ -2971,12 +2971,9 @@ function Get-ActiveDescendants {
       return [pscustomobject]@{ ok = $false; busy = $false; count = $active; invalidEvidence = $false; error = $childInfo.error }
     }
     $rolloutPath = if ($childInfo.found) { [string]$childInfo.rolloutPath } else { '' }
-    if ($childInfo.found -and [string]::IsNullOrWhiteSpace($rolloutPath)) {
-      # The indexed incarnation is authoritative even before its file appears;
-      # an older same-thread rollout cannot prove that this child is idle.
-      return [pscustomobject]@{ ok = $false; busy = $true; count = ($active + 1); invalidEvidence = $true; error = 'indexed descendant rollout unavailable' }
-    }
-    if ([string]::IsNullOrWhiteSpace($rolloutPath)) {
+    # An indexed incarnation remains authoritative while its file is pending.
+    # Use the existing missing-child busy/orphan clock, not an older rollout.
+    if (-not $childInfo.found -and [string]::IsNullOrWhiteSpace($rolloutPath)) {
       $rolloutPath = Find-RolloutPathByThread -ThreadId $childId -SessionHome $SessionHome
     }
     if ([string]::IsNullOrWhiteSpace($rolloutPath)) {

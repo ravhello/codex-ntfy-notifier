@@ -2180,7 +2180,13 @@ $publicState = $publicProbe.state
                 finally:
                     if process.poll() is None:
                         process.terminate()
-                        process.communicate(timeout=5)
+                    # Reap even a worker that exited between the assertion and
+                    # cleanup, so a failure cannot leak its captured pipes.
+                    try:
+                        process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=10)
                     shutil.rmtree(self.state, ignore_errors=True)
                     shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
                     database.unlink(missing_ok=True)

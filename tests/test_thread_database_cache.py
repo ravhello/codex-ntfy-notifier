@@ -55,17 +55,25 @@ function Get-FastRolloutProbe {
 function Get-FastRolloutLatestProbe {
   param($Path, $IncludeMessage)
   $script:SelectedProbePath = $Path
-  throw 'PROBE_CAPTURED'
+  $entry = [IO.File]::ReadAllText($Path) | ConvertFrom-Json
+  return [pscustomobject]@{
+    ok = $true; state = [pscustomobject]@{
+      lastLifecycleType = [string]$entry.payload.type
+      modifiedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    }
+  }
 }
 $script:StateDatabasePathCache = @{}
 $script:ThreadDatabaseCache = @{}
 $script:RolloutProbeCache = @{}
+$script:TestRecords = @{}
 $CodexHome = $env:CACHE_HOME
 while ($null -ne ($line = [Console]::ReadLine())) {
   $request = $line | ConvertFrom-Json
   if ($request.action -eq 'quit') { break }
   $script:SelectedProbePath = ''
   $info = $null
+  $record = $null
   try {
     $targetHome = if ($request.home) { [string]$request.home } else { $CodexHome }
     $cacheKey = ($targetHome + '|' + $targetHome + '|' + $request.thread).ToLowerInvariant()
@@ -91,8 +99,14 @@ while ($null -ne ($line = [Console]::ReadLine())) {
       if ($request.action -eq 'gate') {
         $info = Test-RecordIdleGate -Record $record -Config $config
       } elseif ($request.action -eq 'children') {
+        if ($script:TestRecords.ContainsKey($cacheKey)) {
+          $record = $script:TestRecords[$cacheKey]
+        } else { $script:TestRecords[$cacheKey] = $record }
+        $probeNow = if ($request.now) { [int64]$request.now } else {
+          [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        }
         $info = Get-ActiveDescendants -Record $record -Config $config `
-          -NowUnixMs ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -SessionHome $targetHome -SqliteHome $targetHome
+          -NowUnixMs $probeNow -SessionHome $targetHome -SqliteHome $targetHome
       }
     }
     $errorText = ''
@@ -103,6 +117,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
   [pscustomobject]@{
     info = $info; queries = $script:QueryCount; recursion = $script:RecursiveAttempts
     cache_count = $script:ThreadDatabaseCache.Count; probe_path = $script:SelectedProbePath; error = $errorText
+    unknown_since = if ($null -ne $record) { $record.descendant_unknown_since } else { $null }
   } | ConvertTo-Json -Depth 8 -Compress
 }
 """
@@ -291,11 +306,38 @@ class ThreadDatabaseCacheTests(unittest.TestCase):
             connection.execute("INSERT INTO thread_spawn_edges VALUES (?, ?, 'running')", (parent, self.thread_id))
             connection.commit()
         absent = self.ask("children", thread=parent)
-        self.assertFalse(absent["info"]["ok"])
+        self.assertTrue(absent["info"]["ok"])
         self.assertTrue(absent["info"]["busy"])
-        self.assertTrue(absent["info"]["invalidEvidence"])
-        future.write_text('{}\n', encoding="utf-8")
-        self.assertEqual(self.ask("children", thread=parent)["probe_path"], str(future))
+        self.assertEqual(absent["info"]["count"], 1)
+        self.assertFalse(absent["info"]["invalidEvidence"])
+        first_seen = absent["unknown_since"][self.thread_id]
+        later = self.ask("children", thread=parent, now=str(first_seen + 31_000))
+        self.assertTrue(later["info"]["ok"])
+        self.assertTrue(later["info"]["busy"])
+        self.assertEqual(later["unknown_since"][self.thread_id], first_seen)
+        future.write_text('{"type":"event_msg","payload":{"type":"task_complete"}}\n', encoding="utf-8")
+        available = self.ask("children", thread=parent)
+        self.assertEqual(available["probe_path"], str(future))
+        self.assertTrue(available["info"]["ok"])
+        self.assertFalse(available["info"]["busy"])
+        self.assertEqual(available["unknown_since"], {})
+
+    def test_closed_edge_clears_missing_indexed_child_without_reading_rollout(self) -> None:
+        parent = str(uuid.uuid4())
+        self.set_path(self.home / "sessions" / "not-yet-created.jsonl")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("INSERT INTO thread_spawn_edges VALUES (?, ?, 'running')", (parent, self.thread_id))
+            connection.commit()
+        self.assertTrue(self.ask("children", thread=parent)["info"]["busy"])
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("UPDATE thread_spawn_edges SET status='closed' WHERE child_thread_id=?", (self.thread_id,))
+            connection.commit()
+        closed = self.ask("children", thread=parent)
+        self.assertTrue(closed["info"]["ok"])
+        self.assertFalse(closed["info"]["busy"])
+        self.assertEqual(closed["info"]["count"], 0)
+        self.assertEqual(closed["unknown_since"], {})
+        self.assertEqual(closed["probe_path"], "")
 
 
 if __name__ == "__main__":
