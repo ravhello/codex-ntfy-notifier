@@ -32,7 +32,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.5.4'
+$ScriptVersion = '2.5.5'
 $MaxNtfyMessageBytes = 3500
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
@@ -293,7 +293,7 @@ function Get-Config {
       $rootOrigin = [string](Get-ObjectValue $entry 'origin' '')
       $sqliteHome = [string](Get-FirstObjectValue $entry @('sqlite_path', 'sqlite_home', 'session_sqlite_home'))
     }
-    $path = $path.Trim()
+    $path = ConvertTo-NormalizedWatchPath -Path $path.Trim()
     if ([string]::IsNullOrWhiteSpace($path)) { continue }
     $rootKey = $path.ToLowerInvariant()
     if ($seenWatchRoots.ContainsKey($rootKey)) { continue }
@@ -302,7 +302,7 @@ function Get-Config {
     $watchRoots += [pscustomobject]@{
       path = $path
       session_codex_home = $path
-      session_sqlite_home = $sqliteHome.Trim()
+      session_sqlite_home = ConvertTo-NormalizedWatchPath -Path $sqliteHome.Trim()
       origin = Sanitize-NotificationText -Text $rootOrigin -MaxLength 100
     }
   }
@@ -2451,11 +2451,16 @@ public static class CodexNtfyWinSqlite {
             Dictionary<string, object> envelope = serializer.DeserializeObject(line) as Dictionary<string, object>;
             if (envelope == null) return 0;
             object envelopeType;
-            if (!envelope.TryGetValue("type", out envelopeType) || !String.Equals(envelopeType as string, "event_msg", StringComparison.Ordinal))
+            if (!envelope.TryGetValue("type", out envelopeType)) return 0;
+            bool responseItem = String.Equals(envelopeType as string, "response_item", StringComparison.Ordinal);
+            if (!responseItem && !String.Equals(envelopeType as string, "event_msg", StringComparison.Ordinal))
                 return 0;
             object payloadValue;
-            if (!envelope.TryGetValue("payload", out payloadValue)) return -1;
+            if (!envelope.TryGetValue("payload", out payloadValue)) return responseItem ? 0 : -1;
             payload = payloadValue as Dictionary<string, object>;
+            // A response item is optional user evidence, never lifecycle
+            // authority. Ignore invalid containers just as the other probes do.
+            if (responseItem) return payload == null ? 0 : 2;
             return payload == null ? -1 : 1;
         } catch {
             return -1;
@@ -2472,6 +2477,47 @@ public static class CodexNtfyWinSqlite {
             }
         }
         return String.Empty;
+    }
+
+    private static bool ResponseItemHasUserEvidence(Dictionary<string, object> payload, string currentTurn) {
+        if (String.IsNullOrWhiteSpace(currentTurn)) return false;
+        object rawMetadata;
+        if (!payload.TryGetValue("internal_chat_message_metadata_passthrough", out rawMetadata)) return false;
+        Dictionary<string, object> metadata = rawMetadata as Dictionary<string, object>;
+        if (metadata == null || !String.Equals(JsonString(metadata, "turn_id"), currentTurn, StringComparison.Ordinal)) return false;
+        if (String.Equals(JsonString(payload, "type"), "function_call_output", StringComparison.Ordinal)) {
+            // Host-injected cross-chat input is not an ordinary tool receipt.
+            // Heartbeats and all call-correlated tool outputs remain excluded.
+            if (payload.ContainsKey("call_id") ||
+                !String.Equals(JsonString(payload, "namespace"), "codex_app", StringComparison.Ordinal) ||
+                !String.Equals(JsonString(payload, "name"), "send_message_to_thread", StringComparison.Ordinal)) return false;
+            object rawOutput;
+            if (!payload.TryGetValue("output", out rawOutput) || !(rawOutput is string)) return false;
+            System.Text.RegularExpressions.Match delegation = System.Text.RegularExpressions.Regex.Match(
+                (string)rawOutput,
+                @"(?s)\A\s*<codex_delegation>\s*<source_thread_id>\s*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\s*</source_thread_id>\s*<input>(.*?)</input>\s*</codex_delegation>\s*\z");
+            return delegation.Success && !String.IsNullOrWhiteSpace(delegation.Groups[1].Value);
+        }
+        if (!String.Equals(JsonString(payload, "type"), "message", StringComparison.Ordinal) ||
+            !String.Equals(JsonString(payload, "role"), "user", StringComparison.Ordinal)) return false;
+        object rawContent, rawKinds;
+        if (!payload.TryGetValue("content", out rawContent) || !metadata.TryGetValue("content_item_kinds", out rawKinds)) return false;
+        object[] content = rawContent as object[];
+        object[] kinds = rawKinds as object[];
+        if (content == null || kinds == null || content.Length == 0 || content.Length != kinds.Length) return false;
+        bool hasUserText = false;
+        for (int index = 0; index < content.Length; index++) {
+            Dictionary<string, object> item = content[index] as Dictionary<string, object>;
+            string kind = kinds[index] as string;
+            object rawType;
+            if (item == null || kind == null || !item.TryGetValue("type", out rawType) || !(rawType is string)) return false;
+            if (!String.Equals(kind, "user.text", StringComparison.Ordinal)) continue;
+            object rawText;
+            if (!String.Equals(rawType as string, "input_text", StringComparison.Ordinal) ||
+                !item.TryGetValue("text", out rawText) || !(rawText is string) || String.IsNullOrWhiteSpace((string)rawText)) return false;
+            hasUserText = true;
+        }
+        return hasUserText;
     }
 
     private static string SummaryMessage(Dictionary<string, object> payload, bool includeMessage) {
@@ -2542,9 +2588,15 @@ public static class CodexNtfyWinSqlite {
                     firstLine = false;
                     if (line.Length > 0 && line[0] == '\uFEFF') line = line.Substring(1);
                 }
-                if (line.IndexOf("\"event_msg\"", StringComparison.Ordinal) < 0 ||
+                bool possibleUserEvidence = line.IndexOf("\"response_item\"", StringComparison.Ordinal) >= 0 &&
+                    line.IndexOf("\"internal_chat_message_metadata_passthrough\"", StringComparison.Ordinal) >= 0 &&
+                    (line.IndexOf("\"user.text\"", StringComparison.Ordinal) >= 0 ||
+                     (line.IndexOf("\"function_call_output\"", StringComparison.Ordinal) >= 0 &&
+                      line.IndexOf("\"codex_app\"", StringComparison.Ordinal) >= 0 &&
+                      line.IndexOf("\"send_message_to_thread\"", StringComparison.Ordinal) >= 0));
+                if ((!possibleUserEvidence && line.IndexOf("\"event_msg\"", StringComparison.Ordinal) < 0) ||
                     line.IndexOf("\"payload\"", StringComparison.Ordinal) < 0) continue;
-                if (line.IndexOf("\"task_started\"", StringComparison.Ordinal) < 0 &&
+                if (!possibleUserEvidence && line.IndexOf("\"task_started\"", StringComparison.Ordinal) < 0 &&
                     line.IndexOf("\"task_complete\"", StringComparison.Ordinal) < 0 &&
                     line.IndexOf("\"turn_aborted\"", StringComparison.Ordinal) < 0 &&
                     line.IndexOf("\"user_message\"", StringComparison.Ordinal) < 0 &&
@@ -2557,6 +2609,16 @@ public static class CodexNtfyWinSqlite {
                 // streaming fallback for this snapshot.
                 if (parseStatus < 0) return new string[0];
                 if (parseStatus == 0) continue;
+                if (parseStatus == 2) {
+                    // Modern desktop rollouts retain user input as response items.
+                    // Their metadata distinguishes real user text from injected
+                    // environment records without storing any message content.
+                    if (openTurns.ContainsKey(currentTurn) && ResponseItemHasUserEvidence(payload, currentTurn)) {
+                        openTurnUserMessages[currentTurn] = true;
+                        if (String.Equals(currentTurn, candidateTurnId, StringComparison.OrdinalIgnoreCase)) candidateUserMessage = true;
+                    }
+                    continue;
+                }
                 string eventType = JsonString(payload, "type");
                 if (String.IsNullOrWhiteSpace(eventType)) return new string[0];
                 eventType = eventType.Trim();
@@ -2740,6 +2802,28 @@ function Get-RecentThreadRolloutPaths {
   return @()
 }
 
+function ConvertTo-NormalizedWatchPath {
+  param([string]$Path)
+
+  # Codex's SQLite index may use Win32 extended paths for ordinary local
+  # files. Canonicalize these before UNC classification and cursor identity;
+  # otherwise a local \\?\C:\... rollout is silently sent to the remote lane.
+  if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+    return '\\' + $Path.Substring(8)
+  }
+  if ($Path -match '^\\\\\?\\[A-Za-z]:\\') {
+    return $Path.Substring(4)
+  }
+  return $Path
+}
+
+function Test-RemoteWatchPath {
+  param([string]$Path)
+
+  $normalized = ConvertTo-NormalizedWatchPath -Path $Path
+  return $normalized.StartsWith('\\', [StringComparison]::Ordinal)
+}
+
 function Resolve-RolloutPath {
   param(
     [string]$DatabasePathValue,
@@ -2747,6 +2831,8 @@ function Resolve-RolloutPath {
   )
 
   if ([string]::IsNullOrWhiteSpace($DatabasePathValue)) { return '' }
+  $canonicalPath = ConvertTo-NormalizedWatchPath -Path $DatabasePathValue
+  if ($canonicalPath -ne $DatabasePathValue -and (Test-Path -LiteralPath $canonicalPath)) { return $canonicalPath }
   if (Test-Path -LiteralPath $DatabasePathValue) { return $DatabasePathValue }
   $normalized = $DatabasePathValue.Replace('\', '/')
   $marker = $normalized.IndexOf('/.codex/', [StringComparison]::OrdinalIgnoreCase)
@@ -3081,6 +3167,56 @@ function New-RolloutProbeState {
   }
 }
 
+function Test-ResponseItemUserEvidence {
+  param([object]$Payload, [string]$CurrentTurn)
+
+  if ([string]::IsNullOrWhiteSpace($CurrentTurn) -or $Payload -isnot [pscustomobject]) { return $false }
+  $typeProperty = $Payload.PSObject.Properties['type']
+  $metadataProperty = $Payload.PSObject.Properties['internal_chat_message_metadata_passthrough']
+  if ($null -eq $typeProperty -or $null -eq $metadataProperty -or $typeProperty.Value -isnot [string]) { return $false }
+  $metadata = $metadataProperty.Value
+  if ($metadata -isnot [pscustomobject]) { return $false }
+  $turnProperty = $metadata.PSObject.Properties['turn_id']
+  if ($null -eq $turnProperty -or $turnProperty.Value -isnot [string] -or $turnProperty.Value -cne $CurrentTurn) { return $false }
+  if ($typeProperty.Value -ceq 'function_call_output') {
+    $namespaceProperty = $Payload.PSObject.Properties['namespace']
+    $nameProperty = $Payload.PSObject.Properties['name']
+    $outputProperty = $Payload.PSObject.Properties['output']
+    if ($null -ne $Payload.PSObject.Properties['call_id'] -or
+        $null -eq $namespaceProperty -or $namespaceProperty.Value -isnot [string] -or $namespaceProperty.Value -cne 'codex_app' -or
+        $null -eq $nameProperty -or $nameProperty.Value -isnot [string] -or $nameProperty.Value -cne 'send_message_to_thread' -or
+        $null -eq $outputProperty -or $outputProperty.Value -isnot [string]) { return $false }
+    $delegation = [regex]::Match($outputProperty.Value,
+      '(?s)\A\s*<codex_delegation>\s*<source_thread_id>\s*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\s*</source_thread_id>\s*<input>(.*?)</input>\s*</codex_delegation>\s*\z')
+    return $delegation.Success -and -not [string]::IsNullOrWhiteSpace($delegation.Groups[1].Value)
+  }
+  $roleProperty = $Payload.PSObject.Properties['role']
+  if ($typeProperty.Value -cne 'message' -or $null -eq $roleProperty -or
+      $roleProperty.Value -isnot [string] -or $roleProperty.Value -cne 'user') { return $false }
+  $contentProperty = $Payload.PSObject.Properties['content']
+  $kindsProperty = $metadata.PSObject.Properties['content_item_kinds']
+  if ($null -eq $contentProperty -or $null -eq $kindsProperty) { return $false }
+  # Direct property access preserves singleton JSON arrays instead of unwrapping
+  # them through PowerShell's function-output enumeration.
+  $content = $contentProperty.Value
+  $kinds = $kindsProperty.Value
+  if ($content -isnot [array] -or $kinds -isnot [array] -or $content.Count -eq 0 -or $content.Count -ne $kinds.Count) { return $false }
+  $hasUserText = $false
+  for ($index = 0; $index -lt $content.Count; $index++) {
+    $item = $content[$index]
+    $kind = $kinds[$index]
+    if ($item -isnot [pscustomobject] -or $kind -isnot [string]) { return $false }
+    $itemTypeProperty = $item.PSObject.Properties['type']
+    if ($null -eq $itemTypeProperty -or $itemTypeProperty.Value -isnot [string]) { return $false }
+    if ($kind -cne 'user.text') { continue }
+    $textProperty = $item.PSObject.Properties['text']
+    if ($itemTypeProperty.Value -cne 'input_text' -or $null -eq $textProperty -or
+        $textProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($textProperty.Value)) { return $false }
+    $hasUserText = $true
+  }
+  return $hasUserText
+}
+
 function Update-RolloutProbeStateFromLine {
   param(
     [object]$State,
@@ -3088,9 +3224,23 @@ function Update-RolloutProbeStateFromLine {
     [bool]$IncludeMessage = $false
   )
 
-  if ($Line -notmatch '"(?:task_started|task_complete|turn_aborted|thread_goal_updated|user_message)"') { return }
+  $possibleUserEvidence = $Line.Contains('"response_item"') -and
+    $Line.Contains('"internal_chat_message_metadata_passthrough"') -and
+    ($Line.Contains('"user.text"') -or ($Line.Contains('"function_call_output"') -and
+      $Line.Contains('"codex_app"') -and $Line.Contains('"send_message_to_thread"')))
+  if (-not $possibleUserEvidence -and $Line -notmatch '"(?:task_started|task_complete|turn_aborted|thread_goal_updated|user_message)"') { return }
   try {
     $item = $Line | ConvertFrom-Json -ErrorAction Stop
+    $envelopeTypeProperty = if ($item -is [pscustomobject]) { $item.PSObject.Properties['type'] } else { $null }
+    if ($null -ne $envelopeTypeProperty -and $envelopeTypeProperty.Value -is [string] -and $envelopeTypeProperty.Value -ceq 'response_item') {
+      $currentTurn = [string]$State.currentTurnId
+      $payloadProperty = $item.PSObject.Properties['payload']
+      if ($null -ne $payloadProperty -and $State.openTurns.ContainsKey($currentTurn) -and
+          (Test-ResponseItemUserEvidence -Payload $payloadProperty.Value -CurrentTurn $currentTurn)) {
+        $State.userMessageTurns[$currentTurn] = $true
+      }
+      return
+    }
     if ([string](Get-ObjectValue $item 'type' '') -ne 'event_msg') { return }
     $payload = Get-ObjectValue $item 'payload'
     if ($null -eq $payload) {
@@ -3854,7 +4004,11 @@ function Add-RolloutWatchEntry {
     [bool]$ForceReplay = $false
   )
   if ($null -eq $File -or [string]::IsNullOrWhiteSpace([string]$File.FullName)) { return }
-  $fullPathKey = $File.FullName.ToLowerInvariant()
+  $canonicalPath = ConvertTo-NormalizedWatchPath -Path $File.FullName
+  if ($canonicalPath -ne $File.FullName -and (Test-Path -LiteralPath $canonicalPath -PathType Leaf)) {
+    $File = Get-Item -LiteralPath $canonicalPath -ErrorAction Stop
+  }
+  $fullPathKey = $canonicalPath.ToLowerInvariant()
   if ($Found.ContainsKey($fullPathKey)) {
     if ($ForceReplay) { Set-RecordValue -Record $Found[$fullPathKey] -Name 'force_replay' -Value $true }
     return
@@ -3886,13 +4040,13 @@ function Get-RecentRolloutFiles {
   $roots = switch ($ScanScope) {
     'Local' {
       @($localRoot) + @($configuredRoots | Where-Object {
-          -not ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' ''))).StartsWith('\\')
+          -not (Test-RemoteWatchPath -Path ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' ''))))
         })
       break
     }
     'Remote' {
       @($configuredRoots | Where-Object {
-          ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' ''))).StartsWith('\\')
+          Test-RemoteWatchPath -Path ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' '')))
         })
       break
     }
@@ -3933,7 +4087,7 @@ function Get-RecentRolloutFiles {
         if ([string]::IsNullOrWhiteSpace($rolloutPath)) { continue }
         $durableCursorPaths[$rolloutPath.ToLowerInvariant()] = $true
         $sessionHome = [string](Get-ObjectValue $cursor 'session_codex_home' '')
-        $isRemoteCursor = $sessionHome.StartsWith('\\') -or $rolloutPath.StartsWith('\\')
+        $isRemoteCursor = (Test-RemoteWatchPath -Path $sessionHome) -or (Test-RemoteWatchPath -Path $rolloutPath)
         $cursorMetadata[$cursorFile.FullName.ToLowerInvariant()] = $cursor
         if ($isRemoteCursor) {
           $remoteCursorFiles += $cursorFile
@@ -3968,14 +4122,14 @@ function Get-RecentRolloutFiles {
     foreach ($cursorFile in @($selectedCursorFiles)) {
       try {
         $cursor = $cursorMetadata[$cursorFile.FullName.ToLowerInvariant()]
-        $rolloutPath = [string](Get-ObjectValue $cursor 'rollout_path' '')
+        $rolloutPath = ConvertTo-NormalizedWatchPath -Path ([string](Get-ObjectValue $cursor 'rollout_path' ''))
         if ([string]::IsNullOrWhiteSpace($rolloutPath)) { continue }
-        $sessionHome = [string](Get-ObjectValue $cursor 'session_codex_home' '')
-        $sqliteHome = [string](Get-ObjectValue $cursor 'session_sqlite_home' '')
+        $sessionHome = ConvertTo-NormalizedWatchPath -Path ([string](Get-ObjectValue $cursor 'session_codex_home' ''))
+        $sqliteHome = ConvertTo-NormalizedWatchPath -Path ([string](Get-ObjectValue $cursor 'session_sqlite_home' ''))
         $rootOrigin = [string](Get-ObjectValue $cursor 'origin' '')
         if (-not (Test-Path -LiteralPath $rolloutPath -PathType Leaf -ErrorAction SilentlyContinue)) { continue }
         foreach ($root in @($roots | Sort-Object { ([string](Get-ObjectValue $_ 'path' '')).Length } -Descending)) {
-          $rootPath = ([string](Get-ObjectValue $root 'path' '')).TrimEnd('\', '/')
+          $rootPath = (ConvertTo-NormalizedWatchPath -Path ([string](Get-ObjectValue $root 'path' ''))).TrimEnd('\', '/')
           if ([string]::IsNullOrWhiteSpace($rootPath)) { continue }
           $underRoot = $rolloutPath.Equals($rootPath, [StringComparison]::OrdinalIgnoreCase) -or
             $rolloutPath.StartsWith($rootPath + '\', [StringComparison]::OrdinalIgnoreCase) -or
@@ -4021,22 +4175,22 @@ function Get-RecentRolloutFiles {
 
   foreach ($root in @($roots)) {
     try {
-      $sessionHome = [string](Get-ObjectValue $root 'session_codex_home' (Get-ObjectValue $root 'path' ''))
+      $sessionHome = ConvertTo-NormalizedWatchPath -Path ([string](Get-ObjectValue $root 'session_codex_home' (Get-ObjectValue $root 'path' '')))
       if ([string]::IsNullOrWhiteSpace($sessionHome)) { continue }
-      $sqliteHome = [string](Get-ObjectValue $root 'session_sqlite_home' $sessionHome)
+      $sqliteHome = ConvertTo-NormalizedWatchPath -Path ([string](Get-ObjectValue $root 'session_sqlite_home' $sessionHome))
       if ([string]::IsNullOrWhiteSpace($sqliteHome)) { $sqliteHome = $sessionHome }
       $rootOrigin = [string](Get-ObjectValue $root 'origin' '')
-      $isRemoteRoot = $sessionHome.StartsWith('\\')
+      $isRemoteRoot = Test-RemoteWatchPath -Path $sessionHome
       $cacheKey = $sessionHome.ToLowerInvariant()
       $cache = if ($script:RolloutDiscoveryCache.ContainsKey($cacheKey)) { $script:RolloutDiscoveryCache[$cacheKey] } else { $null }
       $rootRefreshDue = $null -eq $cache -or $nowUnixMs -ge [int64](Get-ObjectValue $cache 'next_unix_ms' 0)
       $sessions = Join-Path $sessionHome 'sessions'
       $quickFiles = @()
       $recentCutoffUnixMs = $nowUnixMs - [int64]($recentWindowSeconds * 1000)
-      foreach ($recentRolloutPath in @(Get-RecentThreadRolloutPaths -SqliteHome $sqliteHome -CutoffUnixMs $recentCutoffUnixMs -MaxRows 16)) {
+      foreach ($recentRolloutPath in @(Get-RecentThreadRolloutPaths -SqliteHome $sqliteHome -CutoffUnixMs $recentCutoffUnixMs)) {
         try {
           $resolvedRecentPath = Resolve-RolloutPath -DatabasePathValue $recentRolloutPath -SessionHome $sessionHome
-          $isRemoteRecentPath = $resolvedRecentPath.StartsWith('\\')
+          $isRemoteRecentPath = Test-RemoteWatchPath -Path $resolvedRecentPath
           if (($ScanScope -eq 'Local' -and $isRemoteRecentPath) -or
               ($ScanScope -eq 'Remote' -and -not $isRemoteRecentPath -and $isRemoteRoot)) { continue }
           $quickFiles += Get-Item -LiteralPath $resolvedRecentPath -ErrorAction Stop
@@ -5068,7 +5222,7 @@ function Invoke-OutboxWorker {
       }
       $config = Get-Config
       $hasRemoteWatchRoots = @($config.watchRoots | Where-Object {
-          ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' ''))).StartsWith('\\')
+          Test-RemoteWatchPath -Path ([string](Get-ObjectValue $_ 'session_codex_home' (Get-ObjectValue $_ 'path' '')))
         }).Count -gt 0
       $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
       if (-not $DeliveryOnly -and $Continuous -and $null -ne $deliveryProcess -and $deliveryProcess.HasExited) {

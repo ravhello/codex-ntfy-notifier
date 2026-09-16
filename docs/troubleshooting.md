@@ -111,6 +111,10 @@ Legacy `notify` is a fallback, not the finality decision. Its event should enter
 
 ## No candidate appears at all
 
+An active worker and empty queues do **not** prove notifications are working: a candidate may already have been suppressed. Compare recent local completion timestamps with `sent/` and the sanitized suppression reasons in `notify.log`. An ntfy server receipt confirms server acceptance, not display on a particular phone.
+
+Codex format changes can affect detection independently of delivery. Version 2.5.5 recognizes user text carried in modern `response_item` metadata and correctly classifies Windows `\\?\C:\...` paths as local. If otherwise normal completed conversations consistently produce `technical-turn` receipts on an older version, upgrade before relaxing strict mode. Existing suppressed history is not automatically replayed by an upgrade.
+
 If `pending_idle`, `queued`, receipt counts, `watched_rollouts`, and the log never change:
 
 1. confirm `CODEX_HOME` and, when used, `CODEX_SQLITE_HOME` in the Codex process environment;
