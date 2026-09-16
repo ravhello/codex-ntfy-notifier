@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -1026,6 +1027,81 @@ class NotifierContractTests(unittest.TestCase):
                 with self.server.lock:
                     self.server.payloads.clear()
 
+    def test_modern_user_item_completes_in_strict_mode_without_legacy_user_event(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            suppress_technical_turns=True,
+            include_message=False,
+        )
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                thread_id, turn_id = str(uuid.uuid4()), str(uuid.uuid4())
+                rollout = self.write_session_meta(thread_id, subagent=False)
+                self.append_rollout(rollout, "task_started", turn_id=turn_id)
+                item = {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "PRIVATE_USER_SENTINEL_à"}],
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": turn_id, "content_item_kinds": ["user.text"],
+                        },
+                    },
+                }
+                with rollout.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(item, ensure_ascii=False) + "\n")
+                self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="Finale completata")
+                event = self.event(thread_id=thread_id, turn_id=turn_id)
+                event["last-assistant-message"] = "Finale completata"
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation), timeout=60)
+                self.assertEqual(len(self.wait_for_payloads(1)), 1, msg=self.state_debug())
+                # Repeated delivery/scanning must not make a second logical notification.
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation), timeout=60)
+                with self.server.lock:
+                    self.assertEqual(len(self.server.payloads), 1)
+                    self.assertNotIn("PRIVATE_USER_SENTINEL", json.dumps(self.server.payloads))
+                for path in self.state.rglob("*.json"):
+                    self.assertNotIn("PRIVATE_USER_SENTINEL", path.read_text(encoding="utf-8-sig"))
+                self.assertEqual(len(list((self.state / "sent").glob("*.json"))), 1)
+                self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+                shutil.rmtree(self.state, ignore_errors=True)
+                with self.server.lock:
+                    self.server.payloads.clear()
+
+    def test_host_inbox_delegation_completes_without_a_legacy_user_event(self) -> None:
+        self.configure(idle_detection_mode="strict", idle_grace_seconds=0,
+                       goal_poll_seconds=0.05, suppress_technical_turns=True)
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                thread_id, turn_id = str(uuid.uuid4()), str(uuid.uuid4())
+                rollout = self.write_session_meta(thread_id, subagent=False)
+                self.append_rollout(rollout, "task_started", turn_id=turn_id)
+                item = {"type": "response_item", "payload": {
+                    "type": "function_call_output", "namespace": "codex_app",
+                    "name": "send_message_to_thread",
+                    "output": ("<codex_delegation><source_thread_id>" + str(uuid.uuid4()) +
+                               "</source_thread_id><input>Continue the requested work.</input></codex_delegation>"),
+                    "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                }}
+                with rollout.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(item) + "\n")
+                self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="Inbox work complete")
+                event = self.event(thread_id=thread_id, turn_id=turn_id)
+                event["last-assistant-message"] = "Inbox work complete"
+                self.run_ok(self.hook_command(implementation, event))
+                self.run_ok(self.worker_command(implementation), timeout=60)
+                payloads = self.wait_for_payloads(1)
+                self.assertEqual(len(payloads), 1, msg=self.state_debug())
+                self.assertIn("Inbox work complete", payloads[0]["message"])
+                self.assertNotIn("codex_delegation", json.dumps(payloads))
+                shutil.rmtree(self.state, ignore_errors=True)
+                with self.server.lock:
+                    self.server.payloads.clear()
+
     def test_strict_mode_suppresses_a_technical_turn(self) -> None:
         self.configure(
             idle_detection_mode="strict",
@@ -2016,26 +2092,40 @@ $publicState = $publicProbe.state
             goal_poll_seconds=0.05,
             suppress_technical_turns=True,
         )
+        spec = importlib.util.spec_from_file_location("active_goal_observer_notifier", PYTHON_NOTIFIER)
+        assert spec is not None and spec.loader is not None
+        notifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(notifier)
+        observer_runtime = SimpleNamespace(ensure=lambda: None, mutation_locks=self.state / "mutation-locks")
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
-                thread_id = str(uuid.uuid4())
-                turn_id = "00000000-0000-7000-8000-000000000003"
-                rollout = self.write_session_meta(thread_id, subagent=False)
-                self.append_rollout(rollout, "task_started", turn_id=turn_id)
-                self.append_rollout(rollout, "user_message", message="Finish the goal")
-                self.append_rollout(rollout, "thread_goal_updated", message="active")
-                self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="Goal step")
-                database = self.create_goal_database(thread_id, "active")
-                self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id, turn_id=turn_id)))
-                process = self.start_worker(implementation)
+                process = None
+                database = self.codex_home / "goals_1.sqlite"
                 try:
+                    thread_id = str(uuid.uuid4())
+                    turn_id = "00000000-0000-7000-8000-000000000003"
+                    rollout = self.write_session_meta(thread_id, subagent=False)
+                    self.append_rollout(rollout, "task_started", turn_id=turn_id)
+                    self.append_rollout(rollout, "user_message", message="Finish the goal")
+                    self.append_rollout(rollout, "thread_goal_updated", message="active")
+                    self.append_rollout(rollout, "task_complete", turn_id=turn_id, message="Goal step")
+                    self.create_goal_database(thread_id, "active")
+                    self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id, turn_id=turn_id)))
+                    process = self.start_worker(implementation)
                     deadline = time.monotonic() + 30
                     observed_reason = ""
                     while time.monotonic() < deadline and observed_reason != "goal-active":
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
-                                pending_record = json.loads(pending_path.read_text(encoding="utf-8-sig"))
-                            except (OSError, json.JSONDecodeError):
+                                # Do not let the observer deny the worker's
+                                # atomic replacement of the pending record.
+                                guard = (
+                                    notifier.record_mutation_lock(observer_runtime, pending_path.stem)
+                                    if implementation == "python" else contextlib.nullcontext()
+                                )
+                                with guard:
+                                    pending_record = json.loads(read_text_shared_delete(pending_path))
+                            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             observed_reason = str(
                                 pending_record.get("idle_reason") or pending_record.get("gate_reason") or ""
@@ -2043,7 +2133,18 @@ $publicState = $publicProbe.state
                         if process.poll() is not None:
                             break
                         time.sleep(0.05)
-                    self.assertEqual(observed_reason, "goal-active", "worker never observed the active goal")
+                    if observed_reason != "goal-active":
+                        if process.poll() is None:
+                            process.terminate()
+                        try:
+                            stdout, stderr = process.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            stdout, stderr = process.communicate(timeout=5)
+                        self.fail(
+                            f"worker never observed the active goal; reason={observed_reason!r} "
+                            f"exit={process.returncode}\nstdout={stdout}\nstderr={stderr}\n{self.state_debug()}"
+                        )
                     with self.server.lock:
                         self.assertEqual(self.server.payloads, [])
                     connection = sqlite3.connect(database)
@@ -2056,15 +2157,20 @@ $publicState = $publicProbe.state
                     finally:
                         connection.close()
                     self.assert_worker_ok(process, timeout=60)
+                    self.assertEqual(len(self.wait_for_payloads(1)), 1)
                 finally:
-                    if process.poll() is None:
-                        process.terminate()
-                        process.communicate(timeout=5)
-                self.assertEqual(len(self.wait_for_payloads(1)), 1)
-                shutil.rmtree(self.state, ignore_errors=True)
-                database.unlink(missing_ok=True)
-                with self.server.lock:
-                    self.server.payloads.clear()
+                    if process is not None:
+                        if process.poll() is None:
+                            process.terminate()
+                        try:
+                            process.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.communicate(timeout=5)
+                    shutil.rmtree(self.state, ignore_errors=True)
+                    database.unlink(missing_ok=True)
+                    with self.server.lock:
+                        self.server.payloads.clear()
 
     def test_root_waits_for_running_descendant(self) -> None:
         self.configure(
@@ -3586,6 +3692,116 @@ $publicState = $publicProbe.state
                     shutil.rmtree(self.codex_home / "archived_sessions", ignore_errors=True)
                     with self.server.lock:
                         self.server.payloads.clear()
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows extended-path watcher test")
+    def test_windows_local_scan_recovers_extended_path_without_hook_or_history_replay(self) -> None:
+        self.configure(
+            idle_detection_mode="strict",
+            idle_grace_seconds=0,
+            goal_poll_seconds=0.05,
+            watch_rollouts=True,
+            watch_initial_replay_seconds=0,
+            suppress_technical_turns=True,
+        )
+        thread_id = str(uuid.uuid4())
+        old_turn = str(uuid.uuid4())
+        current_turn = str(uuid.uuid4())
+        directory = self.codex_home / "sessions" / "2001" / "01" / "01" / "spazio citt\u00e0"
+        directory.mkdir(parents=True)
+        # Match Get-Item's expanded FullName before deriving the cursor hash.
+        directory = directory.resolve(strict=True)
+        rollout = directory / f"rollout-{thread_id}.jsonl"
+        rollout.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": thread_id, "source": "vscode"}}) + "\n",
+            encoding="utf-8",
+        )
+        self.append_rollout(rollout, "task_started", turn_id=old_turn)
+        self.append_rollout(rollout, "user_message", message="Historical request")
+        self.append_rollout(rollout, "task_complete", turn_id=old_turn, message="DO NOT REPLAY HISTORY")
+        baseline = rollout.stat().st_size
+        watch = self.state / "watch"
+        watch.mkdir(parents=True)
+        cursor_path = watch / (hashlib.sha256(str(rollout).encode("utf-8")).hexdigest() + ".json")
+        cursor_path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "rollout_path": str(rollout),
+                    "session_codex_home": str(self.codex_home),
+                    "session_sqlite_home": str(self.codex_home),
+                    "origin": "",
+                    "offset": baseline,
+                    "seen_unix_ms": 0,
+                    "thread_id": thread_id,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.append_rollout(rollout, "task_started", turn_id=current_turn)
+        self.append_rollout(rollout, "user_message", message="The legacy argv hook did not run")
+        self.append_rollout(rollout, "task_complete", turn_id=current_turn, message="EXTENDED LOCAL RECOVERED")
+        with sqlite3.connect(self.state_database) as database:
+            database.execute("ALTER TABLE threads ADD COLUMN updated_at INTEGER")
+            database.execute("ALTER TABLE threads ADD COLUMN updated_at_ms INTEGER")
+            database.execute(
+                "INSERT INTO threads(id, rollout_path, source, thread_source, updated_at, updated_at_ms) "
+                "VALUES (?, ?, 'vscode', 'user', ?, ?)",
+                (thread_id, "\\\\?\\" + str(rollout), int(time.time()), int(time.time() * 1000)),
+            )
+        scan_command = [
+            str(WINDOWS_POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", str(POWERSHELL_NOTIFIER), "-ScanRollouts", "-ScanScope", "Local",
+        ]
+        self.run_ok(scan_command, timeout=60)
+        self.run_ok(scan_command, timeout=60)
+        self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
+        self.assertEqual(len(list(watch.glob("*.json"))), 1, "Extended and ordinary paths must share a cursor")
+        cursor = json.loads(cursor_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(cursor["offset"], rollout.stat().st_size)
+        self.run_ok(self.worker_command("powershell"), timeout=60)
+        self.run_ok(scan_command, timeout=60)
+        self.run_ok(self.worker_command("powershell"), timeout=60)
+        with self.server.lock:
+            self.assertEqual(len(self.server.payloads), 1)
+            self.assertIn("EXTENDED LOCAL RECOVERED", self.server.payloads[0]["message"])
+            self.assertNotIn("DO NOT REPLAY HISTORY", self.server.payloads[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows watch-path classification test")
+    def test_windows_watch_path_normalization_preserves_unc_remote_classification(self) -> None:
+        local = "C:\\spazio citt\u00e0\\rollout.jsonl"
+        remote = "\\\\server\\spazio citt\u00e0\\rollout.jsonl"
+        cases = [
+            {"path": local, "canonical": local, "remote": False},
+            {"path": "\\\\?\\" + local, "canonical": local, "remote": False},
+            {"path": remote, "canonical": remote, "remote": True},
+            {"path": "\\\\?\\UNC\\" + remote[2:], "canonical": remote, "remote": True},
+            {"path": "\\\\?\\unc\\" + remote[2:], "canonical": remote, "remote": True},
+            {"path": "", "canonical": "", "remote": False},
+        ]
+        self.env["CODEX_NTFY_TEST_PATH_CASES"] = json.dumps(cases)
+        self.env["CODEX_NTFY_TEST_SCRIPT"] = str(POWERSHELL_NOTIFIER)
+        script = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:CODEX_NTFY_TEST_SCRIPT, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { throw 'Notifier parse failed' }
+foreach ($name in @('ConvertTo-NormalizedWatchPath', 'Test-RemoteWatchPath')) {
+  $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+  if ($null -eq $definition) { throw "Missing path helper $name" }
+  Invoke-Expression $definition.Extent.Text
+}
+$cases = ConvertFrom-Json $env:CODEX_NTFY_TEST_PATH_CASES
+foreach ($case in $cases) {
+  if ((ConvertTo-NormalizedWatchPath -Path $case.path) -cne $case.canonical) { throw 'Path normalization mismatch' }
+  if ((Test-RemoteWatchPath -Path $case.path) -ne $case.remote) { throw 'Local/remote classification mismatch' }
+}
+Write-Output $cases.Count
+"""
+        result = self.run_ok(
+            [str(WINDOWS_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", script],
+            timeout=30,
+        )
+        self.assertEqual(result.stdout.strip(), str(len(cases)))
 
     @unittest.skipUnless(os.name == "nt" and WINDOWS_POWERSHELL.exists(), "Windows multi-root watcher test")
     def test_windows_watcher_recovers_a_lost_wsl_root_event(self) -> None:

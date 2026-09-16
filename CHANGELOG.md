@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.5.5] - 2026-09-16
+
+### Fixed
+
+- Recognize current Codex user-input evidence stored in structured `response_item` messages, even without a legacy `user_message` event. Native Windows, incremental PowerShell, and Python probes require exact open-turn metadata and typed content vectors; injected environment/context messages do not count as user input, and user text is not retained in notifier state.
+- Windows extended local paths (`\\?\C:\...`) no longer get mistaken for remote UNC paths. Resumed old-date conversations remain discoverable by the local watcher when an oversized legacy hook cannot launch. True UNC and WSL paths retain their separate scanner.
+- Recognize structured host-delivered cross-chat requests without accepting ordinary tool outputs as user input. Unchanged scheduled heartbeat checks remain outside this evidence path.
+- Remove an unnecessary 16-row cap on recent indexed Windows conversations; local discovery now uses the existing bounded 64-row query.
+- Add parser parity and isolated end-to-end regressions for modern input, malformed metadata, silent technical turns, extended paths, missed hooks, and notification deduplication.
+
 ## [2.5.4] - 2026-09-12
 
 ### Fixed
@@ -244,7 +254,8 @@ Initial public release. Earlier iterations were private and are not supported pu
 - Extremely large Windows hook payloads may fail before the notifier process is launched.
 - Subagent classification depends partly on local Codex rollout metadata and fails open after its grace period.
 
-[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.4...HEAD
+[Unreleased]: https://github.com/ravhello/codex-ntfy-notifier/compare/v2.5.5...HEAD
+[2.5.5]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.5
 [2.5.4]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.4
 [2.5.3]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.3
 [2.5.2]: https://github.com/ravhello/codex-ntfy-notifier/releases/tag/v2.5.2

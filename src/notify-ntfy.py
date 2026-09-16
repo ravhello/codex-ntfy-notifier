@@ -33,7 +33,7 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.5.4"
+VERSION = "2.5.5"
 MAX_NTFY_MESSAGE_BYTES = 3500
 SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
@@ -769,6 +769,48 @@ def find_rollout(
     return None
 
 
+def response_item_has_user_evidence(payload: Any, current_turn: str) -> bool:
+    """Recognize modern user text without treating injected context as input."""
+    if not current_turn.strip() or not isinstance(payload, dict):
+        return False
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if not isinstance(metadata, dict) or metadata.get("turn_id") != current_turn:
+        return False
+    if payload.get("type") == "function_call_output":
+        # Exact host-injected cross-chat input, never an ordinary tool receipt
+        # or a scheduled heartbeat. The caller still requires an open turn.
+        if "call_id" in payload or payload.get("namespace") != "codex_app" or payload.get("name") != "send_message_to_thread":
+            return False
+        output = payload.get("output")
+        if not isinstance(output, str):
+            return False
+        delegation = re.fullmatch(
+            r"\s*<codex_delegation>\s*<source_thread_id>\s*"
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+            r"\s*</source_thread_id>\s*<input>(.*?)</input>\s*</codex_delegation>\s*",
+            output,
+            flags=re.DOTALL,
+        )
+        return bool(delegation and delegation.group(1).strip())
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return False
+    content = payload.get("content")
+    kinds = metadata.get("content_item_kinds")
+    if not isinstance(content, list) or not isinstance(kinds, list) or not content or len(content) != len(kinds):
+        return False
+    has_user_text = False
+    for item, kind in zip(content, kinds):
+        if not isinstance(item, dict) or not isinstance(kind, str) or not isinstance(item.get("type"), str):
+            return False
+        if kind != "user.text":
+            continue
+        text = item.get("text")
+        if item["type"] != "input_text" or not isinstance(text, str) or not text.strip():
+            return False
+        has_user_text = True
+    return has_user_text
+
+
 def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message: bool) -> dict[str, Any]:
     previous = record.get("idle_probe") if isinstance(record.get("idle_probe"), dict) else {}
     thread_id = str(record.get("thread_id", ""))
@@ -918,7 +960,14 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
         except UnicodeDecodeError:
             invalid_lifecycle = True
             continue
-        if not any(
+        possible_user_evidence = all(
+            marker in line
+            for marker in ('"response_item"', '"internal_chat_message_metadata_passthrough"')
+        ) and (
+            '"user.text"' in line
+            or all(marker in line for marker in ('"function_call_output"', '"codex_app"', '"send_message_to_thread"'))
+        )
+        if not possible_user_evidence and not any(
             marker in line
             for marker in ("task_started", "task_complete", "turn_aborted", "thread_goal_updated", "user_message")
         ):
@@ -928,7 +977,13 @@ def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message:
         except json.JSONDecodeError:
             invalid_lifecycle = True
             continue
-        if not isinstance(envelope, dict) or envelope.get("type") != "event_msg":
+        if not isinstance(envelope, dict):
+            continue
+        if envelope.get("type") == "response_item":
+            if current_turn == candidate_turn and response_item_has_user_evidence(envelope.get("payload"), current_turn):
+                candidate_user_message = True
+            continue
+        if envelope.get("type") != "event_msg":
             continue
         payload = envelope.get("payload")
         if not isinstance(payload, dict):
