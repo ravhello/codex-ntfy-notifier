@@ -3708,6 +3708,8 @@ $publicState = $publicProbe.state
         current_turn = str(uuid.uuid4())
         directory = self.codex_home / "sessions" / "2001" / "01" / "01" / "spazio citt\u00e0"
         directory.mkdir(parents=True)
+        # Match Get-Item's expanded FullName before deriving the cursor hash.
+        directory = directory.resolve(strict=True)
         rollout = directory / f"rollout-{thread_id}.jsonl"
         rollout.write_text(
             json.dumps({"type": "session_meta", "payload": {"id": thread_id, "source": "vscode"}}) + "\n",

@@ -76,6 +76,10 @@ class WatchIndexCapacityTests(unittest.TestCase):
             # these files. Every observed path must come from the actual index.
             old_bucket = home / "sessions/2001/01/01"
             old_bucket.mkdir(parents=True)
+            # Hosted Windows TEMP may contain RUNNER~1. Match Get-Item's
+            # expanded FileInfo.FullName before creating indexed/expected paths.
+            home = home.resolve(strict=True)
+            old_bucket = old_bucket.resolve(strict=True)
             paths: set[str] = set()
             now_ms = int(time.time() * 1000)
             with closing(sqlite3.connect(home / "state_5.sqlite")) as database:
@@ -124,6 +128,43 @@ class WatchIndexCapacityTests(unittest.TestCase):
         self.assertEqual(result["observed"], 64)
         self.assertEqual(len(set(result["paths"])), 64)
         self.assertTrue(set(result["paths"]).issubset(expected))
+
+    def test_optional_short_alias_resolves_to_powershell_fileinfo_name(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        with tempfile.TemporaryDirectory(prefix="ntfy-short-alias-control-") as directory:
+            canonical = Path(directory).resolve(strict=True)
+            try:
+                get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+            except (OSError, AttributeError) as error:
+                self.skipTest(f"GetShortPathNameW is unavailable: {error}")
+            get_short_path.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+            get_short_path.restype = wintypes.DWORD
+            capacity = get_short_path(str(canonical), None, 0)
+            if capacity <= 0:
+                self.skipTest(f"GetShortPathNameW cannot provide a fixture alias: {ctypes.get_last_error()}")
+            buffer = ctypes.create_unicode_buffer(capacity)
+            length = get_short_path(str(canonical), buffer, capacity)
+            if not 0 < length < capacity:
+                self.skipTest(f"GetShortPathNameW cannot read the fixture alias: {ctypes.get_last_error()}")
+            alias = Path(buffer.value)
+            if str(alias).casefold() == str(canonical).casefold():
+                self.skipTest("This fixture volume does not expose a distinct 8.3 alias")
+            self.assertEqual(alias.resolve(strict=True), canonical)
+            result = subprocess.run(
+                [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-Command",
+                 "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); "
+                 "(Get-Item -LiteralPath $env:SHORT_ALIAS_FIXTURE).FullName"],
+                env={**os.environ, "SHORT_ALIAS_FIXTURE": str(alias)},
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            self.assertEqual(result.returncode, 0, msg=f"stdout={result.stdout}\nstderr={result.stderr}")
+            self.assertEqual(result.stdout.strip(), str(canonical))
 
 
 if __name__ == "__main__":
