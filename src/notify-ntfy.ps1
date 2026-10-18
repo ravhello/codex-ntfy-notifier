@@ -32,7 +32,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.5.5'
+$ScriptVersion = '2.5.6'
 $MaxNtfyMessageBytes = 3500
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
@@ -554,16 +554,35 @@ function Get-ThreadTitle {
   if ([string]::IsNullOrWhiteSpace($ThreadId)) {
     return $null
   }
+  $legacyTitle = $null
   if (-not [string]::IsNullOrWhiteSpace($SqliteHome)) {
     $database = Get-StateDatabasePath -SqliteHome $SqliteHome
-    $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT COALESCE(title,'') FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 1
-    if ($row.ok -and $row.found -and (Test-NotificationThreadTitle -Value $row.values[0])) {
-      return [string]$row.values[0]
+    $schemaSql = "SELECT name FROM pragma_table_info('threads') WHERE name=?1 LIMIT 1"
+    $nameColumn = Invoke-SqliteRow -DatabasePath $database -Sql $schemaSql -Parameter 'name' -ColumnCount 1
+    if ($nameColumn.ok -and $nameColumn.found) {
+      # Modern Codex keeps the sidebar name in name; title can be the complete
+      # first prompt. A missing/invalid name must never fall back to that prompt.
+      $row = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT CASE WHEN typeof(name)='text' THEN name ELSE '' END FROM threads WHERE id=?1 LIMIT 1" -Parameter $ThreadId -ColumnCount 1
+      if ($row.ok -and $row.found -and (Test-NotificationThreadTitle -Value $row.values[0])) {
+        return [string]$row.values[0]
+      }
+    } elseif ($nameColumn.ok) {
+      # Only an attested legacy schema may use title, after the saved name in
+      # session_index. Do not interpret a database read failure as old schema.
+      $firstMessageColumn = Invoke-SqliteRow -DatabasePath $database -Sql $schemaSql -Parameter 'first_user_message' -ColumnCount 1
+      if ($firstMessageColumn.ok) {
+        $legacySql = "SELECT CASE WHEN typeof(title)='text' THEN title ELSE '' END FROM threads WHERE id=?1"
+        if ($firstMessageColumn.found) { $legacySql += ' AND (first_user_message IS NULL OR title<>first_user_message)' }
+        $row = Invoke-SqliteRow -DatabasePath $database -Sql ($legacySql + ' LIMIT 1') -Parameter $ThreadId -ColumnCount 1
+        if ($row.ok -and $row.found -and (Test-NotificationThreadTitle -Value $row.values[0])) {
+          $legacyTitle = [string]$row.values[0]
+        }
+      }
     }
   }
   $indexPath = Join-Path $SessionHome 'session_index.jsonl'
   if (-not (Test-Path -LiteralPath $indexPath)) {
-    return $null
+    return $legacyTitle
   }
   $stream = $null
   $reader = $null
@@ -596,7 +615,7 @@ function Get-ThreadTitle {
     elseif ($null -ne $stream) { $stream.Dispose() }
   }
   if (-not [string]::IsNullOrWhiteSpace($title)) { return $title }
-  return $null
+  return $legacyTitle
 }
 
 function Read-FirstLineShared {

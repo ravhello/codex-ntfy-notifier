@@ -16,6 +16,7 @@ import time
 import unittest
 import uuid
 from datetime import datetime, timezone
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +38,7 @@ class RecordingServer(ThreadingHTTPServer):
         self.statuses: list[int] = []
         self.redirect_url: str | None = None
         self.redirect_hits = 0
+        self.before_response: Callable[[dict, int], None] | None = None
         self.lock = threading.Lock()
 
 
@@ -49,6 +51,9 @@ class RecordingHandler(BaseHTTPRequestHandler):
         with self.server.lock:
             self.server.payloads.append(payload)
             status = self.server.statuses.pop(0) if self.server.statuses else 200
+            before_response = self.server.before_response
+        if before_response is not None:
+            before_response(payload, status)
         response = json.dumps({"id": f"test-{len(self.server.payloads)}"}).encode()
         self.send_response(status)
         if 300 <= status < 400 and self.server.redirect_url:
@@ -132,6 +137,7 @@ class NotifierContractTests(unittest.TestCase):
             self.server.statuses.clear()
             self.server.redirect_url = None
             self.server.redirect_hits = 0
+            self.server.before_response = None
 
     def tearDown(self) -> None:
         shutil.rmtree(self.temp, ignore_errors=True)
@@ -4473,14 +4479,16 @@ Write-Output $cases.Count
                 self.assertIn(sensitive_title, payload["title"])
                 shutil.rmtree(self.state, ignore_errors=True)
 
-    def test_database_thread_title_is_authoritative_when_session_index_is_missing_or_stale(self) -> None:
+    def test_database_current_thread_name_is_authoritative_when_session_index_is_missing_or_stale(self) -> None:
         thread_id = "66666666-6666-7666-8666-666666666666"
         turn_id = "77777777-7777-7777-8777-777777777777"
         title = "Titolo conversazione dal database"
         connection = sqlite3.connect(self.state_database)
         try:
+            connection.execute("ALTER TABLE threads ADD COLUMN name TEXT")
             connection.execute(
-                "INSERT INTO threads(id, rollout_path, source, thread_source, title) VALUES (?, ?, 'vscode', 'user', ?)",
+                "INSERT INTO threads(id, rollout_path, source, thread_source, title, name) "
+                "VALUES (?, ?, 'vscode', 'user', 'Original prompt, not the current task name', ?)",
                 (thread_id, str(self.codex_home / "missing-rollout.jsonl"), title),
             )
             connection.commit()
@@ -4562,13 +4570,15 @@ Write-Output $cases.Count
             ),
         )
         self.configure(include_thread_title=True)
+        with sqlite3.connect(self.state_database) as connection:
+            connection.execute("ALTER TABLE threads ADD COLUMN name TEXT")
         index_path = self.codex_home / "session_index.jsonl"
         for name, database_title, index_titles, expected_title in cases:
             connection = sqlite3.connect(self.state_database)
             try:
                 connection.execute(
-                    "INSERT OR REPLACE INTO threads(id, rollout_path, source, thread_source, title) "
-                    "VALUES (?, ?, 'vscode', 'user', ?)",
+                    "INSERT OR REPLACE INTO threads(id, rollout_path, source, thread_source, title, name) "
+                    "VALUES (?, ?, 'vscode', 'user', 'Original prompt must not appear', ?)",
                     (thread_id, str(self.codex_home / "missing-rollout.jsonl"), database_title),
                 )
                 connection.commit()
@@ -4598,6 +4608,191 @@ Write-Output $cases.Count
                     shutil.rmtree(self.state, ignore_errors=True)
             if "powershell" in captured and "python" in captured:
                 self.assertEqual(captured["powershell"], captured["python"])
+
+    def test_modern_missing_or_invalid_name_never_uses_original_prompt(self) -> None:
+        thread_id = str(uuid.uuid4())
+        protocol = "<codex_delegation>\n<source_thread_id>internal"
+        cases = (
+            ("empty_name", "", ["Old name", "Latest saved name"], "Latest saved name"),
+            ("blank_name", " \t", ["Old name", "Latest saved name"], "Latest saved name"),
+            ("protocol_name", protocol, ["Latest saved name", protocol], "Latest saved name"),
+            ("null_name", None, None, "perfect notifier"),
+            ("non_text_name", sqlite3.Binary(b"invalid-title"), None, "perfect notifier"),
+            ("invalid_index_entries", "", ["Latest saved name", 42, True, None, {}, [], " "], "Latest saved name"),
+        )
+        with sqlite3.connect(self.state_database) as connection:
+            connection.execute("ALTER TABLE threads ADD COLUMN name")
+        self.configure(include_thread_title=True)
+        index_path = self.codex_home / "session_index.jsonl"
+        for label, current_name, index_titles, expected in cases:
+            with sqlite3.connect(self.state_database) as connection:
+                connection.execute(
+                    "INSERT OR REPLACE INTO threads(id, rollout_path, source, thread_source, title, name) "
+                    "VALUES (?, ?, 'vscode', 'user', 'Private original prompt must not appear', ?)",
+                    (thread_id, str(self.codex_home / "missing-rollout.jsonl"), current_name),
+                )
+            if index_titles is None:
+                index_path.unlink(missing_ok=True)
+            else:
+                index_path.write_text(
+                    "".join(json.dumps({"id": thread_id, "thread_name": value}) + "\n" for value in index_titles),
+                    encoding="utf-8",
+                )
+            for implementation in self.implementations():
+                with self.subTest(case=label, implementation=implementation):
+                    self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id)))
+                    self.run_ok(self.worker_command(implementation))
+                    with self.server.lock:
+                        payloads = list(self.server.payloads)
+                        self.server.payloads.clear()
+                    self.assertEqual(len(payloads), 1)
+                    self.assertEqual(payloads[0]["title"], expected)
+                    self.assertEqual(payloads[0]["tags"], ["white_check_mark"])
+                    shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_legacy_title_is_only_a_last_resort_and_never_the_first_user_message(self) -> None:
+        thread_id = str(uuid.uuid4())
+        self.configure(include_thread_title=True)
+        index_path = self.codex_home / "session_index.jsonl"
+        for has_prompt_column, saved_name, title, prompt, expected in (
+            (False, "Current saved name", "Old database title", None, "Current saved name"),
+            (False, None, "Legacy chat title", None, "Legacy chat title"),
+            (True, None, "Original prompt", "Original prompt", "perfect notifier"),
+            (True, "Saved renamed task", "Original prompt", "Original prompt", "Saved renamed task"),
+            (True, None, "Legacy renamed title", "Original prompt", "Legacy renamed title"),
+        ):
+            with sqlite3.connect(self.state_database) as connection:
+                if has_prompt_column and not any(row[1] == "first_user_message" for row in connection.execute("PRAGMA table_info(threads)")):
+                    connection.execute("ALTER TABLE threads ADD COLUMN first_user_message TEXT")
+                connection.execute(
+                    "INSERT OR REPLACE INTO threads(id, rollout_path, source, thread_source, title) "
+                    "VALUES (?, ?, 'vscode', 'user', ?)",
+                    (thread_id, str(self.codex_home / "missing-rollout.jsonl"), title),
+                )
+                if has_prompt_column:
+                    connection.execute("UPDATE threads SET first_user_message=? WHERE id=?", (prompt, thread_id))
+            if saved_name is None:
+                index_path.unlink(missing_ok=True)
+            else:
+                index_path.write_text(json.dumps({"id": thread_id, "thread_name": saved_name}) + "\n", encoding="utf-8")
+            for implementation in self.implementations():
+                with self.subTest(prompt_column=has_prompt_column, index=saved_name, title=title, implementation=implementation):
+                    self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id)))
+                    self.run_ok(self.worker_command(implementation))
+                    with self.server.lock:
+                        payloads = list(self.server.payloads)
+                        self.server.payloads.clear()
+                    self.assertEqual(len(payloads), 1)
+                    self.assertEqual(payloads[0]["title"], expected)
+                    shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_unreadable_title_database_uses_saved_name_or_project(self) -> None:
+        thread_id = str(uuid.uuid4())
+        self.configure(include_thread_title=True, suppress_subagents=False)
+        self.state_database.write_bytes(b"not a SQLite database")
+        index_path = self.codex_home / "session_index.jsonl"
+        for saved_name, expected in (("Saved current name", "Saved current name"), (None, "perfect notifier")):
+            if saved_name is None:
+                index_path.unlink(missing_ok=True)
+            else:
+                index_path.write_text(json.dumps({"id": thread_id, "thread_name": saved_name}) + "\n", encoding="utf-8")
+            for implementation in self.implementations():
+                with self.subTest(index=saved_name, implementation=implementation):
+                    self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id)))
+                    self.run_ok(self.worker_command(implementation))
+                    with self.server.lock:
+                        payloads = list(self.server.payloads)
+                        self.server.payloads.clear()
+                    self.assertEqual(len(payloads), 1)
+                    self.assertEqual(payloads[0]["title"], expected)
+                    shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_current_thread_name_is_read_after_enqueue_with_one_status_icon(self) -> None:
+        thread_id = str(uuid.uuid4())
+        with sqlite3.connect(self.state_database) as connection:
+            connection.execute("ALTER TABLE threads ADD COLUMN name TEXT")
+            connection.execute(
+                "INSERT INTO threads(id, rollout_path, source, thread_source, title, name) "
+                "VALUES (?, ?, 'vscode', 'user', 'Original prompt, not a task name', 'Name before enqueue')",
+                (thread_id, str(self.codex_home / "missing-rollout.jsonl")),
+            )
+        (self.codex_home / "session_index.jsonl").write_text(
+            json.dumps({"id": thread_id, "thread_name": "Stale saved name"}) + "\n", encoding="utf-8"
+        )
+        for implementation in self.implementations():
+            for status, tag in (("task_complete", "white_check_mark"), ("turn_aborted", "warning"), ("blocked", "warning")):
+                with self.subTest(implementation=implementation, status=status):
+                    self.configure(include_thread_title=True, tags=["white_check_mark"])
+                    with sqlite3.connect(self.state_database) as connection:
+                        connection.execute("UPDATE threads SET name='Name before enqueue' WHERE id=?", (thread_id,))
+                    event = self.event(thread_id=thread_id)
+                    event["completion-event-type"] = "task_complete" if status == "blocked" else status
+                    self.run_ok(self.hook_command(implementation, event))
+                    queued = list((self.state / "outbox").glob("*.json"))
+                    self.assertEqual(len(queued), 1)
+                    if status == "blocked":
+                        record = json.loads(queued[0].read_text(encoding="utf-8-sig"))
+                        record["goal_status"] = "blocked"
+                        queued[0].write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+                    current_name = "Attività rinominata — già pronta 中文"
+                    with sqlite3.connect(self.state_database) as connection:
+                        connection.execute("UPDATE threads SET name=? WHERE id=?", (current_name, thread_id))
+                    self.run_ok(self.worker_command(implementation))
+                    with self.server.lock:
+                        payloads = list(self.server.payloads)
+                        self.server.payloads.clear()
+                    self.assertEqual(len(payloads), 1)
+                    self.assertEqual(payloads[0]["title"], current_name)
+                    self.assertEqual(payloads[0]["tags"], [tag])
+                    self.assertNotIn("�", payloads[0]["title"])
+                    self.assertNotIn("✅", payloads[0]["title"])
+                    self.assertNotIn("⚠", payloads[0]["title"])
+                    self.assertFalse(list((self.state / "outbox").glob("*.json")))
+                    shutil.rmtree(self.state, ignore_errors=True)
+
+    def test_retry_resolves_the_newest_name_after_failed_http(self) -> None:
+        thread_id = str(uuid.uuid4())
+        with sqlite3.connect(self.state_database) as connection:
+            connection.execute("ALTER TABLE threads ADD COLUMN name TEXT")
+            connection.execute(
+                "INSERT INTO threads(id, rollout_path, source, thread_source, title, name) "
+                "VALUES (?, ?, 'vscode', 'user', 'Original prompt', 'Name at first attempt')",
+                (thread_id, str(self.codex_home / "missing-rollout.jsonl")),
+            )
+        self.configure(include_thread_title=True)
+        for implementation in self.implementations():
+            with self.subTest(implementation=implementation):
+                renamed = threading.Event()
+
+                def rename_before_failed_response(_payload: dict, status: int) -> None:
+                    if status == 503:
+                        with sqlite3.connect(self.state_database) as connection:
+                            connection.execute("UPDATE threads SET name='Name after failed attempt' WHERE id=?", (thread_id,))
+                        renamed.set()
+
+                with sqlite3.connect(self.state_database) as connection:
+                    connection.execute("UPDATE threads SET name='Name at first attempt' WHERE id=?", (thread_id,))
+                with self.server.lock:
+                    self.server.statuses[:] = [503, 200]
+                    self.server.before_response = rename_before_failed_response
+                try:
+                    self.run_ok(self.hook_command(implementation, self.event(thread_id=thread_id)))
+                    self.run_ok(self.worker_command(implementation), timeout=60)
+                    with self.server.lock:
+                        payloads = list(self.server.payloads)
+                    self.assertTrue(renamed.is_set(), "No failed HTTP response occurred before the rename")
+                    self.assertEqual(len(payloads), 2)
+                    self.assertEqual([payload["title"] for payload in payloads], ["Name at first attempt", "Name after failed attempt"])
+                    self.assertEqual(payloads[0]["sequence_id"], payloads[1]["sequence_id"])
+                    self.assertTrue(all(payload["tags"] == ["white_check_mark"] for payload in payloads))
+                    self.assertEqual(len(list((self.state / "sent").glob("*.json"))), 1)
+                    self.assertFalse(list((self.state / "outbox").glob("*.json")))
+                finally:
+                    with self.server.lock:
+                        self.server.before_response = None
+                        self.server.payloads.clear()
+                        self.server.statuses.clear()
+                    shutil.rmtree(self.state, ignore_errors=True)
 
     def test_concurrent_hooks_create_one_outbox_item(self) -> None:
         for implementation in self.implementations():
