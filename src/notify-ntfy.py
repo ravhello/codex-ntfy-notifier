@@ -33,7 +33,7 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.5.5"
+VERSION = "2.5.6"
 MAX_NTFY_MESSAGE_BYTES = 3500
 SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
@@ -381,16 +381,34 @@ def is_notification_thread_title(value: object) -> bool:
 def thread_title(runtime: Runtime, thread_id: str, session_home: str = "", sqlite_home: str = "") -> str:
     if not thread_id:
         return ""
-    _, database_title = sqlite_scalar(
-        state_database_path(Path(sqlite_home or session_home or runtime.sqlite_home)),
-        "SELECT COALESCE(title, '') FROM threads WHERE id = ? LIMIT 1",
-        thread_id,
-    )
-    if is_notification_thread_title(database_title):
-        return database_title
+    database = state_database_path(Path(sqlite_home or session_home or runtime.sqlite_home))
+    schema_sql = "SELECT name FROM pragma_table_info('threads') WHERE name = ? LIMIT 1"
+    schema_ok, name_column = sqlite_scalar(database, schema_sql, "name")
+    legacy_title = ""
+    if schema_ok and name_column:
+        # Modern title can contain the full first prompt; name is the sidebar
+        # name. Never expose that prompt when the modern name is unavailable.
+        _, database_name = sqlite_scalar(
+            database,
+            "SELECT CASE WHEN typeof(name) = 'text' THEN name ELSE '' END FROM threads WHERE id = ? LIMIT 1",
+            thread_id,
+        )
+        if is_notification_thread_title(database_name):
+            return database_name
+    elif schema_ok:
+        # Legacy title is considered only after the saved session-index name.
+        # Database read errors do not establish permission to use old schema.
+        first_message_ok, first_message_column = sqlite_scalar(database, schema_sql, "first_user_message")
+        if first_message_ok:
+            legacy_sql = "SELECT CASE WHEN typeof(title) = 'text' THEN title ELSE '' END FROM threads WHERE id = ?"
+            if first_message_column:
+                legacy_sql += " AND (first_user_message IS NULL OR title <> first_user_message)"
+            _, legacy_title = sqlite_scalar(database, legacy_sql + " LIMIT 1", thread_id)
+            if not is_notification_thread_title(legacy_title):
+                legacy_title = ""
     index = Path(session_home or runtime.codex_home) / "session_index.jsonl"
     if not index.exists():
-        return ""
+        return legacy_title
     title = ""
     try:
         with index.open("r", encoding="utf-8", errors="replace") as handle:
@@ -403,7 +421,7 @@ def thread_title(runtime: Runtime, thread_id: str, session_home: str = "", sqlit
                         title = item["thread_name"]
     except OSError:
         pass
-    return title
+    return title or legacy_title
 
 
 def sqlite_scalar(database: Path, sql: str, parameter: str) -> tuple[bool, str]:
@@ -2050,7 +2068,9 @@ def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any
                         "clear": True,
                     }
                 ]
-    if config["tags"]:
+    if record.get("completion_event_type") == "turn_aborted" or record.get("goal_status") == "blocked":
+        payload["tags"] = ["warning"]
+    elif config["tags"]:
         payload["tags"] = config["tags"]
     if config["priority"] != 3:
         payload["priority"] = config["priority"]

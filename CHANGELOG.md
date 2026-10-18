@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.5.6] - 2026-10-18
+
+### Fixed
+
+- Codex notifications now prefer the current chat name (`threads.name`) over `threads.title`, which modern Codex can retain as the first user message. A missing modern name falls back to the saved session-index name, then the project name; it never falls back to the modern first-prompt title.
+- Saved session-index names take precedence over legacy database titles. Legacy titles remain compatible when no saved name exists, excluding titles known to equal `first_user_message`.
+- Names are read immediately before each delivery attempt, so renames made while a notification is queued or waiting to retry are reflected in the next attempt. One status icon and the existing privacy defaults are preserved.
+- Python delivery now selects the same single warning tag as Windows for aborted turns or blocked goals, instead of retaining the configured completion icon.
+
 ## [2.5.5] - 2026-09-16
 
 ### Fixed
