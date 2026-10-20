@@ -235,7 +235,7 @@ The private configuration lives at `~/.codex/ntfy-config.json`. Start from [ntfy
 | `unknown_retry_max_seconds` | `60` | Maximum interval between exponential retries while root or rollout evidence remains unknown. |
 | `goal_aware` | `true` | Hold a candidate while the root task goal status is `active`. |
 | `goal_poll_seconds` | `1` | Poll cadence while goal, turn, or descendant state can still change. |
-| `subagent_orphan_seconds` | `1800` | Stop treating a stale child rollout as active after this interval. |
+| `subagent_orphan_seconds` | `1800` | Stop treating a stale child as active after this interval. A missing rollout uses the exact child's latest valid database activity, so historical missing children do not restart the wait for each parent turn. Without reliable activity, the conservative first-observed grace remains. Zero disables expiry. |
 | `suppress_technical_turns` | `true` | Suppress legacy/watcher completions that do not look like a user-facing root turn. Modern `Stop` candidates classified as root are retained. |
 | `watch_rollouts` | `true` | Let a continuous worker discover locally persisted completions missed by hooks. |
 | `watch_scan_seconds` | `2` | Fast cadence for hot, recently modified rollout files. |

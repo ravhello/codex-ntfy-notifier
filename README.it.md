@@ -222,7 +222,7 @@ La configurazione privata è `~/.codex/ntfy-config.json`; vedere [ntfy-config.ex
 | `unknown_retry_max_seconds` | `60` | Intervallo massimo tra i tentativi esponenziali quando la prova root o rollout resta sconosciuta. |
 | `goal_aware` | `true` | Trattiene il candidato finché il goal root è `active`. |
 | `goal_poll_seconds` | `1` | Intervallo di ricontrollo di goal, turno e discendenti. |
-| `subagent_orphan_seconds` | `1800` | Età dopo la quale un rollout figlio fermo non blocca per sempre. |
+| `subagent_orphan_seconds` | `1800` | Età dopo la quale un figlio fermo smette di bloccare. Se manca il rollout, usa l'ultima attività valida di quel preciso figlio nel database: i vecchi figli mancanti non riavviano l'attesa a ogni turno del genitore. Senza attività affidabile resta la prudenza del primo rilevamento. Zero disattiva la scadenza. |
 | `suppress_technical_turns` | `true` | Sopprime completion legacy/watcher non rivolte all’utente; un `Stop` classificato come root resta candidato. |
 | `watch_rollouts` | `true` | Recupera completion persistite localmente ma perse dagli hook. |
 | `watch_scan_seconds` | `2` | Frequenza rapida per i rollout recenti modificati di recente. |
