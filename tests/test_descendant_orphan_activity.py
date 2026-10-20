@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, nullcontext
 import importlib.util
 import json
 import os
@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -183,6 +184,10 @@ class DescendantOrphanDeliveryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         contracts.NotifierContractTests.setUpClass()
+        spec = importlib.util.spec_from_file_location("orphan_delivery_observer_notifier", ROOT / "src/notify-ntfy.py")
+        assert spec is not None and spec.loader is not None
+        cls.observer_notifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.observer_notifier)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -235,14 +240,23 @@ class DescendantOrphanDeliveryTests(unittest.TestCase):
                     self.assertEqual(len(fixture.server.payloads), 1)
                     fixture.server.payloads.clear()
 
-    def wait_for_child_gate(self, fixture, process, *, after_due: int = 0) -> dict:
+    def wait_for_child_gate(self, fixture, process, *, implementation: str, after_due: int = 0) -> dict:
+        observer_runtime = SimpleNamespace(ensure=lambda: None, mutation_locks=fixture.state / "mutation-locks")
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             with fixture.server.lock:
                 self.assertEqual(fixture.server.payloads, [], "intermediate root completion escaped the child gate")
             for path in (fixture.state / "pending").glob("*.json"):
                 try:
-                    record = json.loads(read_text_shared_delete(path))
+                    # Windows Python os.replace also needs serialization with
+                    # the reader; SHARE_DELETE alone is sufficient only for
+                    # PowerShell's File.Replace writer. Close before unlocking.
+                    guard = (
+                        self.observer_notifier.record_mutation_lock(observer_runtime, path.stem)
+                        if implementation == "python" else nullcontext()
+                    )
+                    with guard:
+                        record = json.loads(read_text_shared_delete(path))
                 except (OSError, UnicodeError, json.JSONDecodeError):
                     continue
                 reason = record.get("idle_reason") or record.get("gate_reason")
@@ -270,7 +284,7 @@ class DescendantOrphanDeliveryTests(unittest.TestCase):
                 process = subprocess.Popen(fixture.continuous_worker_command(implementation), env=fixture.env,
                                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:
-                    first = self.wait_for_child_gate(fixture, process)
+                    first = self.wait_for_child_gate(fixture, process, implementation=implementation)
                     self.assertEqual(fixture.write_session_meta(child, subagent=True), missing)
                     child_turn = str(uuid.uuid4())
                     fixture.append_rollout(missing, "task_started", turn_id=child_turn)
@@ -283,11 +297,20 @@ class DescendantOrphanDeliveryTests(unittest.TestCase):
                     # no HTTP therefore proves the active file was observed.
                     first_due = first.get("next_probe_unix_ms") or first["next_attempt_unix_ms"]
                     self.wait_for_child_gate(fixture, process,
+                                             implementation=implementation,
                                              after_due=max(first_due, int(time.time() * 1000) + 250))
                     fixture.append_rollout(missing, "task_complete", turn_id=child_turn, message="Child finished")
                     self.assertEqual(len(fixture.wait_for_payloads(1, timeout=60)), 1)
                 finally:
-                    fixture.stop_continuous_worker(process)
+                    worker_output = fixture.stop_continuous_worker(process)
+                    if sys.exc_info()[0] is not None:
+                        # Runtime diagnostics are inspected only after the
+                        # worker and its children have stopped and been reaped.
+                        print(
+                            f"child-gate failure implementation={implementation} rc={process.returncode}\n"
+                            f"stdout={worker_output[0][-2000:]}\nstderr={worker_output[1][-2000:]}\n"
+                            f"{fixture.state_debug()[-6000:]}", file=sys.stderr,
+                        )
                 fixture.run_ok(fixture.hook_command(implementation, event))
                 fixture.run_ok(fixture.worker_command(implementation), timeout=60)
                 with fixture.server.lock:
