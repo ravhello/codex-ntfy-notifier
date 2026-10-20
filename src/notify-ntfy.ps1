@@ -32,7 +32,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.5.6'
+$ScriptVersion = '2.5.7'
 $MaxNtfyMessageBytes = 3500
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
@@ -3041,6 +3041,40 @@ SELECT COALESCE(group_concat(id || '|' || status, ','), '') FROM descendants
   return [pscustomobject]@{ ok = $true; available = $true; entries = $entries; error = '' }
 }
 
+function Get-ThreadLastActivityUnixMs {
+  param(
+    [string]$ThreadId,
+    [string]$SqliteHome,
+    [int64]$NowUnixMs
+  )
+
+  if ([string]::IsNullOrWhiteSpace($ThreadId) -or [string]::IsNullOrWhiteSpace($SqliteHome) -or $NowUnixMs -le 0) { return [int64]0 }
+  $database = Get-StateDatabasePath -SqliteHome $SqliteHome
+  $schema = Invoke-SqliteRow -DatabasePath $database -Sql "SELECT group_concat(name, ',') FROM pragma_table_info('threads') WHERE name IN ('updated_at_ms','updated_at','recency_at_ms','recency_at') AND ?1=?1" -Parameter 'thread-activity' -ColumnCount 1
+  if (-not $schema.ok -or -not $schema.found) { return [int64]0 }
+  $availableColumns = @(([string]$schema.values[0]) -split ',')
+  $values = @()
+  $invalid = @()
+  # Column names come only from this allowlist. Missing/malformed activity is
+  # unknown, never evidence that a missing child is old or completed.
+  foreach ($column in @('updated_at_ms', 'updated_at', 'recency_at_ms', 'recency_at')) {
+    if ($availableColumns -cnotcontains $column) { continue }
+    $isSeconds = $column -in @('updated_at', 'recency_at')
+    $maximum = if ($isSeconds) { '9223372036854775' } else { '9223372036854775807' }
+    $invalid += "($column IS NOT NULL AND (typeof($column)<>'integer' OR $column<0 OR $column>$maximum))"
+    $values += if ($isSeconds) { "COALESCE($column,0)*1000" } else { "COALESCE($column,0)" }
+  }
+  if ($values.Count -eq 0) { return [int64]0 }
+  $latest = if ($values.Count -eq 1) { $values[0] } else { 'MAX(' + ($values -join ',') + ')' }
+  $sql = "SELECT CASE WHEN " + ($invalid -join ' OR ') + " THEN '' ELSE CAST($latest AS TEXT) END FROM threads WHERE id=?1 LIMIT 1"
+  $row = Invoke-SqliteRow -DatabasePath $database -Sql $sql -Parameter $ThreadId -ColumnCount 1
+  [int64]$activity = 0
+  if (-not $row.ok -or -not $row.found -or
+      -not [int64]::TryParse([string]$row.values[0], [ref]$activity) -or
+      $activity -le 0 -or $activity -gt $NowUnixMs) { return [int64]0 }
+  return $activity
+}
+
 function Get-ActiveDescendants {
   param(
     [object]$Record,
@@ -3095,11 +3129,19 @@ function Get-ActiveDescendants {
       $rolloutPath = Find-RolloutPathByThread -ThreadId $childId -SessionHome $SessionHome
     }
     if ([string]::IsNullOrWhiteSpace($rolloutPath)) {
-      $firstSeen = if ($unknownSince.ContainsKey($childId)) { [int64]$unknownSince[$childId] } else { [int64]0 }
-      if ($firstSeen -le 0) {
+      # The registry outlives deleted child rollouts. Age an indexed missing
+      # child from its last durable activity, not from every new parent turn.
+      # Re-read each time so a resumed/recent child immediately rearms the gate.
+      $activity = Get-ThreadLastActivityUnixMs -ThreadId $childId -SqliteHome $SqliteHome -NowUnixMs $NowUnixMs
+      $firstSeen = if ($activity -gt 0) { $activity } elseif ($unknownSince.ContainsKey($childId)) { [int64]$unknownSince[$childId] } else { [int64]0 }
+      if ($firstSeen -le 0 -or $firstSeen -gt $NowUnixMs) {
         $firstSeen = $NowUnixMs
-        $unknownSince[$childId] = $firstSeen
       }
+      if ($activity -gt 0) {
+        # Keep durable activity separate from an unknown-observation clock. If
+        # the registry becomes unreadable next pass, it needs a fresh grace.
+        [void]$unknownSince.Remove($childId)
+      } else { $unknownSince[$childId] = $firstSeen }
       if ($orphanMs -le 0 -or $NowUnixMs - $firstSeen -lt $orphanMs) {
         $active++
       }
@@ -3142,6 +3184,14 @@ function Get-ActiveDescendants {
     }
     $lifecycle = [string](Get-ObjectValue $probe.state 'lastLifecycleType' 'unknown')
     $modifiedMs = [int64](Get-ObjectValue $probe.state 'modifiedUnixMs' 0)
+    if ($lifecycle -eq 'unknown' -and $modifiedMs -le 0) {
+      $activity = Get-ThreadLastActivityUnixMs -ThreadId $childId -SqliteHome $SqliteHome -NowUnixMs $NowUnixMs
+      $firstSeen = if ($activity -gt 0) { $activity } elseif ($unknownSince.ContainsKey($childId)) { [int64]$unknownSince[$childId] } else { [int64]0 }
+      if ($firstSeen -le 0 -or $firstSeen -gt $NowUnixMs) { $firstSeen = $NowUnixMs }
+      if ($activity -gt 0) { [void]$unknownSince.Remove($childId) } else { $unknownSince[$childId] = $firstSeen }
+      if ($orphanMs -le 0 -or $NowUnixMs - $firstSeen -lt $orphanMs) { $active++ }
+      continue
+    }
     $fresh = $modifiedMs -gt 0 -and ($orphanMs -le 0 -or $NowUnixMs - $modifiedMs -lt $orphanMs)
     if (($lifecycle -eq 'task_started' -or $lifecycle -eq 'unknown') -and $fresh) {
       $active++
@@ -5024,7 +5074,14 @@ function Write-RolloutScanHealth {
 
   try {
     $healthPath = if ($ScanScope -eq 'Remote') { $RemoteScanHealthPath } else { $ScanHealthPath }
-    $previous = if (Test-Path -LiteralPath $healthPath) { Read-JsonFile -Path $healthPath } else { [pscustomobject]@{} }
+    $previous = [pscustomobject]@{}
+    if (Test-Path -LiteralPath $healthPath) {
+      try { $previous = Read-JsonFile -Path $healthPath } catch {
+        # Scan health is derived telemetry, not queue/lifecycle authority. A
+        # truncated previous snapshot must not prevent publishing fresh health.
+        $previous = [pscustomobject]@{}
+      }
+    }
     $lastCompletedAt = if (-not [string]::IsNullOrWhiteSpace($CompletedAt)) {
       $CompletedAt
     } else {

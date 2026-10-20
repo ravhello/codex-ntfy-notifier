@@ -33,7 +33,7 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.5.6"
+VERSION = "2.5.7"
 MAX_NTFY_MESSAGE_BYTES = 3500
 SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
@@ -443,6 +443,55 @@ def sqlite_scalar(database: Path, sql: str, parameter: str) -> tuple[bool, str]:
                 connection.close()
 
 
+def thread_last_activity_unix_ms(sqlite_home: Path, thread_id: str, now_ms: int) -> int:
+    """Read a durable orphan anchor, rejecting incomplete or invalid evidence."""
+    database = state_database_path(sqlite_home)
+    columns = (
+        ("updated_at_ms", 1),
+        ("updated_at", 1000),
+        ("recency_at_ms", 1),
+        ("recency_at", 1000),
+    )
+    schema_available, schema_columns = sqlite_scalar(
+        database,
+        "SELECT group_concat(name, ',') FROM pragma_table_info('threads') "
+        "WHERE name IN ('updated_at_ms','updated_at','recency_at_ms','recency_at') AND ?1 = ?1",
+        thread_id,
+    )
+    if not schema_available or not schema_columns:
+        return 0
+    present = set(schema_columns.split(","))
+    selected = [(name, multiplier) for name, multiplier in columns if name in present]
+    if not selected:
+        return 0
+    # Only the constant allowlist above may contribute SQL identifiers. Preserve
+    # SQLite types alongside values so text/real timestamps never age out work.
+    projection = ", ".join(f"typeof({name}), {name}" for name, _ in selected)
+    available, rows = sqlite_rows(
+        database,
+        f"SELECT {projection} FROM threads WHERE id = ? LIMIT 1",
+        thread_id,
+    )
+    if not available or len(rows) != 1 or len(rows[0]) != len(selected) * 2:
+        return 0
+    latest = 0
+    for index, (_, multiplier) in enumerate(selected):
+        kind, raw = rows[0][index * 2 : index * 2 + 2]
+        if kind == "null":
+            continue
+        if kind != "integer":
+            return 0
+        try:
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        limit = 9_223_372_036_854_775 if multiplier == 1000 else 9_223_372_036_854_775_807
+        if value < 0 or value > limit:
+            return 0
+        latest = max(latest, value * multiplier)
+    return latest if 0 < latest <= now_ms else 0
+
+
 def sqlite_rows(database: Path, sql: str, parameter: str) -> tuple[bool, list[tuple[str, ...]]]:
     """Read string rows without creating or mutating a Codex database."""
     if not database.is_file():
@@ -643,6 +692,25 @@ def active_descendants(
     active = 0
     invalid_evidence = False
     seen_children: set[str] = set()
+
+    def missing_child_since(child_id: str) -> int:
+        # Re-read on every pass: a resumed child must re-arm the orphan window,
+        # while historical missing files must not get a new timer each turn.
+        activity_ms = thread_last_activity_unix_ms(sqlite_home, child_id, now_ms)
+        if activity_ms > 0:
+            # Do not reuse a durable timestamp as an unknown-observation clock
+            # if the database becomes unreadable or malformed on a later pass.
+            unknown_since.pop(child_id, None)
+            return activity_ms
+        try:
+            first_seen = int(unknown_since.get(child_id, 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            first_seen = 0
+        if first_seen <= 0 or first_seen > now_ms:
+            first_seen = now_ms
+        unknown_since[child_id] = first_seen
+        return first_seen
+
     for child_id, edge_status in descendants:
         seen_children.add(child_id)
         if edge_status == "closed":
@@ -650,10 +718,7 @@ def active_descendants(
             continue
         rollout = find_rollout(runtime, child_id, str(codex_home), str(sqlite_home))
         if rollout is None:
-            first_seen = int(unknown_since.get(child_id, 0) or 0)
-            if first_seen <= 0:
-                first_seen = now_ms
-                unknown_since[child_id] = first_seen
+            first_seen = missing_child_since(child_id)
             if orphan_ms <= 0 or now_ms - first_seen < orphan_ms:
                 active += 1
             continue
@@ -671,10 +736,7 @@ def active_descendants(
         elif lifecycle == "unknown" and mtime_ms and (orphan_ms <= 0 or now_ms - mtime_ms < orphan_ms):
             active += 1
         elif lifecycle == "unknown" and not mtime_ms and edge_status != "closed":
-            first_seen = int(unknown_since.get(child_id, 0) or 0)
-            if first_seen <= 0:
-                first_seen = now_ms
-                unknown_since[child_id] = first_seen
+            first_seen = missing_child_since(child_id)
             if orphan_ms <= 0 or now_ms - first_seen < orphan_ms:
                 active += 1
         else:

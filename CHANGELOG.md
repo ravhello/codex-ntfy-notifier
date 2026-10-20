@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.5.7] - 2026-10-20
+
+### Fixed
+
+- Historical subagents with missing rollout files no longer restart a full orphan grace period for every new parent completion. The existing grace period is measured from the latest valid activity saved for that exact child in the Codex database; recent/resumed children and missing or malformed evidence retain conservative handling.
+- PowerShell and Python re-read child activity during idle checks, preserving protection for a child that resumes or whose rollout appears while a notification is waiting. The orphan timeout, active-goal gate, current chat names and single status icon remain unchanged.
+- Windows scan-health snapshots recover automatically from a truncated or invalid previous JSON file, preventing repeated telemetry errors and allowing worker maintenance readiness to recover.
+
 ## [2.5.6] - 2026-10-18
 
 ### Fixed
