@@ -2065,30 +2065,43 @@ $publicState = $publicProbe.state
         event["last-assistant-message"] = "must never be sent"
         self.run_ok(self.hook_command("powershell", event))
         process = self.start_worker("powershell")
+        worker_output: tuple[str, str] | None = None
+        worker_exited_early = False
+        reason = ""
         try:
             deadline = time.monotonic() + 90
-            reason = ""
             while time.monotonic() < deadline and reason != "rollout-probe-failed":
                 for pending_path in (self.state / "pending").glob("*.json"):
                     try:
-                        pending_record = json.loads(pending_path.read_text(encoding="utf-8-sig"))
-                    except (OSError, json.JSONDecodeError):
+                        pending_record = json.loads(read_text_shared_delete(pending_path))
+                    except (OSError, UnicodeError, json.JSONDecodeError):
                         continue
                     reason = str(pending_record.get("gate_reason") or "")
                 if process.poll() is not None:
                     break
                 time.sleep(0.05)
-            self.assertEqual(reason, "rollout-probe-failed", self.state_debug())
         finally:
+            worker_exited_early = process.poll() is not None
             if process.poll() is None:
                 process.terminate()
-                process.communicate(timeout=5)
+            try:
+                worker_output = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                worker_output = process.communicate(timeout=5)
+        if worker_exited_early or reason != "rollout-probe-failed":
+            self.fail(
+                "invalid UTF-8 gate not held by a live worker: "
+                f"reason={reason!r}, exited_early={worker_exited_early}, rc={process.returncode}\n"
+                f"stdout={worker_output[0]}\nstderr={worker_output[1]}\n{self.state_debug()}"
+            )
         with self.server.lock:
             self.assertEqual(self.server.payloads, [])
-        self.assertFalse(list((self.state / "outbox").glob("*.json")), self.state_debug())
+        outbox = list((self.state / "outbox").glob("*.json"))
+        self.assertFalse(outbox, self.state_debug() if outbox else "")
         pending = list((self.state / "pending").glob("*.json"))
-        self.assertEqual(len(pending), 1, self.state_debug())
-        record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+        self.assertEqual(len(pending), 1, self.state_debug() if len(pending) != 1 else "")
+        record = json.loads(read_text_shared_delete(pending[0]))
         self.assertEqual(record.get("gate_reason"), "rollout-probe-failed")
 
     def test_active_goal_waits_for_terminal_status(self) -> None:
