@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import copy
 import ctypes
 import datetime as dt
 import hashlib
+import itertools
 import json
 import os
 import platform
@@ -16,6 +18,7 @@ import random
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -33,10 +36,15 @@ except ImportError:  # Windows fallback, useful for validation and Windows SSH h
     import msvcrt
 
 
-VERSION = "2.5.7"
+VERSION = "2.6.0"
 MAX_NTFY_MESSAGE_BYTES = 3500
 SYNTHETIC_TEST_THREAD_ID = "00000000-0000-4000-8000-000000000001"
 CHATGPT_TASK_URL_PREFIX = "https://chatgpt.com/codex/tasks/"
+ATTENTION_MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
+ATTENTION_MAX_HEADER_BYTES = 1024 * 1024
+ATTENTION_MAX_CALLS = 128
+ATTENTION_MAX_RETIRED_CALLS = 4096
+_ATTENTION_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 def utc_now() -> dt.datetime:
@@ -202,10 +210,14 @@ class Runtime:
         self.sent = self.state_root / "sent"
         self.suppressed = self.state_root / "suppressed"
         self.dead = self.state_root / "dead"
+        self.attention_pending = self.state_root / "attention-pending"
+        self.attention_sent = self.state_root / "attention-sent"
+        self.attention_backoff: dict[str, tuple[int, int, int]] = {}
         self.watch = self.state_root / "watch"
         self.mutation_locks = self.state_root / "mutation-locks"
         self.lock_path = self.state_root / "worker.lock"
         self.delivery_lock_path = self.state_root / "delivery.lock"
+        self.attention_delivery_lock_path = self.state_root / "attention-delivery.lock"
         self.worker_health_path = self.state_root / "worker-health.json"
         self.delivery_health_path = self.state_root / "delivery-health.json"
         self.scan_lock_path = self.state_root / "watch-scan.lock"
@@ -226,9 +238,15 @@ class Runtime:
             self.sent,
             self.suppressed,
             self.dead,
+            self.attention_pending,
+            self.attention_sent,
             self.watch,
             self.mutation_locks,
         ):
+            if path in (self.attention_pending, self.attention_sent) and (path.is_symlink() or path.exists() and not path.is_dir()):
+                # An unsafe optional feature container must not chmod another
+                # target or prevent ordinary completion delivery.
+                continue
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
             with contextlib.suppress(OSError):
                 path.chmod(0o700)
@@ -304,6 +322,9 @@ def load_config(runtime: Runtime) -> dict[str, Any]:
     priority = int(file_config.get("priority", 3))
     if not 1 <= priority <= 5:
         raise ValueError("priority must be between 1 and 5")
+    attention_priority = file_config.get("attention_priority", 4)
+    if isinstance(attention_priority, bool) or not isinstance(attention_priority, int) or not 1 <= attention_priority <= 5:
+        raise ValueError("attention_priority must be an integer between 1 and 5")
     max_message_chars = int(file_config.get("max_message_chars", 180))
     if not 32 <= max_message_chars <= 3000:
         raise ValueError("max_message_chars must be between 32 and 3000")
@@ -318,6 +339,8 @@ def load_config(runtime: Runtime) -> dict[str, Any]:
         "password": str(setting("CODEX_NTFY_PASSWORD", "password", "")),
         "allow_insecure_auth": bool(file_config.get("allow_insecure_auth", False)),
         "priority": priority,
+        "attention_notifications": bool(file_config.get("attention_notifications", True)),
+        "attention_priority": attention_priority,
         "tags": list(tags),
         "max_message_chars": max_message_chars,
         "include_message": bool(file_config.get("include_message", False)),
@@ -891,6 +914,714 @@ def response_item_has_user_evidence(payload: Any, current_turn: str) -> bool:
     return has_user_text
 
 
+def _attention_uuid(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    try:
+        canonical = str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        return ""
+    return canonical if value.lower() == canonical else ""
+
+
+def _attention_identifier(value: Any) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= 256 and not any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value
+    )
+
+
+@contextlib.contextmanager
+def _attention_reader(path: Path) -> Any:
+    """Do not prevent the producer from replacing its own rollout on Windows."""
+    if os.name != "nt":
+        with path.open("rb") as handle:
+            yield handle
+        return
+    import msvcrt
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.restype = wintypes.HANDLE
+    raw_handle = create(str(path), 0x80000000, 7, None, 3, 0x80, None)
+    if raw_handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(raw_handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle(raw_handle)
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        yield handle
+
+
+def _attention_empty(state: str, reason: str = "") -> dict[str, Any]:
+    return {"state": state, "reason": reason, "thread_id": "", "turn_id": "", "call_id": "",
+            "tool_name": "", "question_count": 0, "pending_count": 0, "paused_turns": [], "resumed_turns": [],
+            "snapshot_size": 0, "snapshot_mtime_ns": 0, "cwd": "", "source": None}
+
+
+def _attention_question_count(arguments: Any, tool_name: str) -> int:
+    if isinstance(arguments, str):
+        if len(arguments.encode("utf-8")) > 1024 * 1024:
+            raise ValueError("question arguments exceed bound")
+        arguments = json.loads(arguments)
+    if not isinstance(arguments, dict) or not isinstance(arguments.get("questions"), list):
+        raise ValueError("question arguments unavailable")
+    questions = arguments["questions"]
+    if not 1 <= len(questions) <= 16:
+        raise ValueError("question count unavailable")
+    for question in questions:
+        if not isinstance(question, dict):
+            raise ValueError("question shape unavailable")
+        label = question.get("title") if tool_name == "request_user_input_async" else question.get("question", question.get("title"))
+        if not isinstance(label, str) or not label.strip() or len(label) > 8192:
+            raise ValueError("question label unavailable")
+        if "options" in question:
+            options = question["options"]
+            if not isinstance(options, list) or len(options) > 64:
+                raise ValueError("question options unavailable")
+            for option in options:
+                value = option if tool_name == "request_user_input_async" else option.get("label") if isinstance(option, dict) else None
+                if not isinstance(value, str) or not value.strip() or len(value) > 8192:
+                    raise ValueError("question option unavailable")
+    return len(questions)
+
+
+def _attention_user_text(payload: dict[str, Any]) -> str | None:
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return None
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    content = payload.get("content")
+    kinds = metadata.get("content_item_kinds") if isinstance(metadata, dict) else None
+    if not isinstance(content, list) or not isinstance(kinds, list) or len(content) != len(kinds):
+        return None
+    item_metadata = metadata.get("content_item_metadata")
+    if item_metadata is not None and (not isinstance(item_metadata, list) or len(item_metadata) != len(content)):
+        return None
+    parts: list[str] = []
+    for index, (item, kind) in enumerate(zip(content, kinds)):
+        if kind != "user.text":
+            continue
+        if not isinstance(item, dict) or item.get("type") != "input_text" or not isinstance(item.get("text"), str):
+            return None
+        part_metadata = item_metadata[index] if item_metadata is not None else None
+        if part_metadata is not None:
+            if not isinstance(part_metadata, dict):
+                return None
+            provenance = part_metadata.get("provenance")
+            if provenance is not None and (not isinstance(provenance, dict) or provenance.get("type") != "user"):
+                return None
+        parts.append(item["text"])
+    return "\n".join(parts) if parts else None
+
+
+def codex_attention_state(path: Path | str, thread_id: str, expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Attest an unanswered request from a stable, contiguous bounded tail.
+
+    The cache contains identities, counts and ordering only, never question or
+    answer text. A missing expected call is unknown, not proof of resolution.
+    """
+    path = Path(path)
+    canonical_thread = _attention_uuid(thread_id)
+    if not canonical_thread:
+        return _attention_empty("unknown", "session-identity")
+    if expected is not None and (not isinstance(expected, dict) or
+            not _attention_uuid(expected.get("turn_id")) or not _attention_identifier(expected.get("call_id"))):
+        return _attention_empty("unknown", "expected-identity")
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or path.is_symlink():
+            return _attention_empty("unknown", "transcript-type")
+        identity = (str(path.absolute()), canonical_thread, before.st_dev, before.st_ino,
+                    before.st_size, before.st_mtime_ns)
+        snapshot = _ATTENTION_CACHE.get(identity)
+        if snapshot is None:
+            previous = next((value for key, value in reversed(list(_ATTENTION_CACHE.items()))
+                             if key[:4] == identity[:4] and value["snapshot_size"] < before.st_size and
+                             before.st_size - value["parse_offset"] <= ATTENTION_MAX_SNAPSHOT_BYTES), None)
+            with _attention_reader(path) as handle:
+                opened = os.fstat(handle.fileno())
+                if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+                    return _attention_empty("unknown", "transcript-changing")
+                header = handle.readline(ATTENTION_MAX_HEADER_BYTES + 1)
+                if len(header) > ATTENTION_MAX_HEADER_BYTES or not header.endswith(b"\n"):
+                    return _attention_empty("unknown", "session-header")
+                envelope = json.loads(header.decode("utf-8-sig", errors="strict"))
+                meta = envelope.get("payload") if isinstance(envelope, dict) and envelope.get("type") == "session_meta" else None
+                if not isinstance(meta, dict) or _attention_uuid(meta.get("id")) != canonical_thread:
+                    return _attention_empty("unknown", "session-binding")
+                header_hash = hashlib.sha256(header).hexdigest()
+                if previous is not None:
+                    # Inode plus growth is not proof of an append (e.g. an
+                    # in-place history rewrite). Cheap anchors guard reuse;
+                    # they do not claim to attest every byte of the prefix.
+                    old_size = previous["snapshot_size"]
+                    handle.seek(max(0, old_size - 64))
+                    old_end = handle.read(min(64, old_size))
+                    if (previous.get("header_hash") != header_hash or
+                            previous.get("eof_hash") != hashlib.sha256(old_end).hexdigest()):
+                        previous = None
+                start = previous["parse_offset"] if previous is not None else max(0, opened.st_size - ATTENTION_MAX_SNAPSHOT_BYTES)
+                handle.seek(start)
+                if start and previous is None:
+                    handle.readline(ATTENTION_MAX_SNAPSHOT_BYTES + 1)
+                    start = handle.tell()
+                raw = handle.read(max(0, opened.st_size - start))
+                handle.seek(max(0, opened.st_size - 64))
+                eof_hash = hashlib.sha256(handle.read(min(64, opened.st_size))).hexdigest()
+                after = os.fstat(handle.fileno())
+            current = path.lstat()
+            if (after.st_size, after.st_mtime_ns, current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+                    opened.st_size, opened.st_mtime_ns, opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+                return _attention_empty("unknown", "transcript-changing")
+            calls: dict[str, dict[str, Any]] = copy.deepcopy(previous["calls"]) if previous is not None else {}
+            retired_calls: dict[str, str] = dict(previous["retired_calls"]) if previous is not None else {}
+            bad_offset = previous["bad_offset"] if previous is not None else -1
+            terminals: dict[str, int] = dict(previous["terminals"]) if previous is not None else {}
+            terminal_types: dict[str, str] = dict(previous["terminal_types"]) if previous is not None else {}
+            current_turn = previous["current_turn"] if previous is not None else ""
+            order = start
+            parse_offset = start
+            partial_offset = -1
+
+            def apply_user(text: str, position: int) -> None:
+                match = re.fullmatch(r"\s*<send_user_message_question_reply>\s*(.*?)\s*</send_user_message_question_reply>\s*", text, re.DOTALL)
+                if match:
+                    values = json.loads(match.group(1))
+                    values = [values] if isinstance(values, dict) else values
+                    if not isinstance(values, list) or not 1 <= len(values) <= 16:
+                        raise ValueError("reply shape unavailable")
+                    for value in values:
+                        if not isinstance(value, dict) or not all(isinstance(value.get(key), str) for key in ("questionItemId", "question", "answer")):
+                            continue
+                        try:
+                            item_id = json.loads(value["questionItemId"])
+                        except (ValueError, TypeError):
+                            continue
+                        if not isinstance(item_id, list) or len(item_id) != 3 or item_id[0] != "request_user_input_async":
+                            continue
+                        call = calls.get(item_id[1]) if isinstance(item_id[1], str) else None
+                        index = item_id[2]
+                        if call is None or call["tool_name"] != "request_user_input_async" or type(index) is not int or not 0 <= index < call["question_count"]:
+                            continue
+                        call["answered"].add(index)
+                        if len(call["answered"]) == call["question_count"] and call["resolved_at"] is None:
+                            call["resolved_at"] = position
+                            call["answer_order"] = position
+                    return
+                if text.strip():
+                    for call in calls.values():
+                        if call["resolved_at"] is None:
+                            call["resolved_at"] = position
+
+            for raw_line in raw.splitlines(keepends=True):
+                line_start = order
+                order += len(raw_line)
+                if not raw_line.endswith(b"\n"):
+                    partial_offset = line_start
+                    break
+                parse_offset = order
+                try:
+                    item = json.loads(raw_line.decode("utf-8-sig", errors="strict"))
+                    if not isinstance(item, dict):
+                        raise ValueError("transcript frame unavailable")
+                    envelope_type = item.get("type")
+                    payload = item.get("payload")
+                    if not isinstance(payload, dict):
+                        if envelope_type in ("session_meta", "turn_context", "event_msg", "response_item"):
+                            raise ValueError("typed transcript payload unavailable")
+                        continue
+                    if envelope_type == "turn_context":
+                        current_turn = _attention_uuid(payload.get("turn_id")) or current_turn
+                    elif envelope_type == "event_msg":
+                        event_type = payload.get("type")
+                        if event_type == "task_started":
+                            current_turn = _attention_uuid(payload.get("turn_id")) or current_turn
+                        elif event_type in ("task_complete", "turn_aborted"):
+                            turn = _attention_uuid(payload.get("turn_id"))
+                            if turn:
+                                terminals[turn] = order
+                                terminal_types[turn] = event_type
+                                if len(terminals) > 1024:
+                                    expired_turn = next(iter(terminals))
+                                    terminals.pop(expired_turn)
+                                    terminal_types.pop(expired_turn, None)
+                            if event_type == "turn_aborted":
+                                for call in calls.values():
+                                    if turn and call["turn_id"] == turn and call["resolved_at"] is None:
+                                        call["resolved_at"] = order
+                        elif event_type == "user_message" and isinstance(payload.get("message"), str):
+                            apply_user(payload["message"], order)
+                    elif envelope_type == "response_item":
+                        payload_type = payload.get("type")
+                        if payload_type == "function_call":
+                            name = payload.get("name")
+                            if name not in ("request_user_input", "request_user_input_async", "functions.request_user_input", "functions.request_user_input_async"):
+                                continue
+                            if payload.get("namespace") not in (None, "", "functions"):
+                                continue
+                            name = name.removeprefix("functions.")
+                            call_id = payload.get("call_id")
+                            metadata = payload.get("internal_chat_message_metadata_passthrough")
+                            turn = _attention_uuid(metadata.get("turn_id")) if isinstance(metadata, dict) and "turn_id" in metadata else current_turn
+                            if not turn or not _attention_identifier(call_id):
+                                raise ValueError("request identity unavailable")
+                            arguments = payload.get("arguments")
+                            question_count = _attention_question_count(arguments, name)
+                            decoded_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+                            fingerprint = hashlib.sha256(json.dumps([name, turn, decoded_arguments], sort_keys=True,
+                                                                   ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+                            if call_id in retired_calls:
+                                if retired_calls[call_id] != fingerprint:
+                                    raise ValueError("conflicting retired request identity")
+                                continue
+                            if call_id in calls:
+                                if calls[call_id]["fingerprint"] != fingerprint:
+                                    raise ValueError("conflicting request identity")
+                                continue
+                            if len(calls) >= ATTENTION_MAX_CALLS:
+                                resolved = [value for value in calls.values() if value["resolved_at"] is not None]
+                                if not resolved:
+                                    raise ValueError("unresolved request count exceeds bound")
+                                if len(retired_calls) >= ATTENTION_MAX_RETIRED_CALLS:
+                                    raise ValueError("retired request count exceeds bound")
+                                oldest = min(resolved, key=lambda value: value["created_at"])
+                                # Retain only a resolved identity/hash barrier,
+                                # never its question, answer or resolved state.
+                                # Expected pruned calls remain uncovered/unknown.
+                                retired_calls[oldest["call_id"]] = oldest["fingerprint"]
+                                del calls[oldest["call_id"]]
+                            calls[call_id] = {"call_id": call_id, "turn_id": turn, "tool_name": name,
+                                              "question_count": question_count, "answered": set(),
+                                              "accepted": name == "request_user_input", "acknowledged": name == "request_user_input",
+                                              "created_at": line_start, "resolved_at": None, "answer_order": None, "fingerprint": fingerprint}
+                        elif payload_type == "function_call_output" and isinstance(payload.get("call_id"), str):
+                            call = calls.get(payload["call_id"])
+                            if call is None:
+                                continue
+                            if call["tool_name"] == "request_user_input":
+                                if call["resolved_at"] is None:
+                                    call["resolved_at"] = order
+                                    call["answer_order"] = order
+                            else:
+                                output = payload.get("output")
+                                output = json.loads(output) if isinstance(output, str) else output
+                                if not isinstance(output, dict) or type(output.get("accepted")) is not bool:
+                                    raise ValueError("request acknowledgement unavailable")
+                                if call["acknowledged"] and call["accepted"] != output["accepted"]:
+                                    raise ValueError("conflicting request acknowledgement")
+                                call["acknowledged"] = True
+                                call["accepted"] = output["accepted"]
+                                if not output["accepted"] and call["resolved_at"] is None:
+                                    call["resolved_at"] = order
+                        else:
+                            user_text = _attention_user_text(payload)
+                            if user_text is not None:
+                                apply_user(user_text, order)
+                except (ValueError, TypeError, UnicodeError):
+                    bad_offset = max(bad_offset, line_start)
+            source = meta.get("source")
+            if not isinstance(source, str):
+                source = {"subagent": True} if isinstance(source, dict) and source.get("subagent") is not None else None
+            paused = sorted(turn for turn, position in terminals.items() if any(
+                call["accepted"] and call["turn_id"] == turn and call["created_at"] < position and
+                max(bad_offset, partial_offset) < call["created_at"] and
+                (call["resolved_at"] is None or position < call["resolved_at"])
+                for call in calls.values()))
+            resumed = sorted(turn for turn, position in terminals.items() if terminal_types.get(turn) == "task_complete" and turn not in paused and any(
+                call["accepted"] and call["turn_id"] == turn and call["answer_order"] is not None and
+                call["created_at"] < call["answer_order"] < position and max(bad_offset, partial_offset) < call["created_at"]
+                for call in calls.values()))
+            snapshot = {"calls": calls, "retired_calls": retired_calls,
+                        "bad_offset": bad_offset, "partial_offset": partial_offset,
+                        "parse_offset": parse_offset, "terminals": terminals, "terminal_types": terminal_types,
+                        "current_turn": current_turn, "paused_turns": paused, "resumed_turns": resumed,
+                        "thread_id": canonical_thread, "cwd": sanitize(meta.get("cwd", ""), 1200),
+                        "source": source, "snapshot_size": opened.st_size, "snapshot_mtime_ns": opened.st_mtime_ns,
+                        "header_hash": header_hash, "eof_hash": eof_hash}
+            # Retain no question strings in the cache, including hashes' inputs.
+            if len(_ATTENTION_CACHE) >= 64:
+                _ATTENTION_CACHE.pop(next(iter(_ATTENTION_CACHE)))
+            _ATTENTION_CACHE[identity] = snapshot
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return _attention_empty("unknown", "transcript-unavailable")
+    result = _attention_empty("none")
+    result["transcript_path"] = str(path.absolute())
+    result.update({name: snapshot[name] for name in ("thread_id", "cwd", "source", "snapshot_size", "snapshot_mtime_ns", "paused_turns", "resumed_turns")})
+    source = result["source"]
+    if source == "subagent" or isinstance(source, dict) and source.get("subagent") is not None:
+        result["reason"] = "subagent"
+        result["paused_turns"] = []
+        result["resumed_turns"] = []
+        return result
+    calls = list(snapshot["calls"].values())
+    waiting = [call for call in calls if call["accepted"] and call["resolved_at"] is None]
+    call = snapshot["calls"].get(expected["call_id"]) if expected is not None else waiting[-1] if waiting else calls[-1] if calls else None
+    if call is None:
+        if expected is not None:
+            result.update(state="unknown", reason="expected-request-not-covered", resumed_turns=[])
+        return result
+    result.update({name: call[name] for name in ("turn_id", "call_id", "tool_name", "question_count")})
+    if expected is not None and (call["turn_id"] != _attention_uuid(expected["turn_id"]) or
+            expected.get("tool_name", call["tool_name"]) != call["tool_name"]):
+        result.update(state="unknown", reason="expected-request-mismatch")
+        result["resumed_turns"] = []
+        return result
+    if expected is not None:
+        # An exact receipt cannot borrow a different call's answer merely
+        # because both calls belonged to the same turn.
+        terminal = snapshot["terminals"].get(call["turn_id"], -1)
+        result["resumed_turns"] = ([call["turn_id"]] if call["answer_order"] is not None and
+                                   call["created_at"] < call["answer_order"] < terminal and
+                                   snapshot["terminal_types"].get(call["turn_id"]) == "task_complete" and
+                                   call["turn_id"] not in snapshot["paused_turns"] else [])
+    if max(snapshot["bad_offset"], snapshot["partial_offset"]) >= call["created_at"]:
+        result.update(state="unknown", reason="request-tail-unverifiable", paused_turns=[], resumed_turns=[])
+        return result
+    if not call["acknowledged"]:
+        result.update(state="unknown", reason="awaiting-request-acknowledgement", resumed_turns=[])
+        return result
+    pending_count = call["question_count"] - len(call["answered"])
+    if call["resolved_at"] is not None or not call["accepted"]:
+        result.update(state="resolved", pending_count=0)
+    else:
+        result.update(state="waiting", pending_count=pending_count)
+    return result
+
+
+def attention_completion_disposition(record: dict[str, Any], probe: dict[str, Any]) -> str:
+    """Only proven question-pause terminals may lose normal completion authority."""
+    return "attention-pause" if str(record.get("turn_id", "")) in probe.get("paused_turns", []) else ""
+
+
+def attention_key(provider: str, thread_id: str, turn_id: str, call_id: str) -> str:
+    return hashlib.sha256(f"codex-ntfy/attention/v1|{provider}|{thread_id}|{turn_id}|{call_id}".encode("utf-8")).hexdigest()
+
+
+_ATTENTION_PENDING_FIELDS = {"schema", "kind", "key", "provider", "thread_id", "turn_id", "call_id",
+                             "tool_name", "transcript_path", "session_codex_home", "session_sqlite_home",
+                             "cwd", "origin", "created_unix_ms", "next_attempt_unix_ms", "attempts"}
+_ATTENTION_SENT_FIELDS = {"schema", "kind", "key", "provider", "thread_id", "turn_id", "call_id", "sent_at", "ntfy_id"}
+
+
+def _attention_read_json(path: Path) -> dict[str, Any]:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink() or not 0 < info.st_size <= 65536:
+        raise ValueError("attention record unavailable")
+    with _attention_reader(path) as handle:
+        raw = handle.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("attention record exceeds bound")
+    value = json.loads(raw.decode("utf-8-sig", errors="strict"))
+    if not isinstance(value, dict):
+        raise ValueError("attention record is not an object")
+    return value
+
+
+def _attention_storage(runtime: Runtime) -> None:
+    runtime.ensure()
+    for path in (runtime.attention_pending, runtime.attention_sent):
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or path.is_symlink():
+            raise ValueError("attention storage unavailable")
+
+
+def validate_attention_record(value: Any, expected_key: str, *, sent: bool = False) -> dict[str, Any]:
+    fields = _ATTENTION_SENT_FIELDS if sent else _ATTENTION_PENDING_FIELDS
+    if not isinstance(value, dict) or set(value) != fields or type(value.get("schema")) is not int or value["schema"] != 1:
+        raise ValueError("attention record shape unavailable")
+    if value["kind"] != ("attention-sent" if sent else "attention") or value["provider"] != "codex":
+        raise ValueError("attention record provider unavailable")
+    if value["thread_id"] != _attention_uuid(value["thread_id"]) or value["turn_id"] != _attention_uuid(value["turn_id"]) or not _attention_identifier(value["call_id"]):
+        raise ValueError("attention record identity unavailable")
+    if not isinstance(value["key"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["key"]) or value["key"] != expected_key or value["key"] != attention_key(
+            value["provider"], value["thread_id"], value["turn_id"], value["call_id"]):
+        raise ValueError("attention record key mismatch")
+    if sent:
+        if not isinstance(value["sent_at"], str) or len(value["sent_at"]) > 80 or not isinstance(value["ntfy_id"], str) or len(value["ntfy_id"]) > 256:
+            raise ValueError("attention receipt unavailable")
+        parsed = dt.datetime.fromisoformat(value["sent_at"].replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("attention receipt time unavailable")
+    else:
+        if value["tool_name"] not in ("request_user_input", "request_user_input_async"):
+            raise ValueError("attention request kind unavailable")
+        for name in ("transcript_path", "session_codex_home", "session_sqlite_home"):
+            if not isinstance(value[name], str) or not 0 < len(value[name]) <= 2400 or not Path(value[name]).is_absolute():
+                raise ValueError("attention path unavailable")
+        if not isinstance(value["cwd"], str) or len(value["cwd"]) > 1200 or not isinstance(value["origin"], str) or len(value["origin"]) > 100:
+            raise ValueError("attention context unavailable")
+        for name in ("created_unix_ms", "next_attempt_unix_ms", "attempts"):
+            if type(value[name]) is not int or not 0 <= value[name] <= 9_223_372_036_854_775_807:
+                raise ValueError("attention counters unavailable")
+    return value
+
+
+def _attention_receipt_exists(runtime: Runtime, record: dict[str, Any]) -> bool:
+    path = runtime.attention_sent / f"{record['key']}.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    receipt = validate_attention_record(_attention_read_json(path), record["key"], sent=True)
+    if any(receipt[name] != record[name] for name in ("provider", "thread_id", "turn_id", "call_id")):
+        raise ValueError("attention receipt binding mismatch")
+    return True
+
+
+def enqueue_attention(
+    runtime: Runtime, probe: dict[str, Any], config: dict[str, Any], *, session_home: str = "",
+    sqlite_home: str = "", cwd: str = "", origin: str = "", transcript_path: str = "",
+) -> str:
+    if not config.get("attention_notifications", True) or probe.get("state") != "waiting":
+        return "disabled"
+    _attention_storage(runtime)
+    key = attention_key("codex", probe["thread_id"], probe["turn_id"], probe["call_id"])
+    now = unix_ms()
+    record = {"schema": 1, "kind": "attention", "key": key, "provider": "codex",
+              "thread_id": probe["thread_id"], "turn_id": probe["turn_id"], "call_id": probe["call_id"],
+              "tool_name": probe["tool_name"],
+              "transcript_path": str(Path(transcript_path or probe.get("transcript_path", "")).absolute()),
+              "session_codex_home": str(Path(session_home or runtime.codex_home).absolute()),
+              "session_sqlite_home": str(Path(sqlite_home or session_home or runtime.sqlite_home).absolute()),
+              "cwd": sanitize(cwd or probe.get("cwd", ""), 1200), "origin": sanitize(origin, 100),
+              "created_unix_ms": now, "next_attempt_unix_ms": now, "attempts": 0}
+    validate_attention_record(record, key)
+    with record_mutation_lock(runtime, key):
+        already_sent = _attention_receipt_exists(runtime, record)
+        target = runtime.attention_pending / f"{key}.json"
+        if target.exists():
+            previous = validate_attention_record(_attention_read_json(target), key)
+            if any(previous[name] != record[name] for name in ("provider", "thread_id", "turn_id", "call_id", "tool_name")):
+                raise ValueError("attention pending binding mismatch")
+            # Resume can move the authoritative rollout without changing the
+            # logical question or replacing durable retry counters.
+            refreshed = ("transcript_path", "session_codex_home", "session_sqlite_home", "cwd", "origin")
+            if any(previous[name] != record[name] for name in refreshed):
+                for name in refreshed:
+                    previous[name] = record[name]
+                atomic_write_json(target, previous)
+            return "sent" if already_sent else "pending"
+        atomic_write_json(target, record, no_overwrite=True)
+    return "sent" if already_sent else "queued"
+
+
+def attention_delivery_counts(runtime: Runtime) -> dict[str, int]:
+    counts = {"pending": 0, "waiting": 0}
+    try:
+        _attention_storage(runtime)
+    except (OSError, ValueError):
+        return {"pending": 1, "waiting": 0}
+    for index, path in enumerate(path for path in runtime.attention_pending.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}", path.stem)):
+        if index >= 4096:
+            counts["pending"] += 1
+            break
+        try:
+            with record_mutation_lock(runtime, path.stem):
+                if not path.exists():
+                    continue
+                record = validate_attention_record(_attention_read_json(path), path.stem)
+                counts["waiting" if _attention_receipt_exists(runtime, record) else "pending"] += 1
+        except (OSError, ValueError, TypeError, UnicodeError):
+            counts["pending"] += 1
+    return counts
+
+
+def process_attention_pending(
+    runtime: Runtime, config: dict[str, Any], now_ms: int, retry_base_seconds: float = 5.0,
+) -> int | None:
+    if not config.get("attention_notifications", True):
+        return None
+    try:
+        _attention_storage(runtime)
+        handle = runtime.attention_delivery_lock_path.open("a+b")
+    except (OSError, ValueError):
+        return now_ms + 30000
+    if not _try_lock(handle):
+        handle.close()
+        return now_ms + 1000
+    try:
+        return _process_attention_pending_locked(runtime, config, now_ms, retry_base_seconds)
+    finally:
+        _unlock(handle)
+        handle.close()
+
+
+def _process_attention_pending_locked(
+    runtime: Runtime, config: dict[str, Any], now_ms: int, retry_base_seconds: float,
+) -> int | None:
+    next_due: int | None = None
+    paths = list(itertools.islice((path for path in runtime.attention_pending.glob("*.json")
+                                  if re.fullmatch(r"[0-9a-f]{64}", path.stem)), 4097))
+    if len(paths) > 4096:
+        runtime.log("attention processing held: queue bound")
+        return now_ms + 30000
+    for path in paths:
+        try:
+            info = path.lstat()
+            backoff = runtime.attention_backoff.get(path.name)
+            if backoff is not None and backoff[:2] == (info.st_size, info.st_mtime_ns) and now_ms < backoff[2]:
+                continue
+            with record_mutation_lock(runtime, path.stem):
+                if not path.exists():
+                    continue
+                record = validate_attention_record(_attention_read_json(path), path.stem)
+                already_sent = _attention_receipt_exists(runtime, record)
+            due = record["next_attempt_unix_ms"]
+            if due > now_ms and not already_sent:
+                next_due = due if next_due is None else min(next_due, due)
+                continue
+            probe = codex_attention_state(record["transcript_path"], record["thread_id"], record)
+            if probe["state"] == "resolved":
+                with record_mutation_lock(runtime, record["key"]):
+                    if path.exists() and validate_attention_record(_attention_read_json(path), path.stem) == record:
+                        path.unlink()
+                runtime.attention_backoff.pop(path.name, None)
+                continue
+            classification = event_classification(runtime, {"source": probe.get("source")}, record["thread_id"],
+                                                  record["session_codex_home"], record["session_sqlite_home"])
+            if probe["state"] != "waiting" or classification != "root":
+                runtime.attention_backoff[path.name] = (info.st_size, info.st_mtime_ns, now_ms + 1000)
+                if not already_sent:
+                    next_due = now_ms + 1000 if next_due is None else min(next_due, now_ms + 1000)
+                continue
+            if already_sent:
+                runtime.attention_backoff[path.name] = (info.st_size, info.st_mtime_ns, now_ms + 1000)
+                continue
+            # Re-read question and queue authority immediately before HTTP.
+            final_probe = codex_attention_state(record["transcript_path"], record["thread_id"], record)
+            if final_probe["state"] != "waiting":
+                next_due = now_ms + 1000 if next_due is None else min(next_due, now_ms + 1000)
+                continue
+            with record_mutation_lock(runtime, record["key"]):
+                if not path.exists() or validate_attention_record(_attention_read_json(path), path.stem) != record or _attention_receipt_exists(runtime, record):
+                    continue
+            retry_after = None
+            try:
+                payload_record = {**record, "notification_kind": "attention", "sequence_id": "attention-" + record["key"][:32],
+                                  "event": {"cwd": record["cwd"], "last-assistant-message": ""}}
+                response = publish(runtime, payload_record, config)
+                receipt = {name: record[name] for name in ("key", "provider", "thread_id", "turn_id", "call_id")}
+                response_id = response.get("id", "")
+                response_id = response_id if isinstance(response_id, str) and len(response_id) <= 256 else ""
+                receipt.update(schema=1, kind="attention-sent", sent_at=utc_now().isoformat(), ntfy_id=response_id)
+                validate_attention_record(receipt, record["key"], sent=True)
+                with record_mutation_lock(runtime, record["key"]):
+                    if not _attention_receipt_exists(runtime, record):
+                        atomic_write_json(runtime.attention_sent / path.name, receipt, no_overwrite=True)
+                runtime.attention_backoff[path.name] = (info.st_size, info.st_mtime_ns, now_ms + 1000)
+                runtime.log(f"sent attention key={record['key'][:12]}")
+                continue
+            except urllib.error.HTTPError as exc:
+                if exc.headers and exc.headers.get("Retry-After"):
+                    with contextlib.suppress(ValueError):
+                        retry_after = float(exc.headers["Retry-After"])
+            except (urllib.error.URLError, TimeoutError, OSError, RuntimeError):
+                pass
+            updated = dict(record)
+            updated["attempts"] += 1
+            updated["next_attempt_unix_ms"] = unix_ms() + int(retry_delay(updated["attempts"], retry_base_seconds,
+                                                                        config["retry_max_seconds"], retry_after) * 1000)
+            with record_mutation_lock(runtime, record["key"]):
+                if path.exists():
+                    fresh = validate_attention_record(_attention_read_json(path), path.stem)
+                    if not _attention_receipt_exists(runtime, fresh):
+                        # Preserve a concurrently re-attested resume path/home.
+                        fresh["attempts"] = max(fresh["attempts"], updated["attempts"])
+                        fresh["next_attempt_unix_ms"] = max(fresh["next_attempt_unix_ms"], updated["next_attempt_unix_ms"])
+                        atomic_write_json(path, fresh)
+            next_due = updated["next_attempt_unix_ms"] if next_due is None else min(next_due, updated["next_attempt_unix_ms"])
+        except (OSError, ValueError, TypeError, UnicodeError):
+            with contextlib.suppress(OSError):
+                current = path.lstat()
+                runtime.attention_backoff[path.name] = (current.st_size, current.st_mtime_ns, now_ms + 30000)
+            next_due = now_ms + 30000 if next_due is None else min(next_due, now_ms + 30000)
+            runtime.log(f"attention held: invalid or unavailable metadata key={path.stem[:12]}")
+    return next_due
+
+
+def _attention_completion_probe(runtime: Runtime, record: dict[str, Any], config: dict[str, Any],
+                                expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not config.get("attention_notifications", True):
+        return _attention_empty("none")
+    path = find_rollout(runtime, str(record.get("thread_id", "")), str(record.get("session_codex_home", "")),
+                        str(record.get("session_sqlite_home", "")))
+    if path is None:
+        return _attention_empty("unknown", "transcript-not-found")
+    return codex_attention_state(path, str(record.get("thread_id", "")), expected)
+
+
+def _attention_completion_gate(runtime: Runtime, record: dict[str, Any], config: dict[str, Any]) -> str:
+    if not config.get("attention_notifications", True):
+        return ""
+    probe = _attention_completion_probe(runtime, record, config)
+    disposition = attention_completion_disposition(record, probe)
+    if disposition:
+        return disposition
+    if probe["state"] == "waiting" and probe["turn_id"] == record.get("turn_id"):
+        return "attention-question-pending"
+    # A previously attested same-turn question remains authority when its call
+    # has fallen outside the current bounded tail, even if a different turn's
+    # question is visible. Revalidate its exact identity, not raw projection.
+    try:
+        _attention_storage(runtime)
+        for index, path in enumerate(path for path in runtime.attention_pending.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}", path.stem)):
+            if index >= 4096:
+                break
+            try:
+                with record_mutation_lock(runtime, path.stem):
+                    pending = validate_attention_record(_attention_read_json(path), path.stem)
+            except (OSError, ValueError, TypeError, UnicodeError):
+                continue
+            record_home = str(record.get("session_codex_home") or runtime.codex_home)
+            record_sqlite = str(record.get("session_sqlite_home") or record_home or runtime.sqlite_home)
+            if (pending["thread_id"] == record.get("thread_id") and pending["turn_id"] == record.get("turn_id") and
+                    os.path.normcase(os.path.abspath(pending["session_codex_home"])) == os.path.normcase(os.path.abspath(record_home)) and
+                    os.path.normcase(os.path.abspath(pending["session_sqlite_home"])) == os.path.normcase(os.path.abspath(record_sqlite))):
+                tracked = _attention_completion_probe(runtime, record, config, pending)
+                disposition = attention_completion_disposition(record, tracked)
+                if disposition:
+                    return disposition
+                if tracked["state"] == "waiting":
+                    return "attention-question-pending"
+                if tracked["state"] == "unknown":
+                    return "attention-question-unverifiable"
+    except (OSError, ValueError, TypeError, UnicodeError):
+        # Unbound malformed state cannot suppress unrelated ordinary work.
+        return ""
+    return ""
+
+
+def _attention_can_revive(runtime: Runtime, record: dict[str, Any], receipt: Any) -> bool:
+    if not isinstance(receipt, dict) or type(receipt.get("schema")) is not int or receipt["schema"] != 1 or receipt.get("reason") != "attention-pause":
+        return False
+    if any(receipt.get(name) != record.get(name) for name in ("key", "thread_id", "turn_id")):
+        return False
+    turn = receipt.get("attention_question_turn_id")
+    call_id = receipt.get("attention_question_call_id")
+    if (receipt.get("attention_provider") != "codex" or _attention_uuid(turn) != record.get("turn_id") or
+            not _attention_identifier(call_id) or type(receipt.get("attention_session_epoch")) is not int or
+            receipt["attention_session_epoch"] != 0):
+        return False
+    record_home = str(record.get("session_codex_home") or runtime.codex_home)
+    record_sqlite = str(record.get("session_sqlite_home") or record_home or runtime.sqlite_home)
+    for name, actual in (("attention_session_codex_home", record_home),
+                         ("attention_session_sqlite_home", record_sqlite)):
+        bound = receipt.get(name)
+        if (not isinstance(bound, str) or not bound or
+                os.path.normcase(os.path.abspath(bound)) != os.path.normcase(os.path.abspath(actual))):
+            return False
+    config = load_config(runtime)
+    if not config.get("attention_notifications", True):
+        return False
+    probe = _attention_completion_probe(runtime, record, config, {"turn_id": turn, "call_id": call_id})
+    return probe["state"] == "resolved" and turn in probe.get("resumed_turns", [])
+
+
 def update_idle_probe(runtime: Runtime, record: dict[str, Any], include_message: bool) -> dict[str, Any]:
     previous = record.get("idle_probe") if isinstance(record.get("idle_probe"), dict) else {}
     thread_id = str(record.get("thread_id", ""))
@@ -1173,6 +1904,9 @@ def idle_gate(
     config: dict[str, Any],
     now_ms: int,
 ) -> tuple[bool, int, str]:
+    attention_reason = _attention_completion_gate(runtime, record, config)
+    if attention_reason:
+        return False, now_ms + 1000, attention_reason
     mode = str(config.get("idle_detection_mode", "strict")).lower()
     if mode not in ("strict", "balanced", "off"):
         mode = "strict"
@@ -1342,7 +2076,8 @@ def _enqueue_unlocked(runtime: Runtime, record: dict[str, Any]) -> str:
         return "sent"
     if suppressed_path.exists():
         receipt = read_json(suppressed_path)
-        if str(record.get("source_event", "")) == "Stop" and receipt.get("reason") in ("technical-turn", "unverifiable"):
+        if ((str(record.get("source_event", "")) == "Stop" and receipt.get("reason") in ("technical-turn", "unverifiable")) or
+                _attention_can_revive(runtime, record, receipt)):
             suppressed_path.unlink(missing_ok=True)
         else:
             runtime.log(f"deduplicated suppressed event key={record['key'][:12]}")
@@ -1405,6 +2140,14 @@ def _enqueue_pending_unlocked(runtime: Runtime, record: dict[str, Any]) -> str:
     is_stop = str(record.get("source_event", "")) == "Stop"
     for status, path in paths.items():
         if path.exists():
+            if status == "suppressed":
+                try:
+                    attention_receipt = read_json(path)
+                except (OSError, ValueError):
+                    attention_receipt = None
+                if _attention_can_revive(runtime, record, attention_receipt):
+                    path.unlink(missing_ok=True)
+                    continue
             if is_stop and status == "suppressed":
                 try:
                     receipt = read_json(path)
@@ -1495,18 +2238,33 @@ def _write_suppressed_receipt_unlocked(
                 runtime.log(f"kept Stop evidence during suppression key={record['key'][:12]}")
                 return
     receipt = runtime.suppressed / f"{record['key']}.json"
+    receipt_data = {
+        "schema": 1,
+        "key": record["key"],
+        "thread_id": record["thread_id"],
+        "turn_id": record["turn_id"],
+        "origin": record["origin"],
+        "suppressed_at": utc_now().isoformat(),
+        "reason": reason,
+    }
+    if reason == "attention-pause":
+        # This pure probe does not acquire an attention M lock while the
+        # caller owns the ordinary completion M. Unbound receipts never revive.
+        probe = _attention_completion_probe(runtime, record, load_config(runtime))
+        if (probe["state"] != "unknown" and probe["turn_id"] == record.get("turn_id") and
+                record.get("turn_id") in probe.get("paused_turns", []) and
+                _attention_identifier(probe["call_id"])):
+            record_home = str(record.get("session_codex_home") or runtime.codex_home)
+            receipt_data.update(
+                attention_provider="codex", attention_question_turn_id=probe["turn_id"],
+                attention_question_call_id=probe["call_id"], attention_session_epoch=0,
+                attention_session_codex_home=record_home,
+                attention_session_sqlite_home=str(record.get("session_sqlite_home") or record_home or runtime.sqlite_home),
+            )
     try:
         atomic_write_json(
             receipt,
-            {
-                "schema": 1,
-                "key": record["key"],
-                "thread_id": record["thread_id"],
-                "turn_id": record["turn_id"],
-                "origin": record["origin"],
-                "suppressed_at": utc_now().isoformat(),
-                "reason": reason,
-            },
+            receipt_data,
             no_overwrite=True,
         )
     except FileExistsError:
@@ -1562,6 +2320,9 @@ def reconcile_suppressed_pending(runtime: Runtime, path: Path, record: dict[str,
             return False
         receipt = read_json(receipt_path)
         current = validate_record(read_json(path), record["key"])
+        if _attention_can_revive(runtime, current, receipt):
+            receipt_path.unlink(missing_ok=True)
+            return False
         if str(current.get("source_event", "")) == "Stop" and receipt.get("reason") == "technical-turn":
             receipt_path.unlink(missing_ok=True)
             return False
@@ -1717,7 +2478,7 @@ def process_pending(runtime: Runtime, config: dict[str, Any], now_ms: int) -> in
         ready, probe_due, reason = idle_gate(runtime, record, config, now_ms)
         record["idle_reason"] = reason
         if not ready:
-            if reason in ("superseded", "unverifiable"):
+            if reason in ("superseded", "unverifiable", "attention-pause"):
                 write_suppressed_receipt(runtime, record, reason)
                 continue
             record["next_probe_unix_ms"] = probe_due
@@ -1738,7 +2499,7 @@ def process_pending(runtime: Runtime, config: dict[str, Any], now_ms: int) -> in
         ready, probe_due, reason = idle_gate(runtime, record, config, final_now_ms)
         record["idle_reason"] = reason
         if not ready:
-            if reason in ("superseded", "unverifiable"):
+            if reason in ("superseded", "unverifiable", "attention-pause"):
                 write_suppressed_receipt(runtime, record, reason)
                 continue
             record["next_probe_unix_ms"] = probe_due
@@ -1882,12 +2643,30 @@ def scan_rollout_file(
         # legacy cursors that predate snapshot metadata.
         if snapshot_unchanged or (not has_snapshot and offset == stat.st_size):
             return 0
+    attention_queued = 0
+    if config.get("attention_notifications", True) and (state or offset == 0 or force_replay):
+        # Admit questions only where existing cursor/replay policy admitted a
+        # changed or fresh rollout. Upgrades do not replay ancient asks.
+        attention_metadata = rollout_metadata(path)
+        attention_thread = obj_value(attention_metadata, "id", "thread_id", "threadId", default="")
+        if _attention_uuid(attention_thread):
+            attention = codex_attention_state(path, attention_thread)
+            if attention["state"] == "waiting" and event_classification(
+                    runtime, {"source": attention_metadata.get("source")}, attention_thread,
+                    str(runtime.codex_home), str(runtime.sqlite_home)) == "root":
+                if not scan_parent_is_alive(runtime, parent_pid, parent_token):
+                    return 0
+                status = enqueue_attention(runtime, attention, config, transcript_path=str(path),
+                                           session_home=str(runtime.codex_home), sqlite_home=str(runtime.sqlite_home),
+                                           cwd=str(attention_metadata.get("cwd", "")),
+                                           origin=str(attention_metadata.get("originator", "")) or platform.node())
+                attention_queued = int(status == "queued")
     try:
         with path.open("rb") as handle:
             handle.seek(offset)
             data = handle.read()
     except OSError:
-        return 0
+        return attention_queued
     newline = data.rfind(b"\n")
     if newline < 0:
         if not scan_parent_is_alive(runtime, parent_pid, parent_token):
@@ -1903,7 +2682,7 @@ def scan_rollout_file(
                 "observed_mtime_ns": stat.st_mtime_ns,
             },
         )
-        return 0
+        return attention_queued
     complete = data[: newline + 1]
     new_offset = offset + newline + 1
     metadata = rollout_metadata(path)
@@ -1914,7 +2693,7 @@ def scan_rollout_file(
     cwd = str(obj_value(metadata, "cwd", default=""))
     source = metadata.get("source")
     originator = str(obj_value(metadata, "originator", default=""))
-    queued = 0
+    queued = attention_queued
     completion_missing_identity = False
     line_end_offset = offset
     for raw_line in complete.splitlines(keepends=True):
@@ -2078,6 +2857,18 @@ def ntfy_payload(runtime: Runtime, record: dict[str, Any], config: dict[str, Any
             display_name = local_title
             has_distinct_thread_title = local_title.casefold() != project.casefold()
 
+    if record.get("notification_kind") == "attention":
+        payload = {"topic": config["topic"], "title": display_name, "message": "Reply needed",
+                   "sequence_id": record["sequence_id"], "tags": ["question"],
+                   "priority": config.get("attention_priority", 4)}
+        if config.get("include_task_link", False):
+            task_url = codex_task_url(record.get("thread_id", ""))
+            if task_url:
+                payload["click"] = task_url
+                if config.get("include_task_link_action", False):
+                    payload["actions"] = [{"action": "view", "label": "Open task", "url": task_url, "clear": True}]
+        return payload
+
     metadata: list[str] = []
     if config["include_full_path"] and cwd:
         metadata.append(sanitize(cwd, 120))
@@ -2230,6 +3021,20 @@ def clear_synthetic_test_state(runtime: Runtime) -> int:
             except (OSError, json.JSONDecodeError):
                 # Never infer test state from a filename or free-form message.
                 continue
+    with contextlib.suppress(OSError, ValueError):
+        _attention_storage(runtime)
+        for directory in (runtime.attention_pending, runtime.attention_sent):
+            for path in directory.glob("*.json"):
+                if not re.fullmatch(r"[0-9a-f]{64}", path.stem):
+                    continue
+                try:
+                    with record_mutation_lock(runtime, path.stem):
+                        value = validate_attention_record(_attention_read_json(path), path.stem, sent=directory == runtime.attention_sent)
+                        if value["thread_id"] == SYNTHETIC_TEST_THREAD_ID:
+                            path.unlink()
+                            removed += 1
+                except (OSError, ValueError, TypeError, UnicodeError):
+                    continue
     return removed
 
 
@@ -2534,6 +3339,10 @@ def worker(
                 next_due = process_pending(runtime, config, now)
             else:
                 next_due = None
+            if delivery_only or not continuous:
+                attention_due = process_attention_pending(runtime, config, now, retry_base_seconds)
+                if attention_due is not None:
+                    next_due = attention_due if next_due is None else min(next_due, attention_due)
             outbox_paths = (
                 sorted(runtime.outbox.glob("*.json"), key=lambda item: (item.stat().st_mtime_ns, item.name))
                 if delivery_only or not continuous
@@ -2555,7 +3364,8 @@ def worker(
                     continue
                 if suppressed_receipt.exists():
                     receipt_data = read_json(suppressed_receipt)
-                    if str(record.get("source_event", "")) == "Stop" and receipt_data.get("reason") in ("technical-turn", "unverifiable"):
+                    if ((str(record.get("source_event", "")) == "Stop" and receipt_data.get("reason") in ("technical-turn", "unverifiable")) or
+                            _attention_can_revive(runtime, record, receipt_data)):
                         suppressed_receipt.unlink(missing_ok=True)
                     else:
                         path.unlink(missing_ok=True)
@@ -2587,6 +3397,13 @@ def worker(
                             continue
                 retry_after: float | None = None
                 try:
+                    attention_reason = _attention_completion_gate(runtime, record, config)
+                    if attention_reason == "attention-pause":
+                        write_suppressed_receipt(runtime, record, attention_reason)
+                        continue
+                    if attention_reason:
+                        next_due = now + 1000 if next_due is None else min(next_due, now + 1000)
+                        continue
                     response = publish(runtime, record, config)
                     atomic_write_json(
                         receipt,
@@ -2630,6 +3447,8 @@ def worker(
                 next_due = record["next_attempt_unix_ms"] if next_due is None else min(next_due, record["next_attempt_unix_ms"])
 
             remaining = sum(1 for _ in runtime.pending.glob("*.json")) + sum(1 for _ in runtime.outbox.glob("*.json"))
+            if config.get("attention_notifications", True):
+                remaining += attention_delivery_counts(runtime)["pending"]
             if not continuous and remaining == 0:
                 return 0
             sleep_for = max(0.1, poll_seconds)
@@ -2697,6 +3516,7 @@ def doctor(runtime: Runtime) -> int:
         value = read_json(runtime.scan_health_path)
         if isinstance(value, dict):
             scan_health = value
+    attention_counts = attention_delivery_counts(runtime)
     print(
         json.dumps(
             {
@@ -2721,6 +3541,11 @@ def doctor(runtime: Runtime) -> int:
                 "oldest_pending_seconds": oldest_pending_seconds,
                 "pending_reasons": pending_reasons,
                 "queued": len(outbox_files),
+                "attention_pending": attention_counts["pending"],
+                "attention_waiting": attention_counts["waiting"],
+                "attention_sent": sum(1 for _ in runtime.attention_sent.glob("*.json")),
+                "attention_notifications": config.get("attention_notifications", True),
+                "attention_priority": config.get("attention_priority", 4),
                 "oldest_queued_seconds": oldest_queued_seconds,
                 "watch_scan_status": str(scan_health.get("status", "unknown")),
                 "watch_scan_started_at": str(scan_health.get("started_at", "")),

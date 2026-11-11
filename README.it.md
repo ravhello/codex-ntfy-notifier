@@ -8,7 +8,7 @@
 
 [English](README.md) · [Architettura](docs/architecture.md) · [Privacy e sicurezza](docs/security-and-privacy.md) · [Supporto](SUPPORT.md) · [Alternative](docs/alternatives.md)
 
-Notifiche push ntfy compatte e deduplicate quando una task root locale di OpenAI Codex è verificabilmente inattiva, non a ogni risultato intermedio. Supporta anche Claude Code su Windows, inclusa la scheda Code di Claude Desktop, tramite hook lifecycle nativi opzionali.
+Notifiche push ntfy compatte e deduplicate quando una task root locale di OpenAI Codex è verificabilmente inattiva, con un avviso distinto quando una vera domanda richiede risposta, non a ogni normale risultato intermedio. Supporta anche Claude Code su Windows, inclusa la scheda Code di Claude Desktop, tramite hook lifecycle nativi opzionali.
 
 ![Codex ntfy Notifier aspetta l'idle verificabile localmente prima di inviare una sola notifica di completamento compatta](docs/assets/hero.svg)
 
@@ -47,7 +47,7 @@ Per collegare anche Claude Code su Windows (scheda Code di Claude Desktop, CLI e
 .\install.ps1 -WslDistro Ubuntu -EnableClaudeCode
 ```
 
-L'installer unisce atomicamente in `~/.claude/settings.json` `Stop`/`StopFailure` e `UserPromptSubmit` ordinati e sincroni, più gli acceleratori `Notification` asincroni opzionali (`idle_prompt` e `agent_completed`). Conserva gli altri hook Claude e include l'originale nel backup Codex. Serve Claude Code 2.1.198 o successivo per l'intero set lifecycle gestito. L'installer controlla separatamente l'eseguibile più recente trovato per ogni superficie rilevata—`PATH`, Claude Desktop, VS Code, VS Code Insiders e Cursor—e si interrompe se una superficie rilevata è più vecchia di quel minimo.
+L'installer unisce atomicamente in `~/.claude/settings.json` `Stop`/`StopFailure` e `UserPromptSubmit` ordinati e sincroni, più gli acceleratori asincroni per domande/notifiche (`PreToolUse` / `AskUserQuestion`; `Notification` / `idle_prompt`, `agent_completed`, `permission_prompt`). Conserva gli altri hook Claude e include l'originale nel backup Codex. Serve Claude Code 2.1.198 o successivo per l'intero set lifecycle gestito. L'installer controlla separatamente l'eseguibile più recente trovato per ogni superficie rilevata—`PATH`, Claude Desktop, VS Code, VS Code Insiders e Cursor—e si interrompe se una superficie rilevata è più vecchia di quel minimo.
 
 ### 1b. Installazione su Linux nativo
 
@@ -64,7 +64,7 @@ unset CODEX_NTFY_TOPIC
 
 In ogni ambiente Codex installato, eseguire `/hooks`, controllare il comando `Stop` gestito e approvarlo. L'installer non modifica mai il trust store di Codex.
 
-In Claude Code `/hooks` è un visualizzatore in sola lettura: verificare quattro tipi di evento gestiti e cinque handler (`Notification` ha handler separati per `idle_prompt` e `agent_completed`). Claude normalmente ricarica automaticamente `settings.json`.
+In Claude Code `/hooks` è un visualizzatore in sola lettura: verificare cinque tipi di evento gestiti e sette handler (`PreToolUse` corrisponde ad `AskUserQuestion`; `Notification` ha handler separati per `idle_prompt`, `agent_completed` e `permission_prompt`). Claude normalmente ricarica automaticamente `settings.json`.
 
 ### 3. Esecuzione del doctor
 
@@ -211,6 +211,19 @@ Ogni host reale mantiene `pending/`, cursori dei rollout, outbox e worker propri
 ## Configurazione
 
 La configurazione privata è `~/.codex/ntfy-config.json`; vedere [ntfy-config.example.json](ntfy-config.example.json).
+
+### Domande che richiedono attenzione
+
+La versione 2.6 aggiunge un avviso distinto per le domande Codex sulle piattaforme supportate e Claude Code su Windows. Conserva il nome attuale della chat, secondo le preferenze di privacy, con un solo tag `question` e il breve corpo `Reply needed`. Il nuovo percorso non salva né inoltra il testo di domande o risposte. Permessi generici, output dei tool e domande dei sottoagenti non generano questo avviso.
+
+| Impostazione | Default | Significato |
+| --- | ---: | --- |
+| `attention_notifications` | `true` | Avvisa quando una domanda root corrente e verificata richiede risposta. |
+| `attention_priority` | `4` | Priorità ntfy distinta per le domande; non cambia quella di completamenti o errori. |
+
+La stessa domanda logica resta deduplicata dopo ripresa e retry; una nuova domanda può avvisare di nuovo. La mancata risposta viene ricontrollata prima di ogni invio. La pausa per una domanda non è un completamento: un turno successivo può inviare normalmente la notifica finale. Le ricevute sono separate dalla retention dei completamenti. Il trasporto resta durevole at-least-once, senza promessa exactly-once sul telefono.
+
+Su Android le priorità usano le impostazioni dei canali di notifica: un suono personalizzato va scelto nelle impostazioni ntfy/OS del telefono. Icona e priorità non garantiscono un suono specifico né aggirano le restrizioni del telefono. Vedere [priorità ntfy](https://docs.ntfy.sh/subscribe/phone/#message-priority).
 
 ### Rilevamento idle
 

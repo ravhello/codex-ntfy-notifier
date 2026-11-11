@@ -32,7 +32,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ScriptVersion = '2.5.7'
+$ScriptVersion = '2.6.0'
 $MaxNtfyMessageBytes = 3500
 $SyntheticTestThreadId = '00000000-0000-4000-8000-000000000001'
 $ChatGptTaskUrlPrefix = 'https://chatgpt.com/codex/tasks/'
@@ -61,6 +61,9 @@ $SuppressedDir = Join-Path $StateRoot 'suppressed'
 $DeadDir = Join-Path $StateRoot 'dead'
 $MutationLocksDir = Join-Path $StateRoot 'mutation-locks'
 $ClaudeSessionsDir = Join-Path $StateRoot 'claude-sessions'
+$AttentionPendingDir = Join-Path $StateRoot 'attention-pending'
+$AttentionSentDir = Join-Path $StateRoot 'attention-sent'
+$AttentionDeliveryLockPath = Join-Path $StateRoot 'attention-delivery.lock'
 $WorkerLockPath = Join-Path $StateRoot 'worker.lock'
 $DeliveryLockPath = Join-Path $StateRoot 'delivery.lock'
 $WorkerHealthPath = Join-Path $StateRoot 'worker-health.json'
@@ -74,12 +77,13 @@ $LogPath = Join-Path $StateRoot 'notify.log'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Utf8StrictNoBom = New-Object System.Text.UTF8Encoding($false, $true)
 $script:ClaudeGoalStateCache = @{}
+$script:AttentionProbeCache = @{}
 $ClaudePromptBaselineMaxBytes = [int64](1024 * 1024)
 $ClaudeGoalMaxLineBytes = 1024 * 1024
 $MaxFallbackRolloutLineBytes = 8 * 1024 * 1024
 
 function Ensure-RuntimeDirectories {
-  foreach ($path in @($StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir, $DeadDir, $MutationLocksDir, $ClaudeSessionsDir)) {
+  foreach ($path in @($StateRoot, $PendingDir, $OutboxDir, $WatchDir, $SentDir, $SuppressedDir, $DeadDir, $MutationLocksDir, $ClaudeSessionsDir, $AttentionPendingDir, $AttentionSentDir)) {
     if (-not (Test-Path -LiteralPath $path)) {
       New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
@@ -355,6 +359,8 @@ function Get-Config {
     timeoutSeconds = [int](Get-ObjectValue $fileConfig 'timeout_seconds' 12)
     maxAttempts = [int](Get-ObjectValue $fileConfig 'max_attempts' 0)
     retryMaxSeconds = [double](Get-ObjectValue $fileConfig 'retry_max_seconds' 900)
+    attentionNotifications = [bool](Get-ObjectValue $fileConfig 'attention_notifications' $true)
+    attentionPriority = [int][Math]::Min(5, [Math]::Max(1, [int](Get-ObjectValue $fileConfig 'attention_priority' 4)))
     sentRetentionDays = [int](Get-ObjectValue $fileConfig 'sent_retention_days' 14)
     deadRetentionDays = [int](Get-ObjectValue $fileConfig 'dead_retention_days' 30)
   }
@@ -968,12 +974,15 @@ function Remove-TechnicalSuppressionForStopCore {
     [string]$Path,
     [object]$Record
   )
-  if (-not (Test-IsStopEvidence -Record $Record) -or -not (Test-Path -LiteralPath $Path)) {
+  if (-not (Test-Path -LiteralPath $Path)) {
     return $false
   }
   try {
     $receipt = Read-JsonFile -Path $Path
-    if ([string](Get-ObjectValue $receipt 'reason' '') -notin @('technical-turn', 'unverifiable')) { return $false }
+    $reason = [string](Get-ObjectValue $receipt 'reason' '')
+    if ($reason -eq 'attention-pause') {
+      if (-not (Test-AttentionResumeEvidenceCore -Record $Record -Receipt $receipt)) { return $false }
+    } elseif ($reason -notin @('technical-turn', 'unverifiable') -or -not (Test-IsStopEvidence -Record $Record)) { return $false }
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $Path) { return $false }
     Write-RuntimeLog "revived provisional suppression with Stop evidence key=$($Record.key.Substring(0, 12))"
@@ -1309,6 +1318,1017 @@ function Set-ClaudeSessionIdle {
     Write-RuntimeLog "ignored stale Claude idle notification session=$($SessionId.Substring(0, [Math]::Min(8, $SessionId.Length)))"
   }
   return [bool]$updated
+}
+
+function Test-AttentionOpaqueId {
+  param([object]$Value)
+  return $Value -is [string] -and $Value.Length -gt 0 -and $Value.Length -le 256 -and
+    $Value -notmatch '[\x00-\x20\x7f]'
+}
+
+function Get-AttentionValue {
+  param([object]$Object, [string]$Name, [object]$Default = $null)
+  if ($null -eq $Object) { return ,$Default }
+  $property = $Object.PSObject.Properties[$Name]
+  if ($null -eq $property) { return ,$Default }
+  # Preserve empty/singleton JSON arrays across PowerShell's output pipeline.
+  return ,$property.Value
+}
+
+function Get-AttentionByteHash {
+  param([byte[]]$Bytes)
+  $hash = [Security.Cryptography.SHA256]::Create()
+  try { return ([BitConverter]::ToString($hash.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
+  finally { $hash.Dispose() }
+}
+
+function Test-AttentionGuid {
+  param([object]$Value)
+  $parsed = [Guid]::Empty
+  return $Value -is [string] -and [Guid]::TryParseExact($Value, 'D', [ref]$parsed)
+}
+
+function New-AttentionProbeResult {
+  param([string]$State = 'unknown', [string]$ThreadId = '', [string]$TurnId = '',
+    [string]$CallId = '', [string]$ToolName = '', [int]$QuestionCount = 0,
+    [int]$PendingCount = 0, [string[]]$PausedTurns = @(), [string[]]$ResumedTurns = @())
+  return [pscustomobject][ordered]@{
+    state = $State; thread_id = $ThreadId; turn_id = $TurnId; call_id = $CallId
+    tool_name = $ToolName; question_count = $QuestionCount; pending_count = $PendingCount
+    paused_turns = @($PausedTurns | Where-Object { $null -ne $_ })
+    resumed_turns = @($ResumedTurns | Where-Object { $null -ne $_ })
+  }
+}
+
+function Initialize-AttentionFrameFilter {
+  if ($null -ne ([System.Management.Automation.PSTypeName]'CodexNtfyAttentionFrameFilter').Type) { return $true }
+  $availability = Get-Variable -Name AttentionFrameFilterAvailable -Scope Script -ErrorAction SilentlyContinue
+  if ($null -ne $availability -and -not [bool]$availability.Value) { return $false }
+  try {
+    Add-Type -ReferencedAssemblies 'System.Web.Extensions' -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Text;
+using System.Web.Script.Serialization;
+
+public sealed class CodexNtfyAttentionFrame {
+    public int Order;
+    public bool Invalid;
+    public string Raw;
+}
+
+public sealed class CodexNtfyAttentionFrames {
+    public bool Overflow;
+    public CodexNtfyAttentionFrame[] Frames;
+}
+
+public static class CodexNtfyAttentionFrameFilter {
+    private static bool TryValue(Dictionary<string, object> value, string name, out object found) {
+        if (value.TryGetValue(name, out found)) return true;
+        foreach (KeyValuePair<string, object> item in value) {
+            if (String.Equals(item.Key, name, StringComparison.OrdinalIgnoreCase)) { found = item.Value; return true; }
+        }
+        found = null;
+        return false;
+    }
+
+    private static string StringValue(Dictionary<string, object> value, string name) {
+        object found;
+        return TryValue(value, name, out found) ? found as string : null;
+    }
+
+    private static bool Same(string left, string right) {
+        return String.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool UniquePropertyNames(object value) {
+        Dictionary<string, object> map = value as Dictionary<string, object>;
+        if (map != null) {
+            HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, object> item in map) {
+                if (!names.Add(item.Key) || !UniquePropertyNames(item.Value)) return false;
+            }
+        } else {
+            object[] array = value as object[];
+            if (array != null) foreach (object item in array) if (!UniquePropertyNames(item)) return false;
+        }
+        return true;
+    }
+
+    private static bool Keep(Dictionary<string, object> root, string provider, HashSet<string> questionCalls) {
+        string type = StringValue(root, "type");
+        if (Same(provider, "claude")) {
+            return Same(type, "user") || Same(type, "assistant") || Same(type, "system") ||
+                Same(type, "attachment") || Same(type, "last-prompt");
+        }
+        // Preserve all existing typed-envelope failures for the PS authority
+        // parser; a syntactically valid but malformed payload cannot disappear.
+        if (String.IsNullOrWhiteSpace(type)) return true;
+        if (!Same(type, "session_meta") && !Same(type, "turn_context") &&
+            !Same(type, "event_msg") && !Same(type, "response_item")) return false;
+        object payloadValue;
+        Dictionary<string, object> payload = TryValue(root, "payload", out payloadValue)
+            ? payloadValue as Dictionary<string, object> : null;
+        if (payload == null) return true;
+        if (Same(type, "turn_context")) return true;
+        string kind = StringValue(payload, "type");
+        if (Same(type, "event_msg")) {
+            return Same(kind, "task_started") || Same(kind, "task_complete") ||
+                Same(kind, "turn_aborted") || Same(kind, "user_message");
+        }
+        if (!Same(type, "response_item")) return false;
+        if (Same(kind, "function_call")) {
+            string name = StringValue(payload, "name");
+            if (name != "request_user_input_async" && name != "functions.request_user_input_async" &&
+                name != "request_user_input" && name != "functions.request_user_input") return false;
+            object namespaceValue;
+            if (TryValue(payload, "namespace", out namespaceValue) && namespaceValue != null &&
+                (!(namespaceValue is string) || ((string)namespaceValue != "" && (string)namespaceValue != "functions"))) return false;
+            string call = StringValue(payload, "call_id");
+            if (call != null) questionCalls.Add(call);
+            return true;
+        }
+        if (Same(kind, "function_call_output")) {
+            string call = StringValue(payload, "call_id");
+            return call != null && questionCalls.Contains(call);
+        }
+        return Same(kind, "message") && String.Equals(StringValue(payload, "role"), "user", StringComparison.Ordinal);
+    }
+
+    public static CodexNtfyAttentionFrames Filter(string text, string provider, int maxBytes, int maxFrames) {
+        CodexNtfyAttentionFrames result = new CodexNtfyAttentionFrames();
+        List<CodexNtfyAttentionFrame> frames = new List<CodexNtfyAttentionFrame>();
+        HashSet<string> questionCalls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        JavaScriptSerializer serializer = new JavaScriptSerializer();
+        serializer.MaxJsonLength = maxBytes;
+        serializer.RecursionLimit = 1024;
+        int position = 0;
+        int order = 0;
+        while (position < text.Length) {
+            int end = text.IndexOf('\n', position);
+            if (end < 0) end = text.Length;
+            string line = text.Substring(position, end - position);
+            position = end + 1;
+            if (String.IsNullOrWhiteSpace(line)) continue;
+            if (order >= maxFrames) { result.Overflow = true; break; }
+            bool invalid = false;
+            Dictionary<string, object> root = null;
+            try {
+                if (Encoding.UTF8.GetByteCount(line) > maxBytes) invalid = true;
+                else {
+                    root = serializer.DeserializeObject(line) as Dictionary<string, object>;
+                    invalid = root == null || !UniquePropertyNames(root);
+                }
+            } catch { invalid = true; }
+            if (invalid || Keep(root, provider, questionCalls)) {
+                frames.Add(new CodexNtfyAttentionFrame { Order = order, Invalid = invalid, Raw = invalid ? null : line });
+            }
+            order++;
+        }
+        result.Frames = frames.ToArray();
+        return result;
+    }
+}
+'@ | Out-Null
+    $script:AttentionFrameFilterAvailable = $true
+    return $true
+  } catch {
+    # PowerShell Core hosts without the inbox Framework assembly retain the
+    # existing, slower parser. Availability never changes attention authority.
+    $script:AttentionFrameFilterAvailable = $false
+    return $false
+  }
+}
+
+function Read-AttentionSnapshot {
+  param([string]$TranscriptPath, [int]$MaxBytes = 16777216, [ValidateSet('codex','claude')][string]$Provider = 'codex')
+  $unknown = [pscustomobject]@{ ok = $false; frames = @(); head = $null; complete = $false; size = [int64]0; write_ticks = [int64]0 }
+  if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or $MaxBytes -lt 1024 -or $MaxBytes -gt 16777216) { return $unknown }
+  $stream = $null
+  try {
+    $path = [IO.Path]::GetFullPath($TranscriptPath)
+    $before = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ($before.PSIsContainer -or ($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $before.Length -le 0 -or
+        [IO.Path]::GetExtension($path) -ine '.jsonl') { return $unknown }
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    $size = [int64]$stream.Length
+    $headBytes = New-Object byte[] ([int][Math]::Min($size, 1048576))
+    $headCount = $stream.Read($headBytes, 0, $headBytes.Length)
+    $headEnd = [Array]::IndexOf($headBytes, [byte]10, 0, $headCount)
+    if ($headEnd -lt 0) { return $unknown }
+    $strict = [Text.UTF8Encoding]::new($false, $true)
+    $headText = $strict.GetString($headBytes, 0, $headEnd).TrimStart([char]0xfeff).TrimEnd([char]13)
+    $head = $headText | ConvertFrom-Json -ErrorAction Stop
+    $start = [Math]::Max([int64]0, $size - $MaxBytes)
+    [void]$stream.Seek($start, [IO.SeekOrigin]::Begin)
+    $bytes = New-Object byte[] ([int]($size - $start))
+    $read = 0
+    while ($read -lt $bytes.Length) {
+      $count = $stream.Read($bytes, $read, $bytes.Length - $read)
+      if ($count -le 0) { return $unknown }
+      $read += $count
+    }
+    if ($bytes.Length -eq 0 -or $bytes[$bytes.Length - 1] -ne 10) { return $unknown }
+    $skip = if ($start -gt 0) { [Array]::IndexOf($bytes, [byte]10) + 1 } else { 0 }
+    if ($start -gt 0 -and $skip -le 0) { return $unknown }
+    $text = $strict.GetString($bytes, $skip, $bytes.Length - $skip).TrimStart([char]0xfeff)
+    $frames = New-Object 'Collections.Generic.List[object]'
+    $native = $null
+    if (Initialize-AttentionFrameFilter) {
+      try { $native = [CodexNtfyAttentionFrameFilter]::Filter($text, $Provider, $MaxBytes, 65536) } catch { $native = $null }
+    }
+    if ($null -ne $native) {
+      if ($native.Overflow) { return $unknown }
+      foreach ($nativeFrame in @($native.Frames)) {
+        $value = $null; $invalidLine = [bool]$nativeFrame.Invalid
+        if (-not $invalidLine) {
+          try { $value = $nativeFrame.Raw.TrimEnd([char]13) | ConvertFrom-Json -ErrorAction Stop } catch { $invalidLine = $true }
+          if ($null -eq $value -or $value -isnot [Management.Automation.PSCustomObject]) { $invalidLine = $true }
+        }
+        $frames.Add([pscustomobject]@{ value = $value; order = [int]$nativeFrame.Order; invalid = $invalidLine; hash = $(if ($invalidLine) { '' } else { Get-Sha256Hex $nativeFrame.Raw }) })
+      }
+    } else {
+      $order = 0
+      foreach ($line in @($text -split "`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($frames.Count -ge 65536) { return $unknown }
+        $value = $null; $invalidLine = $strict.GetByteCount($line) -gt $MaxBytes
+        if (-not $invalidLine) {
+          try { $value = $line.TrimEnd([char]13) | ConvertFrom-Json -ErrorAction Stop } catch { $invalidLine = $true }
+          if ($null -eq $value -or $value -isnot [Management.Automation.PSCustomObject]) { $invalidLine = $true }
+        }
+        $frames.Add([pscustomobject]@{ value = $value; order = $order; invalid = $invalidLine; hash = $(if ($invalidLine) { '' } else { Get-Sha256Hex $line }) })
+        $order++
+      }
+    }
+    $after = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ($after.PSIsContainer -or ($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        $before.Length -ne $after.Length -or $before.LastWriteTimeUtc.Ticks -ne $after.LastWriteTimeUtc.Ticks -or $stream.Length -ne $size) { return $unknown }
+    $headDigestBytes = New-Object byte[] $headEnd; [Array]::Copy($headBytes, 0, $headDigestBytes, 0, $headEnd)
+    $endBytes = New-Object byte[] ([int][Math]::Min(64, $size)); [Array]::Copy($bytes, $bytes.Length - $endBytes.Length, $endBytes, 0, $endBytes.Length)
+    return [pscustomobject]@{ ok = $true; frames = @($frames.ToArray()); head = $head; complete = ($start -eq 0); size = $size; write_ticks = $after.LastWriteTimeUtc.Ticks; creation_ticks = $after.CreationTimeUtc.Ticks; head_digest = Get-AttentionByteHash $headDigestBytes; end_digest = Get-AttentionByteHash $endBytes }
+  } catch { return $unknown } finally { if ($null -ne $stream) { $stream.Dispose() } }
+}
+
+function Get-AttentionProbeCache {
+  param([string]$Provider, [string]$TranscriptPath, [string]$ThreadId, [string]$ExpectedTurnId, [string]$ExpectedCallId, [int]$MaxBytes)
+  if ($null -eq (Get-Variable -Name AttentionProbeCache -Scope Script -ErrorAction SilentlyContinue)) { $script:AttentionProbeCache = @{} }
+  try {
+    $path = [IO.Path]::GetFullPath($TranscriptPath)
+    $file = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    $key = "$Provider|$($path.ToLowerInvariant())|$ThreadId|$ExpectedTurnId|$ExpectedCallId|$MaxBytes"
+    $cached = if ($script:AttentionProbeCache.ContainsKey($key)) { $script:AttentionProbeCache[$key] } else { $null }
+    if ($null -ne $cached -and -not $file.PSIsContainer -and -not ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      if ($file.Length -eq $cached.size -and $file.LastWriteTimeUtc.Ticks -eq $cached.write_ticks) { return $cached.result }
+      if ($Provider -eq 'codex' -and $cached.result.state -ne 'unknown') {
+        $append = Get-CodexAttentionSafeAppend -Path $path -File $file -Cached $cached
+        if ($null -ne $append) {
+          $copy = [pscustomobject]@{}
+          foreach ($property in $cached.result.PSObject.Properties) { $copy | Add-Member -NotePropertyName $property.Name -NotePropertyValue $property.Value }
+          return Save-AttentionProbeCache $Provider $TranscriptPath $ThreadId $ExpectedTurnId $ExpectedCallId $MaxBytes $append $copy
+        }
+      }
+    }
+  } catch { }
+  return $null
+}
+
+function Save-AttentionProbeCache {
+  param([string]$Provider, [string]$TranscriptPath, [string]$ThreadId, [string]$ExpectedTurnId, [string]$ExpectedCallId, [int]$MaxBytes, [object]$Snapshot, [object]$Result)
+  $Result | Add-Member -NotePropertyName snapshot_size -NotePropertyValue ([int64]$Snapshot.size) -Force
+  $Result | Add-Member -NotePropertyName snapshot_write_ticks -NotePropertyValue ([int64]$Snapshot.write_ticks) -Force
+  $Result | Add-Member -NotePropertyName snapshot_mtime_ns -NotePropertyValue ([int64](($Snapshot.write_ticks - 621355968000000000) * 100)) -Force
+  if ($script:AttentionProbeCache.Count -ge 64) { $script:AttentionProbeCache.Clear() }
+  $path = [IO.Path]::GetFullPath($TranscriptPath)
+  $key = "$Provider|$($path.ToLowerInvariant())|$ThreadId|$ExpectedTurnId|$ExpectedCallId|$MaxBytes"
+  # Cache only normalized identity/disposition, never raw question or answer text.
+  $script:AttentionProbeCache[$key] = [pscustomobject]@{ size = $Snapshot.size; write_ticks = $Snapshot.write_ticks; creation_ticks = $Snapshot.creation_ticks; head_digest = $Snapshot.head_digest; end_digest = $Snapshot.end_digest; result = $Result }
+  return $Result
+}
+
+function Get-CodexAttentionSafeAppend {
+  param([string]$Path, [object]$File, [object]$Cached)
+  $delta = [int64]$File.Length - [int64]$Cached.size
+  if ($delta -le 0 -or $delta -gt 262144 -or $File.CreationTimeUtc.Ticks -ne $Cached.creation_ticks) { return $null }
+  $stream = $null
+  try {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    if ($stream.Length -ne $File.Length) { return $null }
+    $head = New-Object byte[] ([int][Math]::Min($stream.Length, 1048576))
+    $count = $stream.Read($head, 0, $head.Length); $end = [Array]::IndexOf($head, [byte]10, 0, $count)
+    if ($end -lt 0) { return $null }
+    $headValue = New-Object byte[] $end; [Array]::Copy($head, 0, $headValue, 0, $end)
+    if ((Get-AttentionByteHash $headValue) -cne $Cached.head_digest) { return $null }
+    $boundary = New-Object byte[] ([int][Math]::Min(64, $Cached.size))
+    [void]$stream.Seek($Cached.size - $boundary.Length, [IO.SeekOrigin]::Begin)
+    if ($stream.Read($boundary, 0, $boundary.Length) -ne $boundary.Length -or (Get-AttentionByteHash $boundary) -cne $Cached.end_digest) { return $null }
+    [void]$stream.Seek($Cached.size, [IO.SeekOrigin]::Begin)
+    $bytes = New-Object byte[] ([int]$delta); $offset = 0
+    while ($offset -lt $bytes.Length) { $read = $stream.Read($bytes, $offset, $bytes.Length - $offset); if ($read -le 0) { return $null }; $offset += $read }
+    if ($bytes[$bytes.Length - 1] -ne 10) { return $null }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    foreach ($line in @($text -split "`n")) {
+      if ([string]::IsNullOrWhiteSpace($line)) { continue }
+      $entry = $line | ConvertFrom-Json -ErrorAction Stop
+      if ($entry -isnot [Management.Automation.PSCustomObject]) { return $null }
+      $payload = Get-ObjectValue $entry 'payload'; $kind = [string](Get-ObjectValue $payload 'type' '')
+      $type = [string](Get-ObjectValue $entry 'type' '')
+      $irrelevant = ($type -eq 'response_item' -and ($kind -eq 'reasoning' -or ($kind -eq 'message' -and [string](Get-ObjectValue $payload 'role' '') -ceq 'assistant'))) -or
+        ($type -eq 'event_msg' -and $kind -in @('agent_message','agent_reasoning','token_count','turn_diff','context_compacted'))
+      if (-not $irrelevant) { return $null }
+    }
+    $tail = New-Object byte[] ([int][Math]::Min(64, $File.Length)); [void]$stream.Seek(-$tail.Length, [IO.SeekOrigin]::End)
+    if ($stream.Read($tail, 0, $tail.Length) -ne $tail.Length) { return $null }
+    $after = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($stream.Length -ne $File.Length -or $after.Length -ne $File.Length -or $after.LastWriteTimeUtc.Ticks -ne $File.LastWriteTimeUtc.Ticks -or ($after.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+    return [pscustomobject]@{ size = $File.Length; write_ticks = $File.LastWriteTimeUtc.Ticks; creation_ticks = $File.CreationTimeUtc.Ticks; head_digest = $Cached.head_digest; end_digest = Get-AttentionByteHash $tail }
+  } catch { return $null } finally { if ($null -ne $stream) { $stream.Dispose() } }
+}
+
+function Get-ClaudeAttentionState {
+  param([string]$TranscriptPath, [string]$ThreadId, [string]$ExpectedTurnId = '', [string]$ExpectedCallId = '', [int]$MaxBytes = 16777216)
+  $unknown = New-AttentionProbeResult -ThreadId $ThreadId
+  if (-not (Test-AttentionGuid $ThreadId)) { return $unknown }
+  $cached = Get-AttentionProbeCache -Provider claude -TranscriptPath $TranscriptPath -ThreadId $ThreadId -ExpectedTurnId $ExpectedTurnId -ExpectedCallId $ExpectedCallId -MaxBytes $MaxBytes
+  if ($null -ne $cached) { return $cached }
+  try {
+    if ([IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFullPath($TranscriptPath)) -ine $ThreadId) { return $unknown }
+    $snapshot = Read-AttentionSnapshot -TranscriptPath $TranscriptPath -MaxBytes $MaxBytes -Provider claude
+    if (-not $snapshot.ok) { return $unknown }
+    $nodes = @{}; $leaf = ''; $invalid = $false
+    foreach ($frame in $snapshot.frames) {
+      if ($frame.invalid) { return $unknown }
+      $entry = $frame.value
+      $type = [string](Get-ObjectValue $entry 'type' '')
+      if ($type -eq 'last-prompt') {
+        $explicit = Get-ObjectValue $entry 'explicit'
+        if ($null -ne $explicit -and $explicit -isnot [bool]) { $invalid = $true; break }
+        if ($explicit -eq $true) {
+          $selected = Get-ObjectValue $entry 'leafUuid'
+          if (-not (Test-AttentionOpaqueId $selected)) { $invalid = $true; break }
+          $leaf = [string]$selected
+        }
+        continue
+      }
+      if ($type -notin @('user', 'assistant', 'system', 'attachment')) { continue }
+      $side = Get-ObjectValue $entry 'isSidechain'
+      if ($side -isnot [bool]) { $invalid = $true; break }
+      if ($side) { continue }
+      if ([string](Get-ObjectValue $entry 'sessionId' '') -cne $ThreadId) { $invalid = $true; break }
+      $id = Get-ObjectValue $entry 'uuid'
+      $parentProperty = $entry.PSObject.Properties['parentUuid']
+      if (-not (Test-AttentionOpaqueId $id) -or $null -eq $parentProperty -or
+          ($null -ne $parentProperty.Value -and -not (Test-AttentionOpaqueId $parentProperty.Value))) { $invalid = $true; break }
+      if ($nodes.ContainsKey([string]$id) -and $nodes[[string]$id].hash -cne $frame.hash) { $invalid = $true; break }
+      $nodes[[string]$id] = $frame
+      $leaf = [string]$id
+    }
+    if ($invalid -or [string]::IsNullOrEmpty($leaf)) { return $unknown }
+    $chain = New-Object 'Collections.Generic.List[object]'; $seen = @{}; $foreground = ''
+    while (-not [string]::IsNullOrEmpty($leaf)) {
+      if ($seen.ContainsKey($leaf) -or -not $nodes.ContainsKey($leaf)) { return $unknown }
+      $seen[$leaf] = $true; $entry = $nodes[$leaf].value; $chain.Add($entry)
+      $message = Get-ObjectValue $entry 'message'
+      if ([string](Get-ObjectValue $entry 'type' '') -eq 'user' -and [string](Get-ObjectValue $message 'role' '') -eq 'user') {
+        $content = Get-AttentionValue $message 'content'
+        $isResult = $content -is [array] -and @($content | Where-Object { [string](Get-ObjectValue $_ 'type' '') -eq 'tool_result' }).Count -gt 0
+        if (-not $isResult) { $foreground = [string](Get-ObjectValue $entry 'uuid' ''); break }
+      }
+      $leaf = [string](Get-ObjectValue $entry 'parentUuid' '')
+      if ($chain.Count -gt 65536) { return $unknown }
+    }
+    if (-not (Test-AttentionGuid $foreground)) { return $unknown }
+    if (-not [string]::IsNullOrEmpty($ExpectedTurnId) -and $ExpectedTurnId -cne $foreground) {
+      $result = New-AttentionProbeResult -State resolved -ThreadId $ThreadId -TurnId $ExpectedTurnId -CallId $ExpectedCallId -ToolName AskUserQuestion
+      return Save-AttentionProbeCache claude $TranscriptPath $ThreadId $ExpectedTurnId $ExpectedCallId $MaxBytes $snapshot $result
+    }
+    $ordered = $chain.ToArray(); [Array]::Reverse($ordered)
+    $tools = @{}; $asks = @{}; $lastUnansweredAssistant = ''; $badTail = $false
+    $nodeOrder = 0; $latestEndTurn = -1
+    foreach ($entry in $ordered) {
+      $nodeOrder++
+      $type = [string](Get-ObjectValue $entry 'type' ''); $message = Get-ObjectValue $entry 'message'
+      if ([bool](Get-ObjectValue $entry 'isApiErrorMessage' $false) -or
+          ($type -eq 'system' -and [string](Get-ObjectValue $entry 'subtype' '') -in @('api_error', 'error', 'turn_aborted'))) { $badTail = $true }
+      if ($type -notin @('assistant', 'user')) { continue }
+      if ([string](Get-ObjectValue $message 'role' '') -cne $type) { return $unknown }
+      $content = Get-AttentionValue $message 'content'
+      if ($content -isnot [array]) { if ($type -eq 'assistant' -and $asks.Count -gt 0) { $badTail = $true }; continue }
+      if ($type -eq 'assistant') {
+        if ([string](Get-ObjectValue $message 'stop_reason' '') -ceq 'end_turn') { $latestEndTurn = $nodeOrder }
+        if ($asks.Count -gt 0 -and @($asks.Values | Where-Object { -not $_.resolved }).Count -gt 0) { $badTail = $true }
+        foreach ($part in $content) {
+          if ([string](Get-ObjectValue $part 'type' '') -ne 'tool_use') { continue }
+          $call = Get-ObjectValue $part 'id'
+          if (-not (Test-AttentionOpaqueId $call) -or $tools.ContainsKey([string]$call)) { return $unknown }
+          $tools[[string]$call] = $false
+          if ([string](Get-ObjectValue $part 'name' '') -cne 'AskUserQuestion') { continue }
+          $caller = Get-ObjectValue $part 'caller'
+          if ($null -ne $caller -and [string](Get-ObjectValue $caller 'type' '') -cne 'direct') { return $unknown }
+          $input = Get-ObjectValue $part 'input'; $questions = Get-AttentionValue $input 'questions'
+          if ($questions -isnot [array] -or $questions.Count -lt 1 -or $questions.Count -gt 4) { return $unknown }
+          foreach ($question in $questions) {
+            if ([string]::IsNullOrWhiteSpace([string](Get-ObjectValue $question 'question' '')) -or
+                [string]::IsNullOrWhiteSpace([string](Get-ObjectValue $question 'header' '')) -or
+                (Get-AttentionValue $question 'options') -isnot [array]) { return $unknown }
+          }
+          $answers = Get-ObjectValue $input 'answers'
+          $answered = $null -ne $answers -and @($answers.PSObject.Properties).Count -gt 0
+          $asks[[string]$call] = [pscustomobject]@{ resolved = $answered; count = $questions.Count; answered_order = -1 }
+          if ($answered) { $tools[[string]$call] = $true }
+          $lastUnansweredAssistant = [string](Get-ObjectValue $entry 'uuid' '')
+        }
+      } else {
+        foreach ($part in $content) {
+          if ([string](Get-ObjectValue $part 'type' '') -ne 'tool_result') { continue }
+          $call = Get-ObjectValue $part 'tool_use_id'
+          if (-not (Test-AttentionOpaqueId $call)) { return $unknown }
+          if ($tools.ContainsKey([string]$call)) { $tools[[string]$call] = $true }
+          if ($asks.ContainsKey([string]$call)) {
+            $asks[[string]$call].resolved = $true
+            $asks[[string]$call].answered_order = $nodeOrder
+          }
+        }
+      }
+    }
+    if (-not [string]::IsNullOrEmpty($ExpectedCallId)) {
+      if (-not $asks.ContainsKey($ExpectedCallId)) { return $unknown }
+      if ($asks[$ExpectedCallId].resolved) {
+        $resumed = if (-not $badTail -and $asks[$ExpectedCallId].answered_order -ge 0 -and $latestEndTurn -gt $asks[$ExpectedCallId].answered_order -and
+            @($tools.Keys | Where-Object { -not $tools[$_] }).Count -eq 0) { @($foreground) } else { @() }
+        $result = New-AttentionProbeResult -State resolved -ThreadId $ThreadId -TurnId $foreground -CallId $ExpectedCallId -ToolName AskUserQuestion -QuestionCount $asks[$ExpectedCallId].count -ResumedTurns $resumed
+        return Save-AttentionProbeCache claude $TranscriptPath $ThreadId $ExpectedTurnId $ExpectedCallId $MaxBytes $snapshot $result
+      }
+    }
+    $outstanding = @($tools.Keys | Where-Object { -not $tools[$_] })
+    $pending = @($asks.Keys | Where-Object { -not $asks[$_].resolved })
+    if ($pending.Count -eq 0) {
+      $resumed = if (-not $badTail -and $outstanding.Count -eq 0 -and @($asks.Values | Where-Object { $_.answered_order -ge 0 -and $latestEndTurn -gt $_.answered_order }).Count -gt 0) { @($foreground) } else { @() }
+      $result = New-AttentionProbeResult -State none -ThreadId $ThreadId -TurnId $foreground -ResumedTurns $resumed
+    } elseif ($badTail -or $pending.Count -ne 1 -or $outstanding.Count -ne 1 -or $outstanding[0] -cne $pending[0] -or
+        (-not [string]::IsNullOrEmpty($ExpectedCallId) -and $ExpectedCallId -cne $pending[0])) { return $unknown }
+    else {
+      $result = New-AttentionProbeResult -State waiting -ThreadId $ThreadId -TurnId $foreground -CallId $pending[0] -ToolName AskUserQuestion -QuestionCount $asks[$pending[0]].count -PendingCount $asks[$pending[0]].count
+    }
+    return Save-AttentionProbeCache claude $TranscriptPath $ThreadId $ExpectedTurnId $ExpectedCallId $MaxBytes $snapshot $result
+  } catch { return $unknown }
+}
+
+function Get-CodexAttentionState {
+  param([string]$TranscriptPath, [string]$ThreadId, [string]$ExpectedTurnId = '', [string]$ExpectedCallId = '', [int]$MaxBytes = 16777216)
+  $unknown = New-AttentionProbeResult -ThreadId $ThreadId
+  if (-not (Test-AttentionGuid $ThreadId)) { return $unknown }
+  $cached = Get-AttentionProbeCache -Provider codex -TranscriptPath $TranscriptPath -ThreadId $ThreadId -ExpectedTurnId $ExpectedTurnId -ExpectedCallId $ExpectedCallId -MaxBytes $MaxBytes
+  if ($null -ne $cached) { return $cached }
+  $snapshot = Read-AttentionSnapshot -TranscriptPath $TranscriptPath -MaxBytes $MaxBytes -Provider codex
+  if (-not $snapshot.ok) { return $unknown }
+  try {
+    $meta = Get-ObjectValue $snapshot.head 'payload'
+    if ([string](Get-ObjectValue $snapshot.head 'type' '') -cne 'session_meta' -or
+        [string](Get-ObjectValue $meta 'id' '') -cne $ThreadId) { return $unknown }
+    $source = Get-ObjectValue $meta 'source'
+    if (($source -is [string] -and $source -eq 'subagent') -or
+        ($null -ne $source -and $source -isnot [string] -and $null -ne (Get-ObjectValue $source 'subagent'))) {
+      return New-AttentionProbeResult -State none -ThreadId $ThreadId
+    }
+    $requests = @{}; $currentTurn = ''; $lastBad = -1; $latestCall = ''; $terminals = @{}; $completedTerminals = @{}
+    foreach ($frame in $snapshot.frames) {
+      $order = [int]$frame.order
+      if ($frame.invalid) { $lastBad = $order; continue }
+      $envelope = $frame.value
+      if ((Get-ObjectValue $envelope 'type') -isnot [string] -or [string]::IsNullOrWhiteSpace([string](Get-ObjectValue $envelope 'type' ''))) { $lastBad = $order; continue }
+      $type = [string](Get-ObjectValue $envelope 'type' '')
+      if ($type -notin @('session_meta','turn_context','event_msg','response_item')) { continue }
+      $payload = Get-ObjectValue $envelope 'payload'
+      if ($null -eq $payload -or $payload -isnot [Management.Automation.PSCustomObject]) { $lastBad = $order; continue }
+      $eventType = [string](Get-ObjectValue $payload 'type' '')
+      if ($type -eq 'turn_context' -or ($type -eq 'event_msg' -and $eventType -eq 'task_started')) {
+        $turn = Get-ObjectValue $payload 'turn_id'
+        if (Test-AttentionGuid $turn) { $currentTurn = [string]$turn }
+      }
+      if ($type -eq 'event_msg' -and $eventType -in @('task_complete', 'turn_aborted')) {
+        $turn = [string](Get-ObjectValue $payload 'turn_id' $currentTurn)
+        if (Test-AttentionGuid $turn) {
+          $terminals[$turn] = $order
+          if ($eventType -eq 'task_complete') { $completedTerminals[$turn] = $order }
+          if ($eventType -eq 'turn_aborted') {
+            foreach ($request in @($requests.Values)) {
+              if ($request.turn_id -ceq $turn -and $request.resolved_order -lt 0) { $request.resolved_order = $order }
+            }
+          }
+        }
+      }
+      if ($type -eq 'response_item' -and $eventType -eq 'function_call') {
+        $name = [string](Get-ObjectValue $payload 'name' '')
+        if ($name -cnotin @('request_user_input_async', 'functions.request_user_input_async', 'request_user_input', 'functions.request_user_input')) { continue }
+        $namespace = Get-ObjectValue $payload 'namespace'
+        if ($null -ne $namespace -and ($namespace -isnot [string] -or $namespace -cnotin @('', 'functions'))) { continue }
+        if ($name.StartsWith('functions.', [StringComparison]::Ordinal)) { $name = $name.Substring('functions.'.Length) }
+        $call = Get-ObjectValue $payload 'call_id'
+        $turnMeta = Get-ObjectValue $payload 'internal_chat_message_metadata_passthrough'
+        $explicitTurn = Get-ObjectValue $turnMeta 'turn_id'
+        $turn = if ($null -ne $explicitTurn) { $explicitTurn } else { $currentTurn }
+        if (-not (Test-AttentionOpaqueId $call) -or -not (Test-AttentionGuid $turn)) { $lastBad = $order; continue }
+        $arguments = Get-ObjectValue $payload 'arguments'
+        if ($arguments -isnot [string] -or $arguments.Length -gt 262144) { $lastBad = $order; continue }
+        try { $input = $arguments | ConvertFrom-Json -ErrorAction Stop } catch { $lastBad = $order; continue }
+        $questions = Get-AttentionValue $input 'questions'
+        if ($questions -isnot [array] -or $questions.Count -lt 1 -or $questions.Count -gt 32) { $lastBad = $order; continue }
+        $async = $name -ceq 'request_user_input_async'
+        $valid = $true
+        foreach ($question in $questions) {
+          $label = Get-ObjectValue $question $(if ($async) { 'title' } else { 'question' })
+          if ($question -isnot [Management.Automation.PSCustomObject] -or $label -isnot [string] -or [string]::IsNullOrWhiteSpace($label)) { $valid = $false; break }
+          $options = Get-AttentionValue $question 'options'
+          if ($null -ne $options -and $options -isnot [array]) { $valid = $false; break }
+        }
+        if (-not $valid) { $lastBad = $order; continue }
+        $hash = Get-Sha256Hex ("$name|$turn|$arguments")
+        if ($requests.ContainsKey([string]$call)) {
+          if ($requests[[string]$call].hash -cne $hash) { return $unknown }
+          continue
+        }
+        $requests[[string]$call] = [pscustomobject]@{
+          call_id = [string]$call; turn_id = [string]$turn; tool_name = $name; count = $questions.Count
+          async = $async; accepted = -not $async; acknowledged = -not $async; answered = @{}; order = $order; resolved_order = -1; answer_order = -1; hash = $hash
+        }
+        $latestCall = [string]$call
+      }
+      if ($type -eq 'response_item' -and $eventType -eq 'function_call_output') {
+        $call = [string](Get-ObjectValue $payload 'call_id' '')
+        if ($requests.ContainsKey($call)) {
+          $request = $requests[$call]
+          if ($request.async) {
+            $output = Get-ObjectValue $payload 'output'
+            try { $ack = if ($output -is [string]) { $output | ConvertFrom-Json -ErrorAction Stop } else { $null } } catch { $ack = $null }
+            $accepted = Get-ObjectValue $ack 'accepted'
+            if ($accepted -isnot [bool] -or ($request.acknowledged -and $request.accepted -ne $accepted)) { $lastBad = $order }
+            else {
+              $request.acknowledged = $true; $request.accepted = $accepted
+              if (-not $accepted -and $request.resolved_order -lt 0) { $request.resolved_order = $order }
+            }
+          } elseif ($request.resolved_order -lt 0) { $request.resolved_order = $order; $request.answer_order = $order }
+        }
+      }
+      $textParts = @(); $genuine = $false
+      if ($type -eq 'event_msg' -and $eventType -eq 'user_message') {
+        $message = Get-ObjectValue $payload 'message'
+        if ($message -is [string]) { $textParts = @($message); $genuine = $true }
+      } elseif ($type -eq 'response_item' -and $eventType -eq 'message' -and [string](Get-ObjectValue $payload 'role' '') -ceq 'user') {
+        $content = Get-AttentionValue $payload 'content'
+        $metadata = Get-ObjectValue $payload 'internal_chat_message_metadata_passthrough'
+        $kinds = Get-AttentionValue $metadata 'content_item_kinds'
+        if ($content -is [array] -and $content.Count -gt 0 -and $kinds -is [array] -and $kinds.Count -eq $content.Count) {
+          $genuine = $true; $itemMetadata = Get-AttentionValue $metadata 'content_item_metadata'
+          if ($null -ne $itemMetadata -and ($itemMetadata -isnot [array] -or $itemMetadata.Count -ne $content.Count)) { $genuine = $false }
+          for ($contentIndex = 0; $contentIndex -lt $content.Count; $contentIndex++) {
+            $kind = $kinds[$contentIndex]; $item = $content[$contentIndex]
+            if ($kind -isnot [string]) { $genuine = $false; break }
+            if ($kind -cne 'user.text') { continue }
+            if ([string](Get-ObjectValue $item 'type' '') -cne 'input_text' -or (Get-ObjectValue $item 'text') -isnot [string]) { $genuine = $false; break }
+            if ($itemMetadata -is [array] -and $itemMetadata.Count -eq $content.Count) {
+              $provenance = Get-ObjectValue $itemMetadata[$contentIndex] 'provenance'
+              if ($null -ne $provenance -and [string](Get-ObjectValue $provenance 'type' '') -cne 'user') { $genuine = $false; break }
+            }
+            $textParts += [string](Get-ObjectValue $item 'text' '')
+          }
+          if ($textParts.Count -eq 0) { $genuine = $false }
+        }
+      }
+      if ($genuine) {
+        $text = ($textParts -join "`n").Trim()
+        $reply = [regex]::Match($text, '\A<send_user_message_question_reply>\s*([\s\S]*?)\s*</send_user_message_question_reply>\z')
+        if ($reply.Success) {
+          $items = $null
+          try { $items = $reply.Groups[1].Value | ConvertFrom-Json -ErrorAction Stop } catch { $lastBad = $order; continue }
+          $replyItems = @(if ($items -is [array]) { $items } elseif ($items -is [Management.Automation.PSCustomObject]) { $items })
+          if ($replyItems.Count -eq 0) { $lastBad = $order; continue }
+          foreach ($item in $replyItems) {
+            $tupleText = Get-ObjectValue $item 'questionItemId'; $answer = Get-ObjectValue $item 'answer'
+            $tuple = $null
+            try { if ($tupleText -is [string]) { $tuple = $tupleText | ConvertFrom-Json -ErrorAction Stop } } catch { }
+            if ($tuple -isnot [array] -or $tuple.Count -ne 3 -or $answer -isnot [string] -or (Get-ObjectValue $item 'question') -isnot [string] -or
+                $tuple[0] -isnot [string] -or $tuple[0] -cne 'request_user_input_async' -or
+                -not (Test-AttentionOpaqueId $tuple[1]) -or ($tuple[2] -isnot [int] -and $tuple[2] -isnot [int64]) -or $tuple[2] -lt 0) { continue }
+            $call = [string]$tuple[1]
+            if ($requests.ContainsKey($call) -and $requests[$call].async) {
+              $request = $requests[$call]
+              if ($tuple[2] -ge $request.count) { continue }
+              $request.answered[[int]$tuple[2]] = $true
+              if ($request.answered.Count -eq $request.count -and $request.resolved_order -lt 0) { $request.resolved_order = $order; $request.answer_order = $order }
+            }
+          }
+        } else {
+          foreach ($request in @($requests.Values)) { if ($request.resolved_order -lt 0) { $request.resolved_order = $order } }
+        }
+      }
+    }
+    $paused = New-Object 'Collections.Generic.HashSet[string]'
+    $resumed = New-Object 'Collections.Generic.HashSet[string]'
+    foreach ($request in @($requests.Values)) {
+      if (-not $request.accepted) { continue }
+      if ($lastBad -lt $request.order -and $terminals.ContainsKey($request.turn_id) -and $terminals[$request.turn_id] -gt $request.order -and
+          ($request.resolved_order -lt 0 -or $terminals[$request.turn_id] -lt $request.resolved_order)) {
+        [void]$paused.Add($request.turn_id)
+      }
+      if ($request.answer_order -ge 0 -and $completedTerminals.ContainsKey($request.turn_id) -and
+          $completedTerminals[$request.turn_id] -gt $request.answer_order -and $terminals[$request.turn_id] -eq $completedTerminals[$request.turn_id] -and
+          $lastBad -lt $request.order) { [void]$resumed.Add($request.turn_id) }
+    }
+    foreach ($turn in @($paused)) { [void]$resumed.Remove($turn) }
+    $latestWaiting = @($requests.Values | Where-Object { $_.accepted -and $_.resolved_order -lt 0 } | Sort-Object order -Descending | Select-Object -First 1)
+    $selected = if (-not [string]::IsNullOrEmpty($ExpectedCallId)) { $ExpectedCallId }
+      elseif ($latestWaiting.Count -gt 0) { [string]$latestWaiting[0].call_id } else { $latestCall }
+    if ([string]::IsNullOrEmpty($selected)) {
+      if (-not [string]::IsNullOrEmpty($ExpectedCallId)) { return $unknown }
+      $result = New-AttentionProbeResult -State none -ThreadId $ThreadId -PausedTurns @($paused) -ResumedTurns @($resumed)
+    } elseif (-not $requests.ContainsKey($selected)) { return $unknown }
+    else {
+      $request = $requests[$selected]
+      if ($lastBad -gt $request.order -or (-not [string]::IsNullOrEmpty($ExpectedTurnId) -and $request.turn_id -cne $ExpectedTurnId)) { return $unknown }
+      $state = if ($request.resolved_order -ge 0) { 'resolved' } elseif ($request.accepted) { 'waiting' } else { 'unknown' }
+      $pendingCount = if ($state -ne 'waiting') { 0 } elseif ($request.async) { $request.count - $request.answered.Count } else { $request.count }
+      $selectedResumed = if ($request.answer_order -ge 0 -and $resumed.Contains($request.turn_id) -and
+          $completedTerminals.ContainsKey($request.turn_id) -and $completedTerminals[$request.turn_id] -gt $request.answer_order -and
+          $terminals[$request.turn_id] -eq $completedTerminals[$request.turn_id]) { @($request.turn_id) } else { @() }
+      $result = New-AttentionProbeResult -State $state -ThreadId $ThreadId -TurnId $request.turn_id -CallId $request.call_id -ToolName $request.tool_name -QuestionCount $request.count -PendingCount $pendingCount -PausedTurns @($paused) -ResumedTurns $selectedResumed
+    }
+    return Save-AttentionProbeCache codex $TranscriptPath $ThreadId $ExpectedTurnId $ExpectedCallId $MaxBytes $snapshot $result
+  } catch { return $unknown }
+}
+
+function Get-AttentionKey {
+  param([string]$Provider, [string]$ThreadId, [string]$TurnId, [string]$CallId)
+  return Get-Sha256Hex ("codex-ntfy/attention/v1|$Provider|$ThreadId|$TurnId|$CallId")
+}
+
+function Read-AttentionJsonFile {
+  param([string]$Path)
+  $file = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $file.Length -lt 1 -or $file.Length -gt 65536) { throw 'invalid attention storage leaf' }
+  $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+  try {
+    if ($stream.Length -lt 1 -or $stream.Length -gt 65536) { throw 'invalid attention storage size' }
+    $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false, $true), $true)
+    try { return ($reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop) } finally { $reader.Dispose() }
+  } finally { $stream.Dispose() }
+}
+
+function Assert-AttentionRecord {
+  param([object]$Record, [string]$ExpectedKey, [switch]$Sent)
+  $names = if ($Sent) { @('schema','kind','key','provider','thread_id','turn_id','call_id','sent_at','ntfy_id') }
+    else { @('schema','kind','key','provider','thread_id','turn_id','call_id','tool_name','transcript_path','session_codex_home','session_sqlite_home','cwd','origin','created_unix_ms','next_attempt_unix_ms','attempts') }
+  if ($null -eq $Record -or $Record -isnot [Management.Automation.PSCustomObject] -or
+      @($Record.PSObject.Properties).Count -ne $names.Count) { throw 'invalid attention record shape' }
+  foreach ($property in $Record.PSObject.Properties) { if ($property.Name -cnotin $names) { throw 'invalid attention property' } }
+  if (($Record.schema -isnot [int] -and $Record.schema -isnot [int64]) -or $Record.schema -ne 1 -or
+      $Record.kind -cne $(if ($Sent) { 'attention-sent' } else { 'attention' }) -or
+      $Record.provider -cnotin @('codex','claude') -or -not (Test-AttentionGuid $Record.thread_id) -or
+      -not (Test-AttentionGuid $Record.turn_id) -or -not (Test-AttentionOpaqueId $Record.call_id) -or
+      $Record.key -isnot [string] -or $Record.key -cnotmatch '^[0-9a-f]{64}$' -or $Record.key -cne $ExpectedKey -or
+      $Record.key -cne (Get-AttentionKey $Record.provider $Record.thread_id $Record.turn_id $Record.call_id)) { throw 'invalid attention identity' }
+  if ($Sent) {
+    $parsed = [DateTimeOffset]::MinValue
+    if ($Record.sent_at -isnot [string] -or -not [DateTimeOffset]::TryParse($Record.sent_at, [ref]$parsed) -or
+        $Record.ntfy_id -isnot [string] -or $Record.ntfy_id.Length -gt 256) { throw 'invalid attention receipt' }
+  } else {
+    foreach ($name in @('tool_name','transcript_path','session_codex_home','session_sqlite_home','cwd','origin')) {
+      if ($Record.$name -isnot [string] -or $Record.$name.Length -gt 4096) { throw 'invalid attention metadata' }
+    }
+    if ([string]::IsNullOrWhiteSpace($Record.transcript_path) -or [IO.Path]::GetExtension($Record.transcript_path) -ine '.jsonl') { throw 'invalid attention transcript' }
+    $allowed = if ($Record.provider -eq 'claude') { @('AskUserQuestion') } else { @('request_user_input_async','functions.request_user_input_async','request_user_input','functions.request_user_input') }
+    if ($Record.tool_name -cnotin $allowed) { throw 'invalid attention tool' }
+    foreach ($name in @('created_unix_ms','next_attempt_unix_ms','attempts')) {
+      if (($Record.$name -isnot [int] -and $Record.$name -isnot [int64]) -or $Record.$name -lt 0) { throw 'invalid attention scheduling' }
+    }
+    if ($Record.created_unix_ms -le 0 -or $Record.attempts -gt 1000000) { throw 'invalid attention scheduling' }
+  }
+}
+
+function Get-AttentionRecordProbe {
+  param([object]$Record)
+  if ($Record.provider -eq 'claude') {
+    return Get-ClaudeAttentionState -TranscriptPath $Record.transcript_path -ThreadId $Record.thread_id -ExpectedTurnId $Record.turn_id -ExpectedCallId $Record.call_id
+  }
+  $classification = Get-EventClassification -Event ([pscustomobject]@{ transcript_path = $Record.transcript_path }) -ThreadId $Record.thread_id -SessionHome $Record.session_codex_home -SqliteHome $Record.session_sqlite_home
+  if ($classification -ne 'root') { return New-AttentionProbeResult -ThreadId $Record.thread_id }
+  $info = Get-ThreadDatabaseInfo -ThreadId $Record.thread_id -SessionHome $Record.session_codex_home -SqliteHome $Record.session_sqlite_home
+  $path = [string](Get-ObjectValue $info 'rolloutPath' '')
+  if ([string]::IsNullOrWhiteSpace($path)) { $path = $Record.transcript_path }
+  return Get-CodexAttentionState -TranscriptPath $path -ThreadId $Record.thread_id -ExpectedTurnId $Record.turn_id -ExpectedCallId $Record.call_id
+}
+
+function Read-AttentionRecordSnapshot {
+  param([string]$Path, [switch]$Sent)
+  $key = [IO.Path]::GetFileNameWithoutExtension($Path)
+  if ($key -cnotmatch '^[0-9a-f]{64}$') { return [pscustomobject]@{ state = 'invalid'; record = $null } }
+  return Invoke-WithRecordMutationLock -Key $key -Action {
+    param($pathValue, $expectedKey, $isSent)
+    if (-not (Test-Path -LiteralPath $pathValue)) { return [pscustomobject]@{ state = 'missing'; record = $null } }
+    try {
+      $value = Read-AttentionJsonFile $pathValue
+      Assert-AttentionRecord -Record $value -ExpectedKey $expectedKey -Sent:$isSent
+      return [pscustomobject]@{ state = 'valid'; record = $value }
+    } catch { return [pscustomobject]@{ state = 'invalid'; record = $null } }
+  } -Arguments @($Path, $key, [bool]$Sent)
+}
+
+function Add-AttentionCandidate {
+  param([object]$Probe, [ValidateSet('codex','claude')][string]$Provider, [string]$TranscriptPath,
+    [string]$EventSessionHome = $CodexHome, [string]$EventSqliteHome = '', [string]$Cwd = '', [string]$EventOrigin = '', [object]$Config)
+  if (-not [bool](Get-ObjectValue $Config 'attentionNotifications' $true) -or [string](Get-ObjectValue $Probe 'state' '') -ne 'waiting') { return $false }
+  if ([string]::IsNullOrWhiteSpace($EventSqliteHome)) { $EventSqliteHome = $EventSessionHome }
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $key = Get-AttentionKey $Provider $Probe.thread_id $Probe.turn_id $Probe.call_id
+  $record = [pscustomobject][ordered]@{
+    schema = 1; kind = 'attention'; key = $key; provider = $Provider
+    thread_id = [string]$Probe.thread_id; turn_id = [string]$Probe.turn_id; call_id = [string]$Probe.call_id; tool_name = [string]$Probe.tool_name
+    transcript_path = [IO.Path]::GetFullPath($TranscriptPath); session_codex_home = $EventSessionHome; session_sqlite_home = $EventSqliteHome
+    cwd = [string]$Cwd; origin = [string]$EventOrigin; created_unix_ms = [int64]$now
+    next_attempt_unix_ms = [int64]($now + [Math]::Max(250, [Math]::Min(1500, [double](Get-ObjectValue $Config 'idleGraceSeconds' 1.5) * 1000)))
+    attempts = 0
+  }
+  Assert-AttentionRecord -Record $record -ExpectedKey $key
+  $verified = Get-AttentionRecordProbe -Record $record
+  if ($verified.state -ne 'waiting') { return $false }
+  return [bool](Invoke-WithRecordMutationLock -Key $key -Action {
+    param($incoming)
+    $sentPath = Join-Path $AttentionSentDir ($incoming.key + '.json')
+    $pendingPath = Join-Path $AttentionPendingDir ($incoming.key + '.json')
+    if (Test-Path -LiteralPath $sentPath) {
+      # Even an invalid receipt remains quarantined: never replace dedup authority.
+      try {
+        Assert-AttentionRecord -Record (Read-AttentionJsonFile $sentPath) -ExpectedKey $incoming.key -Sent
+        if (Test-Path -LiteralPath $pendingPath) {
+          $previous = Read-AttentionJsonFile $pendingPath; Assert-AttentionRecord $previous $incoming.key
+          if ($previous.transcript_path -cne $incoming.transcript_path -or $previous.session_codex_home -cne $incoming.session_codex_home -or $previous.session_sqlite_home -cne $incoming.session_sqlite_home) {
+            $incoming.created_unix_ms = $previous.created_unix_ms; $incoming.attempts = $previous.attempts; $incoming.next_attempt_unix_ms = $previous.next_attempt_unix_ms
+            Write-JsonAtomic -Path $pendingPath -Value $incoming
+          }
+        } else { Write-JsonAtomic -Path $pendingPath -Value $incoming -NoOverwrite }
+      } catch { }
+      return $true
+    }
+    if (Test-Path -LiteralPath $pendingPath) {
+      try {
+        $previous = Read-AttentionJsonFile $pendingPath
+        Assert-AttentionRecord -Record $previous -ExpectedKey $incoming.key
+        if ($previous.transcript_path -cne $incoming.transcript_path -or $previous.session_codex_home -cne $incoming.session_codex_home -or $previous.session_sqlite_home -cne $incoming.session_sqlite_home) {
+          $incoming.created_unix_ms = $previous.created_unix_ms
+          $incoming.attempts = $previous.attempts
+          $incoming.next_attempt_unix_ms = $previous.next_attempt_unix_ms
+          Write-JsonAtomic -Path $pendingPath -Value $incoming
+        }
+      } catch { }
+      return $true
+    }
+    Write-JsonAtomic -Path $pendingPath -Value $incoming -NoOverwrite
+    $readback = Read-AttentionJsonFile $pendingPath
+    Assert-AttentionRecord -Record $readback -ExpectedKey $incoming.key
+    return $true
+  } -Arguments @($record))
+}
+
+function Test-AttentionPendingBinding {
+  param([object]$Current, [object]$Snapshot)
+  foreach ($name in @('key','provider','thread_id','turn_id','call_id','transcript_path','session_codex_home','session_sqlite_home','created_unix_ms')) {
+    if ([string](Get-ObjectValue $Current $name '') -cne [string](Get-ObjectValue $Snapshot $name '')) { return $false }
+  }
+  return $true
+}
+
+function New-AttentionPayloadRecord {
+  param([object]$Record)
+  return [pscustomobject]@{
+    key = $Record.key; sequence_id = ($Record.provider + '-attention-' + $Record.key.Substring(0, 32))
+    provider = $Record.provider; thread_id = $Record.thread_id; turn_id = $Record.turn_id; origin = $Record.origin
+    session_codex_home = $Record.session_codex_home; session_sqlite_home = $Record.session_sqlite_home
+    candidate_rollout_path = $Record.transcript_path; notification_kind = 'attention'
+    completion_event_type = ''; goal_status = ''; event = [pscustomobject]@{ cwd = $Record.cwd; 'last-assistant-message' = '' }
+  }
+}
+
+function Get-AttentionDeliveryCounts {
+  $pending = 0; $waiting = 0
+  foreach ($file in @(Get-ChildItem -LiteralPath $AttentionPendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Select-Object -First 4097)) {
+    try {
+      $pendingSnapshot = Read-AttentionRecordSnapshot -Path $file.FullName
+      if ($pendingSnapshot.state -ne 'valid') { $pending++; continue }
+      $receiptSnapshot = Read-AttentionRecordSnapshot -Path (Join-Path $AttentionSentDir ($pendingSnapshot.record.key + '.json')) -Sent
+      if ($receiptSnapshot.state -eq 'valid') { $waiting++ } else { $pending++ }
+    } catch { $pending++ }
+  }
+  return [pscustomobject]@{ pending = $pending; waiting = $waiting }
+}
+
+function Process-AttentionPending {
+  param([object]$Config)
+  $result = [pscustomobject]@{ nextDueUnixMs = $null; remaining = 0 }
+  if (-not [bool](Get-ObjectValue $Config 'attentionNotifications' $true)) { return $result }
+  Ensure-RuntimeDirectories
+  $senderLock = $null
+  try { $senderLock = [IO.File]::Open($AttentionDeliveryLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+  catch [IO.IOException] { $result.remaining = (Get-AttentionDeliveryCounts).pending; $result.nextDueUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 500; return $result }
+  try {
+    $files = @(Get-ChildItem -LiteralPath $AttentionPendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -cmatch '^[0-9a-f]{64}$' } | Select-Object -First 4097)
+    if ($files.Count -gt 4096) { $result.remaining = $files.Count; $result.nextDueUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 60000; return $result }
+    $sentAttempts = 0
+    foreach ($file in @($files | Sort-Object LastWriteTimeUtc -Descending)) {
+      $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); $record = $null
+      try { $pendingSnapshot = Read-AttentionRecordSnapshot -Path $file.FullName; if ($pendingSnapshot.state -ne 'valid') { continue }; $record = $pendingSnapshot.record } catch { continue }
+      $sentPath = Join-Path $AttentionSentDir ($record.key + '.json')
+      $sentSnapshot = Read-AttentionRecordSnapshot -Path $sentPath -Sent
+      if ($sentSnapshot.state -ne 'missing') {
+        try {
+          if ($sentSnapshot.state -ne 'valid') { continue }
+          # Keep an O(active questions) tracker while the sent question remains
+          # unanswered. It is not undelivered work and cannot hold one-shot drain.
+          $tracked = Get-AttentionRecordProbe $record
+          if ($tracked.state -in @('resolved','none')) {
+            [void](Invoke-WithRecordMutationLock -Key $record.key -Action {
+              param($path, $snapshot)
+              try {
+                $current = Read-AttentionJsonFile $path; Assert-AttentionRecord $current $snapshot.key
+                if (Test-AttentionPendingBinding $current $snapshot) { Remove-Item -LiteralPath $path -Force }
+              } catch { }
+            } -Arguments @($file.FullName, $record))
+          }
+        } catch { }
+        continue
+      }
+      $due = [int64]$record.next_attempt_unix_ms
+      if ($due -gt $now -or $sentAttempts -ge 4) {
+        if ($null -eq $result.nextDueUnixMs -or $due -lt $result.nextDueUnixMs) { $result.nextDueUnixMs = [Math]::Max($now + 250, $due) }
+        continue
+      }
+      $probe = Get-AttentionRecordProbe $record
+      if ($probe.state -in @('resolved','none')) {
+        [void](Invoke-WithRecordMutationLock -Key $record.key -Action {
+          param($path, $snapshot)
+          try {
+            $current = Read-AttentionJsonFile $path; Assert-AttentionRecord $current $snapshot.key
+            if (Test-AttentionPendingBinding $current $snapshot) { Remove-Item -LiteralPath $path -Force }
+          } catch { }
+        } -Arguments @($file.FullName, $record))
+        continue
+      }
+      if ($probe.state -ne 'waiting') {
+        $record.next_attempt_unix_ms = [int64]($now + 5000)
+      } else {
+        # No mutation lock is held across HTTP. Re-read the question at every
+        # attempt, including retries; an ACK/status=completed is never an answer.
+        $probe = Get-AttentionRecordProbe $record
+        if ($probe.state -ne 'waiting') { continue }
+        $sentAttempts++
+        try {
+          $response = Send-NtfyEvent -Record (New-AttentionPayloadRecord $record) -Config $Config
+          $receipt = [pscustomobject][ordered]@{
+            schema = 1; kind = 'attention-sent'; key = $record.key; provider = $record.provider
+            thread_id = $record.thread_id; turn_id = $record.turn_id; call_id = $record.call_id
+            sent_at = [DateTimeOffset]::UtcNow.ToString('o'); ntfy_id = [string](Get-ObjectValue $response 'id' '')
+          }
+          [void](Invoke-WithRecordMutationLock -Key $record.key -Action {
+            param($pendingPath, $sentPathValue, $sentReceipt, $snapshot)
+            if (Test-Path -LiteralPath $sentPathValue) {
+              Assert-AttentionRecord -Record (Read-AttentionJsonFile $sentPathValue) -ExpectedKey $snapshot.key -Sent
+            } else {
+              Write-JsonAtomic -Path $sentPathValue -Value $sentReceipt -NoOverwrite
+              Assert-AttentionRecord -Record (Read-AttentionJsonFile $sentPathValue) -ExpectedKey $snapshot.key -Sent
+            }
+            # Pending remains a metadata-only active-question tracker. Only
+            # proven resolution removes it; the sent receipt makes it drained.
+          } -Arguments @($file.FullName, $sentPath, $receipt, $record))
+          Write-RuntimeLog "sent attention key=$($record.key.Substring(0, 12)) provider=$($record.provider)"
+          continue
+        } catch {
+          $record.attempts = [int]$record.attempts + 1
+          $failure = Get-HttpFailureInfo -ErrorRecord $_
+          $delay = Get-RetryDelaySeconds -Attempt $record.attempts -BaseSeconds $RetryBaseSeconds -MaxSeconds $Config.retryMaxSeconds -RetryAfterSeconds $failure.retryAfterSeconds
+          $record.next_attempt_unix_ms = if ($failure.permanent -or ($Config.maxAttempts -gt 0 -and $record.attempts -ge $Config.maxAttempts)) { [int64]::MaxValue }
+            else { [int64]([DateTimeOffset]::UtcNow.AddSeconds([Math]::Max(1, $delay)).ToUnixTimeMilliseconds()) }
+        }
+      }
+      [void](Invoke-WithRecordMutationLock -Key $record.key -Action {
+        param($path, $snapshot)
+        try {
+          $current = Read-AttentionJsonFile $path; Assert-AttentionRecord $current $snapshot.key
+          if ((Test-AttentionPendingBinding $current $snapshot) -and $current.attempts -le $snapshot.attempts) { Write-JsonAtomic -Path $path -Value $snapshot }
+        } catch { }
+      } -Arguments @($file.FullName, $record))
+      if ($null -eq $result.nextDueUnixMs -or $record.next_attempt_unix_ms -lt $result.nextDueUnixMs) { $result.nextDueUnixMs = $record.next_attempt_unix_ms }
+    }
+    $result.remaining = (Get-AttentionDeliveryCounts).pending
+    if ($result.remaining -gt 0 -and $null -eq $result.nextDueUnixMs) { $result.nextDueUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 5000 }
+    return $result
+  } finally { if ($null -ne $senderLock) { $senderLock.Dispose() } }
+}
+
+function Get-AttentionRecordTranscriptPathCore {
+  param([object]$Record)
+  $path = [string](Get-ObjectValue $Record 'candidate_rollout_path' '')
+  if (-not [string]::IsNullOrWhiteSpace($path)) { return $path }
+  if ([string](Get-ObjectValue $Record 'provider' 'codex') -ne 'codex') { return '' }
+  $attentionSessionHome = [string](Get-ObjectValue $Record 'session_codex_home' $CodexHome)
+  $sqliteHome = [string](Get-ObjectValue $Record 'session_sqlite_home' $attentionSessionHome)
+  $info = Get-ThreadDatabaseInfo -ThreadId $Record.thread_id -SessionHome $attentionSessionHome -SqliteHome $sqliteHome
+  return [string](Get-ObjectValue $info 'rolloutPath' '')
+}
+
+function Get-AttentionPauseBindingCore {
+  param([object]$Record)
+  # Called only under the ordinary record lock. No attention/session lock or
+  # mutable queue lookup belongs here: question proof is transcript-only.
+  if (-not [bool](Get-ObjectValue (Get-Config) 'attentionNotifications' $true)) { return $null }
+  $provider = [string](Get-ObjectValue $Record 'provider' 'codex')
+  $path = Get-AttentionRecordTranscriptPathCore -Record $Record
+  if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+  $probe = if ($provider -eq 'claude') { Get-ClaudeAttentionState -TranscriptPath $path -ThreadId $Record.thread_id }
+    else { Get-CodexAttentionState -TranscriptPath $path -ThreadId $Record.thread_id }
+  if (-not (Test-AttentionGuid $probe.turn_id) -or -not (Test-AttentionOpaqueId $probe.call_id)) { return $null }
+  $epoch = [int64]0
+  if ($provider -eq 'claude') {
+    if ($probe.state -ne 'waiting') { return $null }
+    $session = Read-ClaudeSessionState -SessionId $Record.thread_id
+    $epoch = [int64](Get-ObjectValue $Record 'claude_session_epoch' 0)
+    if ($epoch -le 0 -or $null -eq $session -or $epoch -ne [int64](Get-ObjectValue $session 'epoch' 0) -or
+        [string]$Record.turn_id -cne [string](Get-ObjectValue $session 'prompt_id' '')) { return $null }
+  } elseif ($provider -ne 'codex' -or $probe.turn_id -cne [string]$Record.turn_id -or
+      @($probe.paused_turns) -cnotcontains [string]$Record.turn_id) { return $null }
+  return [pscustomobject]@{
+    provider = $provider; turn_id = $probe.turn_id; call_id = $probe.call_id; session_epoch = $epoch
+    session_codex_home = [string](Get-ObjectValue $Record 'session_codex_home' $CodexHome)
+    session_sqlite_home = [string](Get-ObjectValue $Record 'session_sqlite_home' (Get-ObjectValue $Record 'session_codex_home' $CodexHome))
+  }
+}
+
+function Test-AttentionResumeEvidenceCore {
+  param([object]$Record, [object]$Receipt)
+  if (-not [bool](Get-ObjectValue (Get-Config) 'attentionNotifications' $true)) { return $false }
+  $provider = [string](Get-ObjectValue $Record 'provider' 'codex')
+  $turn = Get-ObjectValue $Receipt 'attention_question_turn_id'
+  $call = Get-ObjectValue $Receipt 'attention_question_call_id'
+  if ([string](Get-ObjectValue $Receipt 'key' '') -cne [string]$Record.key -or
+      [string](Get-ObjectValue $Receipt 'thread_id' '') -cne [string]$Record.thread_id -or
+      [string](Get-ObjectValue $Receipt 'turn_id' '') -cne [string]$Record.turn_id -or
+      [string](Get-ObjectValue $Receipt 'attention_provider' '') -cne $provider -or
+      -not (Test-AttentionGuid $turn) -or -not (Test-AttentionOpaqueId $call)) { return $false }
+  $attentionSessionHome = [string](Get-ObjectValue $Record 'session_codex_home' $CodexHome)
+  $sqliteHome = [string](Get-ObjectValue $Record 'session_sqlite_home' $attentionSessionHome)
+  if ([string](Get-ObjectValue $Receipt 'attention_session_codex_home' '') -cne $attentionSessionHome -or
+      [string](Get-ObjectValue $Receipt 'attention_session_sqlite_home' '') -cne $sqliteHome) { return $false }
+  $path = Get-AttentionRecordTranscriptPathCore -Record $Record
+  if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+  if ($provider -eq 'claude') {
+    $epoch = [int64](Get-ObjectValue $Record 'claude_session_epoch' 0)
+    $session = Read-ClaudeSessionState -SessionId $Record.thread_id
+    if ($epoch -le 0 -or $epoch -ne [int64](Get-ObjectValue $Receipt 'attention_session_epoch' 0) -or $null -eq $session -or
+        $epoch -ne [int64](Get-ObjectValue $session 'epoch' 0) -or
+        [string]$Record.turn_id -cne [string](Get-ObjectValue $session 'prompt_id' '')) { return $false }
+    $probe = Get-ClaudeAttentionState -TranscriptPath $path -ThreadId $Record.thread_id -ExpectedTurnId $turn -ExpectedCallId $call
+  } elseif ($provider -eq 'codex' -and $turn -ceq [string]$Record.turn_id) {
+    $probe = Get-CodexAttentionState -TranscriptPath $path -ThreadId $Record.thread_id -ExpectedTurnId $turn -ExpectedCallId $call
+  } else { return $false }
+  return $probe.state -in @('none','resolved') -and @($probe.resumed_turns) -ccontains [string]$turn
+}
+
+function Get-AttentionCompletionDisposition {
+  param([object]$Record, [object]$Config)
+  if (-not [bool](Get-ObjectValue $Config 'attentionNotifications' $true)) { return 'normal' }
+  $provider = [string](Get-ObjectValue $Record 'provider' 'codex')
+  $path = Get-AttentionRecordTranscriptPathCore -Record $Record
+  $attentionSessionHome = [string](Get-ObjectValue $Record 'session_codex_home' $CodexHome)
+  $sqliteHome = [string](Get-ObjectValue $Record 'session_sqlite_home' $attentionSessionHome)
+  # A previously attested request may fall outside a bounded tail. Its active
+  # tracker preserves the unknown gate without scanning historical sent files.
+  foreach ($file in @(Get-ChildItem -LiteralPath $AttentionPendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Select-Object -First 4097)) {
+    try {
+      $trackedSnapshot = Read-AttentionRecordSnapshot -Path $file.FullName
+      if ($trackedSnapshot.state -ne 'valid') { continue }
+      $tracked = $trackedSnapshot.record
+      if ($tracked.provider -cne $provider -or $tracked.thread_id -cne [string]$Record.thread_id -or
+          $tracked.session_codex_home -cne $attentionSessionHome -or $tracked.session_sqlite_home -cne $sqliteHome -or
+          ($provider -eq 'codex' -and $tracked.turn_id -cne [string]$Record.turn_id)) { continue }
+      $trackedPath = if ([string]::IsNullOrWhiteSpace($path)) { $tracked.transcript_path } else { $path }
+      $trackedProbe = if ($provider -eq 'claude') { Get-ClaudeAttentionState -TranscriptPath $trackedPath -ThreadId $Record.thread_id -ExpectedTurnId $tracked.turn_id -ExpectedCallId $tracked.call_id }
+        else { Get-CodexAttentionState -TranscriptPath $trackedPath -ThreadId $Record.thread_id -ExpectedTurnId $tracked.turn_id -ExpectedCallId $tracked.call_id }
+      if ($trackedProbe.state -eq 'unknown') { return 'unknown' }
+      if ($trackedProbe.state -eq 'waiting') {
+        if ($provider -eq 'claude' -or @($trackedProbe.paused_turns) -ccontains [string]$Record.turn_id) { return 'attention-pause' }
+        return 'unknown'
+      }
+    } catch { continue }
+  }
+  if ([string]::IsNullOrWhiteSpace($path)) { return 'normal' }
+  $probe = if ($provider -eq 'claude') { Get-ClaudeAttentionState -TranscriptPath $path -ThreadId $Record.thread_id }
+    else { Get-CodexAttentionState -TranscriptPath $path -ThreadId $Record.thread_id }
+  if (@(Get-AttentionValue $probe 'paused_turns' @()) -ccontains [string]$Record.turn_id) { return 'attention-pause' }
+  if ($provider -eq 'claude' -and $probe.state -eq 'waiting') { return 'attention-pause' }
+  if ($provider -eq 'codex' -and $probe.state -eq 'waiting' -and $probe.turn_id -ceq [string]$Record.turn_id) { return 'unknown' }
+  # Without a known question, unknown attention evidence must not change the
+  # pre-existing completion policy (legacy/missing transcripts remain supported).
+  return 'normal'
 }
 
 function Get-DefaultOrigin {
@@ -1939,7 +2959,11 @@ function New-NtfyPayload {
       }
     }
   }
-  if ([string](Get-ObjectValue $Record 'completion_event_type' '') -eq 'turn_aborted' -or
+  if ([string](Get-ObjectValue $Record 'notification_kind' '') -eq 'attention') {
+    $payload['message'] = 'Reply needed'
+    $payload['tags'] = @('question')
+    $payload['priority'] = [int](Get-ObjectValue $Config 'attentionPriority' 4)
+  } elseif ([string](Get-ObjectValue $Record 'completion_event_type' '') -eq 'turn_aborted' -or
       [string](Get-ObjectValue $Record 'goal_status' '') -eq 'blocked') {
     # One compact error glyph keeps failed turns distinguishable even when the
     # user has disabled assistant-message previews for privacy.
@@ -1947,7 +2971,7 @@ function New-NtfyPayload {
   } elseif (@($Config.tags).Count -gt 0) {
     $payload['tags'] = @($Config.tags)
   }
-  if ([int]$Config.priority -ne 3) { $payload['priority'] = [int]$Config.priority }
+  if ([string](Get-ObjectValue $Record 'notification_kind' '') -ne 'attention' -and [int]$Config.priority -ne 3) { $payload['priority'] = [int]$Config.priority }
   if ($Config.markdown -and -not [string]::IsNullOrWhiteSpace($summary)) { $payload['markdown'] = $true }
   return $payload
 }
@@ -2178,6 +3202,17 @@ function Move-ToSuppressedCore {
     candidate_revision = [string](Get-ObjectValue $Record 'candidate_revision' '')
     suppressed_at = [DateTimeOffset]::UtcNow.ToString('o')
     reason = $Reason
+  }
+  if ($Reason -eq 'attention-pause') {
+    $binding = Get-AttentionPauseBindingCore -Record $Record
+    if ($null -ne $binding) {
+      $receipt.attention_provider = $binding.provider
+      $receipt.attention_question_turn_id = $binding.turn_id
+      $receipt.attention_question_call_id = $binding.call_id
+      $receipt.attention_session_epoch = $binding.session_epoch
+      $receipt.attention_session_codex_home = $binding.session_codex_home
+      $receipt.attention_session_sqlite_home = $binding.session_sqlite_home
+    }
   }
   Write-JsonAtomic -Path $suppressedPath -Value $receipt
   Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
@@ -3694,6 +4729,9 @@ function Test-RecordIdleGate {
   )
 
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $attentionDisposition = Get-AttentionCompletionDisposition -Record $Record -Config $Config
+  if ($attentionDisposition -eq 'attention-pause') { return New-GateResult -State 'attention-pause' -Reason 'attention-pause' -RetryAtUnixMs $now }
+  if ($attentionDisposition -eq 'unknown') { return New-GateResult -State 'busy' -Reason 'attention-awaiting-evidence' -RetryAtUnixMs ($now + 1000) }
   if ([string](Get-ObjectValue $Record 'provider' 'codex') -eq 'claude') {
     $candidateKind = [string](Get-ObjectValue $Record 'candidate_kind' '')
     $recordGoalState = ([string](Get-ObjectValue $Record 'claude_goal_state' '')).Trim().ToLowerInvariant()
@@ -4373,6 +5411,22 @@ function Get-RolloutMetadata {
   }
 }
 
+function Add-CodexAttentionFromScan {
+  param([object]$Entry, [object]$Config, [string]$NewText)
+  if (-not [bool](Get-ObjectValue $Config 'attentionNotifications' $true) -or
+      $NewText -notmatch 'request_user_input|send_user_message_question_reply|"(?:function_call_output|task_complete|turn_aborted|task_started|turn_context|user_message)"|"role"\s*:\s*"user"') { return }
+  $file = Get-ObjectValue $Entry 'file'
+  $metadata = Get-RolloutMetadata -Path $file.FullName
+  $thread = [string](Get-FirstObjectValue $metadata @('id','thread_id','threadId'))
+  if (-not (Test-AttentionGuid $thread)) { return }
+  $probe = Get-CodexAttentionState -TranscriptPath $file.FullName -ThreadId $thread
+  if ($probe.state -ne 'waiting') { return }
+  $attentionSessionHome = [string](Get-ObjectValue $Entry 'session_codex_home' $CodexHome)
+  $sqliteHome = [string](Get-ObjectValue $Entry 'session_sqlite_home' $attentionSessionHome)
+  $queued = Add-AttentionCandidate -Probe $probe -Provider codex -TranscriptPath $file.FullName -EventSessionHome $attentionSessionHome -EventSqliteHome $sqliteHome -Cwd ([string](Get-ObjectValue $metadata 'cwd' '')) -EventOrigin ([string](Get-ObjectValue $Entry 'origin' '')) -Config $Config
+  if (-not $queued) { throw 'attention discovery could not establish durable candidate' }
+}
+
 function Scan-RolloutFile {
   param(
     [object]$Entry,
@@ -4479,6 +5533,9 @@ function Scan-RolloutFile {
       })
   }
   $completeText = $Utf8NoBom.GetString($data, 0, $lastNewline + 1)
+  # Admission follows the existing changed/replay cursor. Merely upgrading an
+  # unchanged archived chat must not replay historical questions.
+  Add-CodexAttentionFromScan -Entry $Entry -Config $Config -NewText $completeText
   $newOffset = $offset + $lastNewline + 1
   $metadata = Get-RolloutMetadata -Path $File.FullName
   $threadId = [string](Get-FirstObjectValue $metadata @('id', 'thread_id', 'threadId'))
@@ -4681,8 +5738,7 @@ function Resolve-QueueReceiptConflict {
     }
     $suppressedPath = Join-Path $SuppressedDir ($lockedRecord.key + '.json')
     if (Test-Path -LiteralPath $suppressedPath) {
-      if ((Test-IsStopEvidence -Record $current) -and
-          (Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $current)) {
+      if (Remove-TechnicalSuppressionForStopCore -Path $suppressedPath -Record $current) {
         return [pscustomobject]@{ keep = $true; reason = 'stop-revived'; record = $current }
       }
       Remove-Item -LiteralPath $lockedPath -Force -ErrorAction SilentlyContinue
@@ -4978,6 +6034,11 @@ function Process-PendingCandidates {
       # The second pass is the final epoch check. It happens while the record is
       # still pending, immediately before the durable move into the outbox.
       $gate = Test-RecordIdleGate -Record $record -Config $Config
+      if ($gate.state -eq 'attention-pause') {
+        Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'attention-pause'
+        $promote = $false
+        break
+      }
       if ($gate.state -eq 'subagent') {
         Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'subagent'
         $promote = $false
@@ -5445,6 +6506,11 @@ function Invoke-OutboxWorker {
         @()
       }
       $nextDueMs = $pendingResult.nextDueUnixMs
+      $attentionResult = [pscustomobject]@{ nextDueUnixMs = $null; remaining = 0 }
+      if ($DeliveryOnly -or -not $Continuous) {
+        $attentionResult = Process-AttentionPending -Config $config
+        if ($null -ne $attentionResult.nextDueUnixMs -and ($null -eq $nextDueMs -or $attentionResult.nextDueUnixMs -lt $nextDueMs)) { $nextDueMs = $attentionResult.nextDueUnixMs }
+      }
 
       foreach ($file in $files) {
         $record = $null
@@ -5500,6 +6566,15 @@ function Invoke-OutboxWorker {
           }
         }
 
+        $attentionDisposition = Get-AttentionCompletionDisposition -Record $record -Config $config
+        if ($attentionDisposition -eq 'attention-pause') {
+          Move-ToSuppressed -Path $file.FullName -Record $record -Reason 'attention-pause'
+          continue
+        }
+        if ($attentionDisposition -eq 'unknown') {
+          $nextDueMs = $nowMs + 1000
+          continue
+        }
         try {
           $response = Send-NtfyEvent -Record $record -Config $config
           $receipt = [ordered]@{
@@ -5536,6 +6611,7 @@ function Invoke-OutboxWorker {
 
       $remaining = @(Get-ChildItem -LiteralPath $OutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count +
         @(Get-ChildItem -LiteralPath $PendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+      if ($DeliveryOnly -or -not $Continuous) { $remaining += [int]$attentionResult.remaining }
       if (-not $Continuous -and $remaining -eq 0) {
         if (-not $DeliveryOnly) {
           if ($NoSpawn -or $env:CODEX_NTFY_NO_SPAWN -eq '1') {
@@ -5741,6 +6817,11 @@ function Show-Doctor {
     sent_receipts = @(Get-ChildItem -LiteralPath $SentDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     suppressed = @(Get-ChildItem -LiteralPath $SuppressedDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     dead_letters = @(Get-ChildItem -LiteralPath $DeadDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+    attention_notifications = [bool]$config.attentionNotifications
+    attention_priority = [int]$config.attentionPriority
+    attention_pending = [int](Get-AttentionDeliveryCounts).pending
+    attention_waiting = [int](Get-AttentionDeliveryCounts).waiting
+    attention_sent = @(Get-ChildItem -LiteralPath $AttentionSentDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
     dead_retention_days = $config.deadRetentionDays
   }
   $result | ConvertTo-Json -Depth 5
@@ -5792,6 +6873,34 @@ try {
     $promptId = [string](Get-FirstObjectValue $hookInput @('prompt_id', 'prompt-id', 'promptId'))
     $agentId = [string](Get-FirstObjectValue $hookInput @('agent_id', 'agent-id', 'agentId'))
     $transcriptPath = [string](Get-FirstObjectValue $hookInput @('transcript_path', 'transcript-path', 'transcriptPath'))
+    $attentionNotification = $hookName -eq 'Notification' -and [string](Get-FirstObjectValue $hookInput @('notification_type','notification-type','notificationType')) -eq 'permission_prompt'
+    if ($hookName -eq 'PreToolUse' -or $attentionNotification) {
+      $attentionConfig = Get-Config
+      if ($attentionConfig.attentionNotifications -and [string]::IsNullOrWhiteSpace($agentId) -and (Test-AttentionGuid $sessionId)) {
+        $tool = [string](Get-ObjectValue $hookInput 'tool_name' '')
+        $call = [string](Get-ObjectValue $hookInput 'tool_use_id' '')
+        $attentionToolInput = Get-ObjectValue $hookInput 'tool_input'
+        $answers = Get-ObjectValue $attentionToolInput 'answers'
+        $preToolAllowed = $hookName -ne 'PreToolUse' -or ($tool -ceq 'AskUserQuestion' -and (Test-AttentionOpaqueId $call) -and
+          ($null -eq $answers -or @($answers.PSObject.Properties).Count -eq 0))
+        if ($preToolAllowed) {
+          # PreToolUse is an async accelerator. Its text alone is never proof;
+          # allow a short bounded persistence race before requiring the actual
+          # current-root AskUserQuestion from the transcript.
+          for ($attentionAttempt = 0; $attentionAttempt -lt 8; $attentionAttempt++) {
+            $question = Get-ClaudeAttentionState -TranscriptPath $transcriptPath -ThreadId $sessionId
+            if ($question.state -eq 'waiting' -and ($hookName -ne 'PreToolUse' -or $question.call_id -ceq $call)) {
+              if (Add-AttentionCandidate -Probe $question -Provider claude -TranscriptPath $transcriptPath -Cwd ([string](Get-ObjectValue $hookInput 'cwd' '')) -EventOrigin 'Claude Code' -Config $attentionConfig) { Start-DetachedWorker }
+              break
+            }
+            if ($hookName -ne 'PreToolUse') { break }
+            Start-Sleep -Milliseconds 250
+          }
+        }
+      }
+      Write-Output '{}'
+      exit 0
+    }
     if ($hookName -eq 'UserPromptSubmit') {
       if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
         [void](Set-ClaudeSessionBusy -SessionId $sessionId -PromptId $promptId -TranscriptPath $transcriptPath)

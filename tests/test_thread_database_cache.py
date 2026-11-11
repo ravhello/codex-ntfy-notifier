@@ -28,7 +28,8 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($env:CACHE_NOTIFIER, [
 if ($errors.Count -gt 0) { throw ($errors | Out-String) }
 foreach ($name in @('Get-ObjectValue', 'Get-FirstObjectValue', 'Initialize-WinSqlite',
     'Invoke-SqliteRow', 'Get-StateDatabasePath', 'Get-ThreadDatabaseInfo',
-    'Test-RecordIdleGate', 'Get-ActiveDescendants', 'Get-DescendantThreadIds', 'Get-ThreadLastActivityUnixMs',
+    'Test-RecordIdleGate', 'Get-AttentionCompletionDisposition',
+    'Get-ActiveDescendants', 'Get-DescendantThreadIds', 'Get-ThreadLastActivityUnixMs',
     'Get-UnknownGateResult', 'New-GateResult', 'Set-RecordValue')) {
   $definition = @($ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -93,6 +94,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
       }
       $config = [pscustomobject]@{
         idleDetectionMode = 'strict'; idleProbeGraceSeconds = 30; goalPollSeconds = 0.1
+        attentionNotifications = $false
         unknownRetryMaxSeconds = 1; suppressSubagents = $true; includeMessage = $false
         subagentOrphanSeconds = [double](Get-ObjectValue $request 'orphan_seconds' 1800)
       }

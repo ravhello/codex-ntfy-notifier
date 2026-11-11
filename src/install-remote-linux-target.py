@@ -155,6 +155,8 @@ def migrate_private_config(path: Path) -> None:
         "include_task_link_action": False,
         "allow_insecure_auth": False,
         "priority": 3,
+        "attention_notifications": True,
+        "attention_priority": 4,
         "tags": ["white_check_mark"],
         "max_message_chars": 180,
         "markdown": False,

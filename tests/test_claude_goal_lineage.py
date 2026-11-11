@@ -57,7 +57,9 @@ if ($env:TEST_PRIOR_ACTIVE -eq '1') {
     claude_session_epoch = 7; claude_goal_state = 'active'; claude_goal_marker = 'abandoned-goal'
     candidate_rollout_path = $env:TEST_TRANSCRIPT; created_unix_ms = 1
   }
-  $gate = Test-RecordIdleGate -Record $record -Config ([pscustomobject]@{ idleGraceSeconds = 0 })
+  $gate = Test-RecordIdleGate -Record $record -Config ([pscustomobject]@{
+    idleGraceSeconds = 0; attentionNotifications = $false
+  })
 }
 [pscustomobject]@{ goal = $goal; gate = $gate } | ConvertTo-Json -Depth 5 -Compress
 """

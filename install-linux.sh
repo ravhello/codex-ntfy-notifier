@@ -42,6 +42,8 @@ config = {
     "password": os.environ.get("CODEX_NTFY_PASSWORD", ""),
     "allow_insecure_auth": False,
     "priority": 3,
+    "attention_notifications": True,
+    "attention_priority": 4,
     "tags": ["white_check_mark"],
     "max_message_chars": 180,
     "include_message": False,

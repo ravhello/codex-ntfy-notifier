@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Codex ntfy Notifier
-description: Idle-only, durable ntfy notifications for local OpenAI Codex tasks and opt-in Claude Code on Windows.
+description: Durable completion and question-attention notifications for local OpenAI Codex tasks and opt-in Claude Code on Windows.
 ---
 
 ![Codex ntfy Notifier](assets/hero.svg)
@@ -12,6 +12,11 @@ Codex ntfy Notifier sends an ntfy push after local lifecycle evidence
 indicates that a root Codex task has no more work. Intermediate turn signals are
 held behind an idle gate, while a durable outbox retries transient delivery
 failures.
+
+Version 2.6 also distinguishes genuine unanswered questions with one question
+icon and a separate high priority. It preserves the current chat name, does not
+forward question/answer text, and rechecks that an answer is still needed before
+each send. A question pause is not announced as a completed task.
 
 Version 2.5 also connects local Claude Code on Windows—including Claude
 Desktop's Code tab—through managed lifecycle hooks and a transcript-backed

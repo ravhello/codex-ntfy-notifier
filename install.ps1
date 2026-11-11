@@ -144,6 +144,8 @@ function New-PrivateConfigIfNeeded {
     $changed = (Add-ConfigDefault -Config $config -Name 'include_task_link_action' -Value $false) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'allow_insecure_auth' -Value $false) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'priority' -Value 3) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'attention_notifications' -Value $true) -or $changed
+    $changed = (Add-ConfigDefault -Config $config -Name 'attention_priority' -Value 4) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'tags' -Value @('white_check_mark')) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'max_message_chars' -Value 180) -or $changed
     $changed = (Add-ConfigDefault -Config $config -Name 'markdown' -Value $false) -or $changed
@@ -232,6 +234,8 @@ function New-PrivateConfigIfNeeded {
     password = [string]$env:CODEX_NTFY_PASSWORD
     allow_insecure_auth = $false
     priority = 3
+    attention_notifications = $true
+    attention_priority = 4
     tags = @('white_check_mark')
     max_message_chars = 180
     include_message = $false
@@ -552,7 +556,7 @@ function Ensure-ClaudeCodeHooks {
 
   foreach ($eventProperty in @($hookEvents.PSObject.Properties)) {
     if ($eventProperty.Value -isnot [array]) {
-      if ($eventProperty.Name -in @('Stop', 'StopFailure', 'UserPromptSubmit', 'UserPromptExpansion', 'Notification')) {
+      if ($eventProperty.Name -in @('Stop', 'StopFailure', 'UserPromptSubmit', 'UserPromptExpansion', 'Notification', 'PreToolUse')) {
         throw "hooks.$($eventProperty.Name) in $SettingsPath must contain a JSON array."
       }
       continue
@@ -593,7 +597,7 @@ function Ensure-ClaudeCodeHooks {
     }
   }
 
-  foreach ($eventName in @('Stop', 'StopFailure', 'UserPromptSubmit', 'Notification')) {
+  foreach ($eventName in @('Stop', 'StopFailure', 'UserPromptSubmit', 'PreToolUse', 'Notification')) {
     $eventProperty = $hookEvents.PSObject.Properties[$eventName]
     if ($null -eq $eventProperty) {
       Add-Member -InputObject $hookEvents -MemberType NoteProperty -Name $eventName -Value @()
@@ -612,14 +616,17 @@ function Ensure-ClaudeCodeHooks {
       # Prompt and terminal hook ordering is part of the correctness contract.
       # UserPromptSubmit must establish the epoch before Stop, and repeated Stop
       # events for one prompt must reach the queue in lifecycle order. Only the
-      # optional Notification accelerators are safe to run asynchronously.
-      async = $eventName -eq 'Notification'
+      # Question/Notification accelerators have no lifecycle decision authority.
+      async = $eventName -in @('Notification', 'PreToolUse')
     }
     $managedGroups = if ($eventName -eq 'Notification') {
       @(
         [pscustomobject][ordered]@{ matcher = 'idle_prompt'; hooks = @($handler) },
-        [pscustomobject][ordered]@{ matcher = 'agent_completed'; hooks = @($handler) }
+        [pscustomobject][ordered]@{ matcher = 'agent_completed'; hooks = @($handler) },
+        [pscustomobject][ordered]@{ matcher = 'permission_prompt'; hooks = @($handler) }
       )
+    } elseif ($eventName -eq 'PreToolUse') {
+      @([pscustomobject][ordered]@{ matcher = 'AskUserQuestion'; hooks = @($handler) })
     } else {
       @([pscustomobject][ordered]@{ hooks = @($handler) })
     }

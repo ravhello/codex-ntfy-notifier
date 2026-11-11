@@ -1,13 +1,13 @@
 # Uninstall and rollback
 
-These procedures apply to version 2.5.2. They are intentionally explicit because `~/.codex` belongs to Codex and `~/.claude/settings.json` may contain unrelated Claude configuration; never remove either whole directory.
+These procedures apply to version 2.6.0. They are intentionally explicit because `~/.codex` belongs to Codex and `~/.claude/settings.json` may contain unrelated Claude configuration; never remove either whole directory.
 
 An **uninstall** removes only this project’s managed `notify` command, `notify-ntfy` hook handlers, scripts, and worker while preserving unrelated Codex settings and hooks. A **rollback** restores the timestamped snapshot taken immediately before a particular installation or upgrade. Decide which outcome is wanted before deleting anything.
 
 ## Before changing files
 
 1. Close or reload Codex app/CLI processes and VS Code windows after the procedure so they do not retain old hook configuration.
-2. Run doctor and inspect both `pending_idle` and `queued`. Wait for both to reach zero, or explicitly accept that idle candidates and network-ready notifications will be discarded.
+2. Run doctor and inspect `pending_idle`, `queued`, and `attention_pending`. Wait for them to reach zero, or explicitly accept that waiting candidates and notifications will be discarded. Preserve `attention-sent` receipts if logical question deduplication must survive a reinstall.
 3. Select the correct host and user. Each local, WSL, and Remote SSH environment can have a separate `~/.codex`.
 4. Make a private copy of any config or state that may be needed for rollback. It can contain credentials and message content.
 5. Do not print or upload `ntfy-config.json`, `hooks.json`, Codex rollout/database state, notifier state, or backups.
@@ -162,7 +162,7 @@ Do not delete all of `hooks.json` and do not edit Codex’s hook trust store. A 
 
 #### Remove the optional Claude Code handlers
 
-Skip this block if the notifier was not installed with `-EnableClaudeCode`. If installation used a custom `-CodexHome` or `-ClaudeHome`, set the same absolute directories below instead of the defaults. The managed set can appear under `Stop`, `StopFailure`, `UserPromptSubmit`, and `Notification`. This cleanup removes only handlers carrying the managed `-ClaudeHook` marker and the exact installed script path; all other Claude settings and hooks remain:
+Skip this block if the notifier was not installed with `-EnableClaudeCode`. If installation used a custom `-CodexHome` or `-ClaudeHome`, set the same absolute directories below instead of the defaults. The managed set can appear under `Stop`, `StopFailure`, `UserPromptSubmit`, `PreToolUse`, and `Notification`. This cleanup removes only handlers carrying the managed `-ClaudeHook` marker and the exact installed script path; all other Claude settings and hooks remain:
 
 ```powershell
 $CodexHome = [IO.Path]::GetFullPath((Join-Path $HOME '.codex')) # replace with the installed -CodexHome when customized

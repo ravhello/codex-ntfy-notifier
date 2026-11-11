@@ -270,6 +270,34 @@ class DescendantOrphanDeliveryTests(unittest.TestCase):
             time.sleep(0.05)
         self.fail("worker never persisted the causal child gate")
 
+    def wait_for_sent_receipt(self, fixture, process, *, implementation: str,
+                              first: dict, thread_id: str, turn_id: str, deadline: float) -> dict:
+        observer_runtime = SimpleNamespace(ensure=lambda: None, mutation_locks=fixture.state / "mutation-locks")
+        path = fixture.state / "sent" / f"{first['key']}.json"
+        last_observed = "receipt absent"
+        while time.monotonic() < deadline:
+            try:
+                guard = (
+                    self.observer_notifier.record_mutation_lock(observer_runtime, first["key"])
+                    if implementation == "python" else nullcontext()
+                )
+                with guard:
+                    receipt = json.loads(read_text_shared_delete(path))
+                last_observed = receipt
+                if (isinstance(receipt, dict) and type(receipt.get("schema")) is int and receipt["schema"] == 1 and
+                        receipt.get("key") == first["key"] and receipt.get("thread_id") == thread_id and
+                        receipt.get("turn_id") == turn_id and receipt.get("ntfy_id") == "test-1"):
+                    self.assertIsNone(process.poll(), "continuous worker exited before intentional stop")
+                    return receipt
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                last_observed = f"{type(error).__name__}: {error}"
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(f"worker exited before exact Sent receipt rc={process.returncode}\n"
+                          f"observed={last_observed!r}\nstdout={stdout}\nstderr={stderr}")
+            time.sleep(0.05)
+        self.fail(f"worker never persisted exact Sent receipt key={first['key']} observed={last_observed!r}")
+
     def test_recent_missing_child_appears_active_and_only_its_completion_releases_root(self) -> None:
         fixture = self.new_fixture()
         for implementation in fixture.implementations():
@@ -299,8 +327,15 @@ class DescendantOrphanDeliveryTests(unittest.TestCase):
                     self.wait_for_child_gate(fixture, process,
                                              implementation=implementation,
                                              after_due=max(first_due, int(time.time() * 1000) + 250))
+                    delivery_deadline = time.monotonic() + 60
                     fixture.append_rollout(missing, "task_complete", turn_id=child_turn, message="Child finished")
-                    self.assertEqual(len(fixture.wait_for_payloads(1, timeout=60)), 1)
+                    self.assertEqual(len(fixture.wait_for_payloads(1, timeout=max(0, delivery_deadline - time.monotonic()))), 1)
+                    # Server acceptance precedes the response and durable Sent
+                    # publish. Do not inject an at-least-once crash window into
+                    # a test whose later assertion requires normal deduplication.
+                    self.wait_for_sent_receipt(fixture, process, implementation=implementation,
+                                               first=first, thread_id=parent, turn_id=turn,
+                                               deadline=delivery_deadline)
                 finally:
                     worker_output = fixture.stop_continuous_worker(process)
                     if sys.exc_info()[0] is not None:

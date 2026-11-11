@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import signal
 import shutil
 import sqlite3
@@ -249,7 +250,36 @@ class NotifierContractTests(unittest.TestCase):
 
     def assert_worker_ok(self, process: subprocess.Popen[str], *, timeout: float = 60) -> None:
         stdout, stderr = process.communicate(timeout=timeout)
-        self.assertEqual(process.returncode, 0, msg=f"stdout={stdout}\nstderr={stderr}")
+        if process.returncode != 0:
+            self.fail(f"stdout={stdout}\nstderr={stderr}\n{self.state_debug()}")
+
+    def read_live_pending_record(self, path: Path, implementation: str) -> dict:
+        """Observe a canonical record without denying its worker's replacement."""
+        if implementation not in {"python", "powershell"}:
+            raise AssertionError(f"unknown pending observer implementation: {implementation}")
+        if (path.parent.resolve() != (self.state / "pending").resolve()
+                or re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None
+                or path.is_symlink()):
+            raise AssertionError(f"noncanonical pending observer path: {path}")
+        guard = contextlib.nullcontext()
+        if implementation == "python":
+            notifier = getattr(self, "_pending_observer_notifier", None)
+            if notifier is None:
+                spec = importlib.util.spec_from_file_location("pending_observer_notifier", PYTHON_NOTIFIER)
+                assert spec is not None and spec.loader is not None
+                notifier = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(notifier)
+                self._pending_observer_notifier = notifier
+            runtime = SimpleNamespace(ensure=lambda: None, mutation_locks=self.state / "mutation-locks")
+            guard = notifier.record_mutation_lock(runtime, path.stem)
+        # Windows os.replace cannot replace an open destination. For Python,
+        # hold its exact production key lock until the shared-delete handle is
+        # closed. PowerShell File.Replace needs only the sharing-compatible read.
+        with guard:
+            record = json.loads(read_text_shared_delete(path))
+        if not isinstance(record, dict) or record.get("key") != path.stem:
+            raise AssertionError(f"pending observer key mismatch: {path.name}")
+        return record
 
     def stop_continuous_worker(self, process: subprocess.Popen[str]) -> tuple[str, str]:
         child_pids: set[int] = set()
@@ -1452,11 +1482,6 @@ class NotifierContractTests(unittest.TestCase):
             suppress_technical_turns=False,
         )
         secret = "LARGE-PRIVATE-" + ("x" * 140_000)
-        spec = importlib.util.spec_from_file_location("partial_jsonl_notifier", PYTHON_NOTIFIER)
-        assert spec is not None and spec.loader is not None
-        notifier = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(notifier)
-        observer_runtime = SimpleNamespace(ensure=lambda: None, mutation_locks=self.state / "mutation-locks")
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
                 thread_id = str(uuid.uuid4())
@@ -1493,16 +1518,7 @@ class NotifierContractTests(unittest.TestCase):
                     while time.monotonic() < deadline and not observed_wait:
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
-                                # MoveFileEx (Python os.replace) cannot replace
-                                # any open destination, even with share-delete.
-                                # Join its real key lock and close before unlock.
-                                # PowerShell File.Replace allows share-delete.
-                                guard = (
-                                    notifier.record_mutation_lock(observer_runtime, pending_path.stem)
-                                    if implementation == "python" else contextlib.nullcontext()
-                                )
-                                with guard:
-                                    pending_record = json.loads(read_text_shared_delete(pending_path))
+                                pending_record = self.read_live_pending_record(pending_path, implementation)
                             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             reason = str(pending_record.get("idle_reason") or pending_record.get("gate_reason") or "")
@@ -1642,8 +1658,8 @@ class NotifierContractTests(unittest.TestCase):
                     while time.monotonic() < deadline and observed_reason != "probe-incomplete":
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
-                                pending_record = json.loads(pending_path.read_text(encoding="utf-8-sig"))
-                            except (OSError, json.JSONDecodeError):
+                                pending_record = self.read_live_pending_record(pending_path, implementation)
+                            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             observed_reason = str(
                                 pending_record.get("idle_reason") or pending_record.get("gate_reason") or ""
@@ -2073,7 +2089,7 @@ $publicState = $publicProbe.state
             while time.monotonic() < deadline and reason != "rollout-probe-failed":
                 for pending_path in (self.state / "pending").glob("*.json"):
                     try:
-                        pending_record = json.loads(read_text_shared_delete(pending_path))
+                        pending_record = self.read_live_pending_record(pending_path, "powershell")
                     except (OSError, UnicodeError, json.JSONDecodeError):
                         continue
                     reason = str(pending_record.get("gate_reason") or "")
@@ -2111,11 +2127,6 @@ $publicState = $publicProbe.state
             goal_poll_seconds=0.05,
             suppress_technical_turns=True,
         )
-        spec = importlib.util.spec_from_file_location("active_goal_observer_notifier", PYTHON_NOTIFIER)
-        assert spec is not None and spec.loader is not None
-        notifier = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(notifier)
-        observer_runtime = SimpleNamespace(ensure=lambda: None, mutation_locks=self.state / "mutation-locks")
         for implementation in self.implementations():
             with self.subTest(implementation=implementation):
                 process = None
@@ -2136,14 +2147,7 @@ $publicState = $publicProbe.state
                     while time.monotonic() < deadline and observed_reason != "goal-active":
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
-                                # Do not let the observer deny the worker's
-                                # atomic replacement of the pending record.
-                                guard = (
-                                    notifier.record_mutation_lock(observer_runtime, pending_path.stem)
-                                    if implementation == "python" else contextlib.nullcontext()
-                                )
-                                with guard:
-                                    pending_record = json.loads(read_text_shared_delete(pending_path))
+                                pending_record = self.read_live_pending_record(pending_path, implementation)
                             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             observed_reason = str(
@@ -2237,8 +2241,8 @@ $publicState = $publicProbe.state
                             )
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
-                                pending_record = json.loads(pending_path.read_text(encoding="utf-8-sig"))
-                            except (OSError, json.JSONDecodeError):
+                                pending_record = self.read_live_pending_record(pending_path, implementation)
+                            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             observed_reason = str(
                                 pending_record.get("idle_reason") or pending_record.get("gate_reason") or ""
@@ -2249,7 +2253,7 @@ $publicState = $publicProbe.state
                             self.fail(
                                 "continuous worker exited before observing the active descendant: "
                                 f"returncode={process.returncode}\n"
-                                f"stdout={worker_output[0]}\nstderr={worker_output[1]}"
+                                f"stdout={worker_output[0]}\nstderr={worker_output[1]}\n{self.state_debug()}"
                             )
                         time.sleep(0.05)
                     self.assertEqual(observed_reason, "subagents-active", "worker never observed the active descendant")
@@ -2307,8 +2311,8 @@ $publicState = $publicProbe.state
                     while time.monotonic() < deadline and "subagent" not in observed_reason:
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
-                                pending_record = json.loads(pending_path.read_text(encoding="utf-8-sig"))
-                            except (OSError, json.JSONDecodeError):
+                                pending_record = self.read_live_pending_record(pending_path, implementation)
+                            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             observed_reason = str(
                                 pending_record.get("idle_reason") or pending_record.get("gate_reason") or ""
@@ -2317,7 +2321,7 @@ $publicState = $publicProbe.state
                             stdout, stderr = process.communicate()
                             self.fail(
                                 "worker exited before observing the missing child rollout: "
-                                f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}"
+                                f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}\n{self.state_debug()}"
                             )
                         time.sleep(0.05)
                     self.assertIn("subagent", observed_reason, "missing child rollout did not hold the root")
@@ -2373,8 +2377,8 @@ $publicState = $publicProbe.state
                     while time.monotonic() < deadline and not observed_reason:
                         for pending_path in (self.state / "pending").glob("*.json"):
                             try:
-                                pending_record = json.loads(pending_path.read_text(encoding="utf-8-sig"))
-                            except (OSError, json.JSONDecodeError):
+                                pending_record = self.read_live_pending_record(pending_path, implementation)
+                            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             observed_reason = str(
                                 pending_record.get("idle_reason") or pending_record.get("gate_reason") or ""
@@ -2690,7 +2694,7 @@ $publicState = $publicProbe.state
                     if refresh:
                         pending = list((self.state / "pending").glob("*.json"))
                         self.assertEqual(len(pending), 1, self.state_debug())
-                        canonical = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+                        canonical = self.read_live_pending_record(pending[0], "powershell")
                         self.assertEqual(canonical["candidate_revision"], expected_suppressed_revision)
                         expected_suppressed_revision = uuid.uuid4().hex
                         canonical["candidate_revision"] = expected_suppressed_revision
@@ -2911,7 +2915,7 @@ $publicState = $publicProbe.state
             while time.time() < deadline:
                 pending = list((self.state / "pending").glob("*.json"))
                 if pending:
-                    record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+                    record = self.read_live_pending_record(pending[0], "powershell")
                     if record.get("claude_goal_state") == "active":
                         break
                 time.sleep(0.05)
@@ -3251,7 +3255,7 @@ $publicState = $publicProbe.state
             while time.time() < deadline:
                 pending = list((self.state / "pending").glob("*.json"))
                 if pending:
-                    record = json.loads(pending[0].read_text(encoding="utf-8-sig"))
+                    record = self.read_live_pending_record(pending[0], "powershell")
                     if record.get("claude_goal_state") == "active":
                         break
                 time.sleep(0.05)
@@ -5247,21 +5251,22 @@ Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $env:FAKE_CLAU
             ["-File", r"C:\old\notify-ntfy.ps1", "-ClaudeHook"],
         )
         managed: list[tuple[str, dict]] = []
-        for event_name in ("Stop", "StopFailure", "UserPromptSubmit", "Notification"):
+        for event_name in ("Stop", "StopFailure", "UserPromptSubmit", "PreToolUse", "Notification"):
             for group in installed["hooks"].get(event_name, []):
                 for handler in group.get("hooks", []):
                     args = [str(value) for value in handler.get("args", [])]
                     if "-ClaudeHook" in args:
                         managed.append((event_name, handler))
-        self.assertEqual(
+        self.assertCountEqual(
             [event for event, _handler in managed],
-            ["Stop", "StopFailure", "UserPromptSubmit", "Notification", "Notification"],
+            ["Stop", "StopFailure", "UserPromptSubmit", "PreToolUse", "Notification", "Notification", "Notification"],
         )
         self.assertNotIn("UserPromptExpansion", installed["hooks"])
-        self.assertEqual(
-            [group["matcher"] for group in installed["hooks"]["Notification"][-2:]],
-            ["idle_prompt", "agent_completed"],
+        self.assertCountEqual(
+            [group["matcher"] for group in installed["hooks"]["Notification"][-3:]],
+            ["idle_prompt", "agent_completed", "permission_prompt"],
         )
+        self.assertEqual(installed["hooks"]["PreToolUse"][-1]["matcher"], "AskUserQuestion")
         for managed_event, handler in managed:
             self.assertEqual(handler["command"], str(WINDOWS_POWERSHELL))
             self.assertIn("-ReadStdin", handler["args"])
@@ -5273,7 +5278,7 @@ Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $env:FAKE_CLAU
                 )
             )
             self.assertEqual(handler["args"][-2:], ["-Origin", "Claude Code"])
-            self.assertEqual(handler["async"], managed_event == "Notification")
+            self.assertEqual(handler["async"], managed_event in ("Notification", "PreToolUse"))
             self.assertEqual(handler["timeout"], 30)
 
         first_bytes = settings_path.read_bytes()
