@@ -5247,21 +5247,22 @@ Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $env:FAKE_CLAU
             ["-File", r"C:\old\notify-ntfy.ps1", "-ClaudeHook"],
         )
         managed: list[tuple[str, dict]] = []
-        for event_name in ("Stop", "StopFailure", "UserPromptSubmit", "Notification"):
+        for event_name in ("Stop", "StopFailure", "UserPromptSubmit", "PreToolUse", "Notification"):
             for group in installed["hooks"].get(event_name, []):
                 for handler in group.get("hooks", []):
                     args = [str(value) for value in handler.get("args", [])]
                     if "-ClaudeHook" in args:
                         managed.append((event_name, handler))
-        self.assertEqual(
+        self.assertCountEqual(
             [event for event, _handler in managed],
-            ["Stop", "StopFailure", "UserPromptSubmit", "Notification", "Notification"],
+            ["Stop", "StopFailure", "UserPromptSubmit", "PreToolUse", "Notification", "Notification", "Notification"],
         )
         self.assertNotIn("UserPromptExpansion", installed["hooks"])
-        self.assertEqual(
-            [group["matcher"] for group in installed["hooks"]["Notification"][-2:]],
-            ["idle_prompt", "agent_completed"],
+        self.assertCountEqual(
+            [group["matcher"] for group in installed["hooks"]["Notification"][-3:]],
+            ["idle_prompt", "agent_completed", "permission_prompt"],
         )
+        self.assertEqual(installed["hooks"]["PreToolUse"][-1]["matcher"], "AskUserQuestion")
         for managed_event, handler in managed:
             self.assertEqual(handler["command"], str(WINDOWS_POWERSHELL))
             self.assertIn("-ReadStdin", handler["args"])
@@ -5273,7 +5274,7 @@ Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $env:FAKE_CLAU
                 )
             )
             self.assertEqual(handler["args"][-2:], ["-Origin", "Claude Code"])
-            self.assertEqual(handler["async"], managed_event == "Notification")
+            self.assertEqual(handler["async"], managed_event in ("Notification", "PreToolUse"))
             self.assertEqual(handler["timeout"], 30)
 
         first_bytes = settings_path.read_bytes()

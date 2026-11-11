@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-11-11
+
+### Added
+
+- Distinct attention notifications for genuine unanswered Codex questions and main-agent Claude Code `AskUserQuestion` calls on Windows. They use the current chat name, one question icon, a compact generic body and a separately configurable priority.
+- Separate durable attention identities and receipts, rechecked before each delivery attempt. Resuming the same question does not create a new logical alert; a new question can alert again. Question and answer text is not stored or forwarded by this path.
+- Claude question accelerators through `PreToolUse` / `AskUserQuestion` and `Notification` / `permission_prompt`, preserving unrelated hooks. Generic permissions and subagent questions do not produce question alerts.
+
+### Fixed
+
+- An asynchronous question acknowledgement is not mistaken for an answer. Replies are correlated to the exact call and question index, including partial or empty replies.
+- A completion representing a question pause stays distinct from subsequent work, avoiding a misleading completion alert while user input is needed.
+
 ## [2.5.7] - 2026-10-20
 
 ### Fixed

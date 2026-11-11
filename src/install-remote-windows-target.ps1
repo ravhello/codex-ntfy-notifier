@@ -291,6 +291,8 @@ foreach ($default in @(
     @('include_task_link_action', $false),
     @('allow_insecure_auth', $false),
     @('priority', 3),
+    @('attention_notifications', $true),
+    @('attention_priority', 4),
     @('tags', @('white_check_mark')),
     @('max_message_chars', 180),
     @('markdown', $false),

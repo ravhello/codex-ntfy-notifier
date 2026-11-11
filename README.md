@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![Windows PowerShell 5.1](https://img.shields.io/badge/Windows%20PowerShell-5.1-5391FE.svg)](https://learn.microsoft.com/powershell/)
 
-Compact, deduplicated ntfy notifications when a local OpenAI Codex root task is verifiably idle—not for intermediate turns. It also supports Claude Code on Windows, including the Code tab in Claude Desktop, through opt-in native lifecycle hooks.
+Compact, deduplicated ntfy notifications when a local OpenAI Codex root task is verifiably idle, plus a distinct alert when a genuine question needs your answer—not for ordinary intermediate turns. It also supports Claude Code on Windows, including the Code tab in Claude Desktop, through opt-in native lifecycle hooks.
 
 ![Codex ntfy Notifier waits for locally verifiable idle before sending one compact completion notification](docs/assets/hero.svg)
 
@@ -47,7 +47,7 @@ To also connect Claude Code on Windows (Claude Desktop Code tab, CLI, and VS Cod
 .\install.ps1 -WslDistro Ubuntu -EnableClaudeCode
 ```
 
-The installer atomically merges ordered synchronous main-agent `Stop`/`StopFailure` and `UserPromptSubmit`, plus optional asynchronous `Notification` accelerators (`idle_prompt` and `agent_completed`), into `~/.claude/settings.json`. It preserves unrelated Claude hooks and backs the original file up with the Codex installation snapshot. Claude Code 2.1.198 or newer is required for the complete managed lifecycle set. The installer checks the newest executable found for each detected surface separately—`PATH`, Claude Desktop, VS Code, VS Code Insiders, and Cursor—and stops if any detected surface is older than that minimum.
+The installer atomically merges ordered synchronous main-agent `Stop`/`StopFailure` and `UserPromptSubmit`, plus asynchronous question/notification accelerators (`PreToolUse` / `AskUserQuestion`; `Notification` / `idle_prompt`, `agent_completed`, `permission_prompt`), into `~/.claude/settings.json`. It preserves unrelated Claude hooks and backs the original file up with the Codex installation snapshot. Claude Code 2.1.198 or newer is required for the complete managed lifecycle set. The installer checks the newest executable found for each detected surface separately—`PATH`, Claude Desktop, VS Code, VS Code Insiders, and Cursor—and stops if any detected surface is older than that minimum.
 
 ### 1b. Install on native Linux
 
@@ -64,7 +64,7 @@ unset CODEX_NTFY_TOPIC
 
 In every installed Codex environment, run `/hooks`, inspect the managed `Stop` command, and approve it. The installer never modifies the Codex trust store.
 
-For Claude Code, `/hooks` is a read-only configuration browser: verify four managed event types and five handlers (`Notification` has separate `idle_prompt` and `agent_completed` handlers). Claude normally reloads `settings.json` automatically.
+For Claude Code, `/hooks` is a read-only configuration browser: verify five managed event types and seven handlers (`PreToolUse` matches `AskUserQuestion`; `Notification` has separate `idle_prompt`, `agent_completed` and `permission_prompt` handlers). Claude normally reloads `settings.json` automatically.
 
 ### 3. Run the doctor
 
@@ -224,6 +224,19 @@ Each real host owns its own pending area, rollout cursor, outbox, and worker. Us
 ## Configuration
 
 The private configuration lives at `~/.codex/ntfy-config.json`. Start from [ntfy-config.example.json](ntfy-config.example.json) when configuring it manually.
+
+### Questions needing your attention
+
+Version 2.6 adds a distinct question alert for Codex on all supported platforms and Claude Code on Windows. Its title follows the same current-name/privacy policy, with exactly one `question` tag and a short `Reply needed` body. The new path never stores or forwards question or answer text. Generic permission prompts, tool output and subagent questions are not question alerts.
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `attention_notifications` | `true` | Notify while a proven current root question needs an answer. |
+| `attention_priority` | `4` | Separate ntfy priority for question alerts; ordinary completion/error priority is unchanged. |
+
+The same logical question remains deduplicated across resume and retries; a new genuine question can alert again. Answered or superseded questions are rechecked before each send. A question pause is not a completion: a later answered turn can still produce its normal final notification. Attention receipts are separate from ordinary completion retention. Transport remains durable at-least-once, not exactly-once phone delivery.
+
+On Android, priorities use notification-channel settings; a custom sound must be chosen in the phone's ntfy/OS settings. Priority and icon cannot guarantee a particular sound or bypass phone restrictions. See [ntfy message priority](https://docs.ntfy.sh/subscribe/phone/#message-priority).
 
 ### Idle detection
 
