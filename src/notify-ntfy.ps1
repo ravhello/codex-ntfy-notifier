@@ -1360,8 +1360,149 @@ function New-AttentionProbeResult {
   }
 }
 
+function Initialize-AttentionFrameFilter {
+  if ($null -ne ([System.Management.Automation.PSTypeName]'CodexNtfyAttentionFrameFilter').Type) { return $true }
+  $availability = Get-Variable -Name AttentionFrameFilterAvailable -Scope Script -ErrorAction SilentlyContinue
+  if ($null -ne $availability -and -not [bool]$availability.Value) { return $false }
+  try {
+    Add-Type -ReferencedAssemblies 'System.Web.Extensions' -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Text;
+using System.Web.Script.Serialization;
+
+public sealed class CodexNtfyAttentionFrame {
+    public int Order;
+    public bool Invalid;
+    public string Raw;
+}
+
+public sealed class CodexNtfyAttentionFrames {
+    public bool Overflow;
+    public CodexNtfyAttentionFrame[] Frames;
+}
+
+public static class CodexNtfyAttentionFrameFilter {
+    private static bool TryValue(Dictionary<string, object> value, string name, out object found) {
+        if (value.TryGetValue(name, out found)) return true;
+        foreach (KeyValuePair<string, object> item in value) {
+            if (String.Equals(item.Key, name, StringComparison.OrdinalIgnoreCase)) { found = item.Value; return true; }
+        }
+        found = null;
+        return false;
+    }
+
+    private static string StringValue(Dictionary<string, object> value, string name) {
+        object found;
+        return TryValue(value, name, out found) ? found as string : null;
+    }
+
+    private static bool Same(string left, string right) {
+        return String.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool UniquePropertyNames(object value) {
+        Dictionary<string, object> map = value as Dictionary<string, object>;
+        if (map != null) {
+            HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, object> item in map) {
+                if (!names.Add(item.Key) || !UniquePropertyNames(item.Value)) return false;
+            }
+        } else {
+            object[] array = value as object[];
+            if (array != null) foreach (object item in array) if (!UniquePropertyNames(item)) return false;
+        }
+        return true;
+    }
+
+    private static bool Keep(Dictionary<string, object> root, string provider, HashSet<string> questionCalls) {
+        string type = StringValue(root, "type");
+        if (Same(provider, "claude")) {
+            return Same(type, "user") || Same(type, "assistant") || Same(type, "system") ||
+                Same(type, "attachment") || Same(type, "last-prompt");
+        }
+        // Preserve all existing typed-envelope failures for the PS authority
+        // parser; a syntactically valid but malformed payload cannot disappear.
+        if (String.IsNullOrWhiteSpace(type)) return true;
+        if (!Same(type, "session_meta") && !Same(type, "turn_context") &&
+            !Same(type, "event_msg") && !Same(type, "response_item")) return false;
+        object payloadValue;
+        Dictionary<string, object> payload = TryValue(root, "payload", out payloadValue)
+            ? payloadValue as Dictionary<string, object> : null;
+        if (payload == null) return true;
+        if (Same(type, "turn_context")) return true;
+        string kind = StringValue(payload, "type");
+        if (Same(type, "event_msg")) {
+            return Same(kind, "task_started") || Same(kind, "task_complete") ||
+                Same(kind, "turn_aborted") || Same(kind, "user_message");
+        }
+        if (!Same(type, "response_item")) return false;
+        if (Same(kind, "function_call")) {
+            string name = StringValue(payload, "name");
+            if (name != "request_user_input_async" && name != "functions.request_user_input_async" &&
+                name != "request_user_input" && name != "functions.request_user_input") return false;
+            object namespaceValue;
+            if (TryValue(payload, "namespace", out namespaceValue) && namespaceValue != null &&
+                (!(namespaceValue is string) || ((string)namespaceValue != "" && (string)namespaceValue != "functions"))) return false;
+            string call = StringValue(payload, "call_id");
+            if (call != null) questionCalls.Add(call);
+            return true;
+        }
+        if (Same(kind, "function_call_output")) {
+            string call = StringValue(payload, "call_id");
+            return call != null && questionCalls.Contains(call);
+        }
+        return Same(kind, "message") && String.Equals(StringValue(payload, "role"), "user", StringComparison.Ordinal);
+    }
+
+    public static CodexNtfyAttentionFrames Filter(string text, string provider, int maxBytes, int maxFrames) {
+        CodexNtfyAttentionFrames result = new CodexNtfyAttentionFrames();
+        List<CodexNtfyAttentionFrame> frames = new List<CodexNtfyAttentionFrame>();
+        HashSet<string> questionCalls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        JavaScriptSerializer serializer = new JavaScriptSerializer();
+        serializer.MaxJsonLength = maxBytes;
+        serializer.RecursionLimit = 1024;
+        int position = 0;
+        int order = 0;
+        while (position < text.Length) {
+            int end = text.IndexOf('\n', position);
+            if (end < 0) end = text.Length;
+            string line = text.Substring(position, end - position);
+            position = end + 1;
+            if (String.IsNullOrWhiteSpace(line)) continue;
+            if (order >= maxFrames) { result.Overflow = true; break; }
+            bool invalid = false;
+            Dictionary<string, object> root = null;
+            try {
+                if (Encoding.UTF8.GetByteCount(line) > maxBytes) invalid = true;
+                else {
+                    root = serializer.DeserializeObject(line) as Dictionary<string, object>;
+                    invalid = root == null || !UniquePropertyNames(root);
+                }
+            } catch { invalid = true; }
+            if (invalid || Keep(root, provider, questionCalls)) {
+                frames.Add(new CodexNtfyAttentionFrame { Order = order, Invalid = invalid, Raw = invalid ? null : line });
+            }
+            order++;
+        }
+        result.Frames = frames.ToArray();
+        return result;
+    }
+}
+'@ | Out-Null
+    $script:AttentionFrameFilterAvailable = $true
+    return $true
+  } catch {
+    # PowerShell Core hosts without the inbox Framework assembly retain the
+    # existing, slower parser. Availability never changes attention authority.
+    $script:AttentionFrameFilterAvailable = $false
+    return $false
+  }
+}
+
 function Read-AttentionSnapshot {
-  param([string]$TranscriptPath, [int]$MaxBytes = 16777216)
+  param([string]$TranscriptPath, [int]$MaxBytes = 16777216, [ValidateSet('codex','claude')][string]$Provider = 'codex')
   $unknown = [pscustomobject]@{ ok = $false; frames = @(); head = $null; complete = $false; size = [int64]0; write_ticks = [int64]0 }
   if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or $MaxBytes -lt 1024 -or $MaxBytes -gt 16777216) { return $unknown }
   $stream = $null
@@ -1394,17 +1535,33 @@ function Read-AttentionSnapshot {
     if ($start -gt 0 -and $skip -le 0) { return $unknown }
     $text = $strict.GetString($bytes, $skip, $bytes.Length - $skip).TrimStart([char]0xfeff)
     $frames = New-Object 'Collections.Generic.List[object]'
-    $order = 0
-    foreach ($line in @($text -split "`n")) {
-      if ([string]::IsNullOrWhiteSpace($line)) { continue }
-      if ($frames.Count -ge 65536) { return $unknown }
-      $value = $null; $invalidLine = $strict.GetByteCount($line) -gt $MaxBytes
-      if (-not $invalidLine) {
-        try { $value = $line.TrimEnd([char]13) | ConvertFrom-Json -ErrorAction Stop } catch { $invalidLine = $true }
-        if ($null -eq $value -or $value -isnot [Management.Automation.PSCustomObject]) { $invalidLine = $true }
+    $native = $null
+    if (Initialize-AttentionFrameFilter) {
+      try { $native = [CodexNtfyAttentionFrameFilter]::Filter($text, $Provider, $MaxBytes, 65536) } catch { $native = $null }
+    }
+    if ($null -ne $native) {
+      if ($native.Overflow) { return $unknown }
+      foreach ($nativeFrame in @($native.Frames)) {
+        $value = $null; $invalidLine = [bool]$nativeFrame.Invalid
+        if (-not $invalidLine) {
+          try { $value = $nativeFrame.Raw.TrimEnd([char]13) | ConvertFrom-Json -ErrorAction Stop } catch { $invalidLine = $true }
+          if ($null -eq $value -or $value -isnot [Management.Automation.PSCustomObject]) { $invalidLine = $true }
+        }
+        $frames.Add([pscustomobject]@{ value = $value; order = [int]$nativeFrame.Order; invalid = $invalidLine; hash = $(if ($invalidLine) { '' } else { Get-Sha256Hex $nativeFrame.Raw }) })
       }
-      $frames.Add([pscustomobject]@{ value = $value; order = $order; invalid = $invalidLine; hash = $(if ($invalidLine) { '' } else { Get-Sha256Hex $line }) })
-      $order++
+    } else {
+      $order = 0
+      foreach ($line in @($text -split "`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($frames.Count -ge 65536) { return $unknown }
+        $value = $null; $invalidLine = $strict.GetByteCount($line) -gt $MaxBytes
+        if (-not $invalidLine) {
+          try { $value = $line.TrimEnd([char]13) | ConvertFrom-Json -ErrorAction Stop } catch { $invalidLine = $true }
+          if ($null -eq $value -or $value -isnot [Management.Automation.PSCustomObject]) { $invalidLine = $true }
+        }
+        $frames.Add([pscustomobject]@{ value = $value; order = $order; invalid = $invalidLine; hash = $(if ($invalidLine) { '' } else { Get-Sha256Hex $line }) })
+        $order++
+      }
     }
     $after = Get-Item -LiteralPath $path -Force -ErrorAction Stop
     if ($after.PSIsContainer -or ($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
@@ -1498,7 +1655,7 @@ function Get-ClaudeAttentionState {
   if ($null -ne $cached) { return $cached }
   try {
     if ([IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFullPath($TranscriptPath)) -ine $ThreadId) { return $unknown }
-    $snapshot = Read-AttentionSnapshot -TranscriptPath $TranscriptPath -MaxBytes $MaxBytes
+    $snapshot = Read-AttentionSnapshot -TranscriptPath $TranscriptPath -MaxBytes $MaxBytes -Provider claude
     if (-not $snapshot.ok) { return $unknown }
     $nodes = @{}; $leaf = ''; $invalid = $false
     foreach ($frame in $snapshot.frames) {
@@ -1625,7 +1782,7 @@ function Get-CodexAttentionState {
   if (-not (Test-AttentionGuid $ThreadId)) { return $unknown }
   $cached = Get-AttentionProbeCache -Provider codex -TranscriptPath $TranscriptPath -ThreadId $ThreadId -ExpectedTurnId $ExpectedTurnId -ExpectedCallId $ExpectedCallId -MaxBytes $MaxBytes
   if ($null -ne $cached) { return $cached }
-  $snapshot = Read-AttentionSnapshot -TranscriptPath $TranscriptPath -MaxBytes $MaxBytes
+  $snapshot = Read-AttentionSnapshot -TranscriptPath $TranscriptPath -MaxBytes $MaxBytes -Provider codex
   if (-not $snapshot.ok) { return $unknown }
   try {
     $meta = Get-ObjectValue $snapshot.head 'payload'
@@ -1640,10 +1797,12 @@ function Get-CodexAttentionState {
     foreach ($frame in $snapshot.frames) {
       $order = [int]$frame.order
       if ($frame.invalid) { $lastBad = $order; continue }
-      $envelope = $frame.value; $payload = Get-ObjectValue $envelope 'payload'
-      if ((Get-ObjectValue $envelope 'type') -isnot [string] -or [string]::IsNullOrWhiteSpace([string](Get-ObjectValue $envelope 'type' '')) -or
-          $null -eq $payload -or $payload -isnot [Management.Automation.PSCustomObject]) { $lastBad = $order; continue }
+      $envelope = $frame.value
+      if ((Get-ObjectValue $envelope 'type') -isnot [string] -or [string]::IsNullOrWhiteSpace([string](Get-ObjectValue $envelope 'type' ''))) { $lastBad = $order; continue }
       $type = [string](Get-ObjectValue $envelope 'type' '')
+      if ($type -notin @('session_meta','turn_context','event_msg','response_item')) { continue }
+      $payload = Get-ObjectValue $envelope 'payload'
+      if ($null -eq $payload -or $payload -isnot [Management.Automation.PSCustomObject]) { $lastBad = $order; continue }
       $eventType = [string](Get-ObjectValue $payload 'type' '')
       if ($type -eq 'turn_context' -or ($type -eq 'event_msg' -and $eventType -eq 'task_started')) {
         $turn = Get-ObjectValue $payload 'turn_id'

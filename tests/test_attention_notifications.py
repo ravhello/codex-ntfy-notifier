@@ -326,6 +326,11 @@ class AttentionProbeTests(unittest.TestCase):
         compacted = {"type": "compacted", "payload": {"message": "x" * (1024 * 1024 + 4096)}}
         self.assertGreater(len(json.dumps(compacted).encode("utf-8")), 1024 * 1024)
         self.assert_state(self.probes(self.waiting() + [compacted]), "waiting", remaining=1)
+        progress = {"type": "progress", "payload": "x" * 180}
+        history = self.waiting() + [progress] * 50_000
+        self.assert_state(self.probes(history), "waiting", remaining=1)
+        self.assert_state(self.probes(history, suffix=b'{"type":"progress","payload":"x"} invalid\n'),
+                          "unknown")
 
     def test_uncovered_expected_call_is_unknown_and_does_not_infer_answer(self) -> None:
         header = ("\n".join(json.dumps(row) for row in self.waiting()) + "\n").encode()
